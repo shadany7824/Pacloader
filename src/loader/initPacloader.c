@@ -128,8 +128,12 @@ void initMain(char *configPath, char *controlsPath)
         else if (sdlJoysticks.joysticks[i])
             joystick = sdlJoysticks.joysticks[i];
 
+        /* The counts are what a controls.ini binding indexes into, so they are
+         * worth printing next to the name. */
         if (joystick)
-            printf("  SDL CONTROLLER %d: %s\n", i, SDL_GetJoystickName(joystick));
+            printf("  SDL CONTROLLER %d: %s (%d axes, %d buttons, %d hats)\n", i,
+                   SDL_GetJoystickName(joystick), SDL_GetNumJoystickAxes(joystick),
+                   SDL_GetNumJoystickButtons(joystick), SDL_GetNumJoystickHats(joystick));
     }
     printf("\n");
     pacFrontendReport("running", getGameName());

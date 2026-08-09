@@ -26,79 +26,12 @@
 
 namespace
 {
-#pragma pack(push, 1)
-struct Wmmt4Coin
-{
-    uint16_t coin;
-    uint16_t inc;
-    uint16_t dec;
-    uint8_t status;
-    uint8_t slotInfo;
-    uint32_t mode;
-    uint32_t retry;
-    uint16_t cid;
-    uint16_t mechCoin;
-    uint16_t mechRate;
-    uint16_t mechPoint;
-    uint16_t mechDec;
-    uint8_t pad[2];
-};
-
-struct Wmmt4Service
-{
-    uint16_t service;
-    uint16_t inc;
-    uint16_t dec;
-    uint16_t timer;
-    uint32_t mode;
-};
-
-struct Wmmt4JvioData
-{
-    uint8_t testSwitch;
-    uint8_t dipSwitch;
-    uint8_t key;
-    uint8_t pad;
-    uint16_t switches[16];
-    Wmmt4Coin coins[4];
-    Wmmt4Service services[4];
-    uint8_t generalOutputs[30];
-    uint16_t analogueOutputs[8];
-    uint16_t analogueInputs[16];
-    uint16_t generalInputs[8];
-    uint8_t serialCount;
-    uint8_t serial[16];
-    uint8_t pad2;
-};
-
-struct Wmmt4JvioControl
-{
-    uint8_t pad[12];
-    Wmmt4JvioData data[2];
-};
-
-struct Wmmt4JvioInstance
-{
-    Wmmt4JvioControl *control;
-};
-#pragma pack(pop)
-
-static_assert(sizeof(Wmmt4JvioData) == 308, "WMMT4 JVIO layout changed");
-
 /* Dongle serials for the two cabinets in a WMMT4 group; they differ in the
  * fifth digit, the same way the ALL.Net serials do. */
 constexpr char DriveHaspSerial[] = "267610069420";
 constexpr char TerminalHaspSerial[] = "267611069420";
 
-constexpr uintptr_t JvioBootedAddress = 0x8370c00;
-constexpr uintptr_t JvioUpdateAddress = 0x83711c0;
-constexpr uintptr_t JvioGetCoinAddress = 0x8372490;
-constexpr uintptr_t JvioDecCoinAddress = 0x8372600;
-constexpr uintptr_t JvioErrorAddress = 0x8370c30;
-constexpr uintptr_t JvioThreadAddress = 0x8375a90;
 constexpr uintptr_t JvioMonitorAddress = 0x8390ba0;
-constexpr uintptr_t JvioInstanceAddress = 0x921589c;
-
 constexpr uintptr_t HaspLoginAddress = 0x8921fd0;
 constexpr uintptr_t HaspLogoutAddress = 0x89281f4;
 constexpr uintptr_t HaspDecryptAddress = 0x8922248;
@@ -131,36 +64,6 @@ constexpr uintptr_t FilenameMatchAddress = 0x89adf50;
  * cabinet has no touch panel and never reaches this. */
 constexpr uintptr_t TouchUpdateAddress = 0x837e4a0;
 
-constexpr uint16_t SwitchInterrupt = 0x0001;
-constexpr uint16_t SwitchViewChange = 0x0002;
-constexpr uint16_t SwitchGearRight = 0x0010;
-constexpr uint16_t SwitchGearLeft = 0x0020;
-constexpr uint16_t SwitchGearDown = 0x0040;
-constexpr uint16_t SwitchGearTop = 0x0080;
-constexpr uint16_t SwitchTerminal = 0x0100;
-constexpr uint16_t SwitchTestEnter = 0x0200;
-constexpr uint16_t SwitchTestDown = 0x1000;
-constexpr uint16_t SwitchTestUp = 0x2000;
-constexpr uint16_t SwitchService = 0x4000;
-
-constexpr Es1JvioInputProfile Wmmt4InputProfile = {
-    SwitchInterrupt,
-    SwitchViewChange,
-    SwitchService,
-    SwitchTestEnter,
-    SwitchTestDown,
-    SwitchTestUp,
-    SwitchTerminal,
-    {0, SwitchGearLeft | SwitchGearTop, SwitchGearLeft | SwitchGearDown,
-     SwitchGearTop, SwitchGearDown, SwitchGearRight | SwitchGearTop,
-     SwitchGearRight | SwitchGearDown},
-    0x80,
-    0,
-    1,
-    2,
-};
-
-Es1JvioInputState g_inputState{};
 std::atomic<unsigned int> g_hookTraceMask{0};
 std::atomic<int> g_lastNetworkCheck{-1};
 
@@ -179,59 +82,6 @@ void traceHook(unsigned int bit, const char *name)
         log_info("System ES1 WMMT4: %s hook invoked", name);
         std::fflush(stdout);
     }
-}
-
-extern "C" bool wmmt4JvioBooted()
-{
-    GuestTls::HostCallScope hostCall;
-    traceHook(0, "JVIO booted");
-    return true;
-}
-
-extern "C" void wmmt4JvioUpdate()
-{
-    GuestTls::HostCallScope hostCall;
-    traceHook(1, "JVIO update");
-    auto *instance = reinterpret_cast<Wmmt4JvioInstance *>(JvioInstanceAddress);
-    if (!instance || !instance->control)
-        return;
-
-    Wmmt4JvioData &data = instance->control->data[1];
-    es1CompatUpdateJvioInput(&data.testSwitch, &data.switches[0], data.analogueInputs,
-                             &data.coins[0].coin, Wmmt4InputProfile, g_inputState);
-    data.analogueInputs[3] = 0;
-}
-
-extern "C" int wmmt4JvioGetCoinNow(int node, int channel)
-{
-    GuestTls::HostCallScope hostCall;
-    traceHook(2, "JVIO get coin");
-    (void)node;
-    (void)channel;
-    return g_inputState.coinCount;
-}
-
-extern "C" int wmmt4JvioDecCoin(int node, int channel, int count)
-{
-    GuestTls::HostCallScope hostCall;
-    traceHook(3, "JVIO decrement coin");
-    (void)node;
-    (void)channel;
-    g_inputState.coinCount = std::max(g_inputState.coinCount - count, 0);
-    return 1;
-}
-
-extern "C" bool wmmt4JvioError()
-{
-    GuestTls::HostCallScope hostCall;
-    traceHook(4, "JVIO error");
-    return false;
-}
-
-extern "C" void wmmt4JvioThread(void *)
-{
-    GuestTls::HostCallScope hostCall;
-    traceHook(5, "JVIO thread");
 }
 
 extern "C" char *wmmt4JvioMonitor(int, int, char *buffer, size_t bufferSize)
@@ -849,12 +699,9 @@ extern "C" int es1Wmmt4InstallHooks(void)
     wmmt4StartTerminalEmulator(DriveHaspSerial);
 
     const Es1HookSpec hooks[] = {
-        {JvioBootedAddress, reinterpret_cast<void *>(wmmt4JvioBooted), "JvioControl_IsBooted"},
-        {JvioUpdateAddress, reinterpret_cast<void *>(wmmt4JvioUpdate), "JvioControl_Update"},
-        {JvioGetCoinAddress, reinterpret_cast<void *>(wmmt4JvioGetCoinNow), "JvioGetCoinNow"},
-        {JvioDecCoinAddress, reinterpret_cast<void *>(wmmt4JvioDecCoin), "JvioDecCoin"},
-        {JvioErrorAddress, reinterpret_cast<void *>(wmmt4JvioError), "JvioControl_IsError"},
-        {JvioThreadAddress, reinterpret_cast<void *>(wmmt4JvioThread), "JvioThread"},
+        /* The JVIO subsystem is left unhooked: the title runs a real JVS master
+         * the virtual board answers. Replacing JvioControl_Update also skipped the
+         * output acknowledgement, reported as "Gout Update Timeout". */
         {JvioMonitorAddress, reinterpret_cast<void *>(wmmt4JvioMonitor), "JvioMonitor"},
         {HaspLoginAddress, reinterpret_cast<void *>(wmmt4HaspLogin), "hasp_login"},
         {HaspLogoutAddress, reinterpret_cast<void *>(wmmt4HaspLogout), "hasp_logout"},

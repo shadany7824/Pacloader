@@ -30,10 +30,20 @@ extern "C" void __attribute__((cdecl)) bridgeglTexImage2D(
     glad_glTexImage2D(target, level, internalFormat, width, height, border, format, type, pixels);
 }
 
+/* GL_CLAMP blends the border colour in at the edge texel, which leaves a seam
+ * along every UI texture; the cabinet's driver clamped to the edge instead. The
+ * title names GL_CLAMP_TO_EDGE itself elsewhere, so only the legacy value moves. */
+static GLint clampToEdge(GLenum name, GLint value)
+{
+    const bool wrap = name == GL_TEXTURE_WRAP_S || name == GL_TEXTURE_WRAP_T ||
+                      name == GL_TEXTURE_WRAP_R;
+    return (wrap && value == GL_CLAMP) ? (GLint)GL_CLAMP_TO_EDGE : value;
+}
+
 extern "C" void __attribute__((cdecl)) bridgeglTexParameteri(
     GLenum target, GLenum name, GLint value)
 {
-    glad_glTexParameteri(target, name, value);
+    glad_glTexParameteri(target, name, clampToEdge(name, value));
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glBlitFramebufferEXT(

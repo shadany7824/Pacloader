@@ -134,6 +134,37 @@ int64_t clockNow(void)
 #endif
 }
 
+/*
+ * The retrace counter and its wait share the limiter's grid so a guest that
+ * paces itself on glXWaitVideoSyncSGI and the limiter do not wait against two
+ * origins, which costs a fraction of a frame every frame.
+ */
+uint64_t videoSyncCount(void)
+{
+#if defined(_WIN32) || defined(__MINGW32__)
+    if (g_qpcFrequency.QuadPart == 0)
+        return 0;
+    const LONGLONG elapsed = qpcNow() - g_qpcStart;
+    if (elapsed <= 0)
+        return 0;
+    return (uint64_t)((long double)elapsed * (long double)g_targetFps /
+                      (long double)g_qpcFrequency.QuadPart);
+#else
+    return (uint64_t)((double)clockNow() * g_targetFps / 1000000.0);
+#endif
+}
+
+void waitVideoSync(uint64_t index)
+{
+#if defined(_WIN32) || defined(__MINGW32__)
+    if (g_qpcFrequency.QuadPart == 0)
+        return;
+    waitUntilQpc(qpcDeadline(index));
+#else
+    (void)index;
+#endif
+}
+
 void frameTiming(void)
 {
     if (!g_fpsLimiterEnabled)

@@ -3,6 +3,9 @@
 
 #include "jvs.h"
 #include "../../config/config.h"
+#if defined(_WIN32) || defined(__MINGW32__)
+#include "../namco/es1/es1Title.h"
+#endif
 
 /* The in and out packets used to read and write to and from*/
 JVSPacket inputPacket, outputPacket;
@@ -49,12 +52,25 @@ int initJVS()
         io.capabilities.analogueInChannels = 8;
         io.capabilities.keypad = 1;
         io.capabilities.generalPurposeInputs = 0;
-        io.capabilities.generalPurposeOutputs = 0;
-        io.capabilities.analogueOutChannels = 0;
-        io.capabilities.commandVersion = 16;
-        io.capabilities.jvsVersion = 16;
-        io.capabilities.commsVersion = 16;
-        strncpy(io.capabilities.name, "namco ltd.;ES1-JAMMA;Ver1.00;USA,Driving",
+        /* The cabinet drives lamps through the board, and a master that finds no
+         * general purpose outputs declared gives up waiting for the write to be
+         * acknowledged ("Gout Update Timeout"). */
+        io.capabilities.generalPurposeOutputs = 20;
+        /* The cabinet's board drives two analogue outputs, and the master
+         * refuses a board that does not declare them. */
+        io.capabilities.analogueOutChannels = 2;
+        /*
+         * Revision 3.1, as BCD, which is what the Namco boards of this era
+         * report.  The ES1 master only records a board's later capabilities
+         * above 1.2 and 2.9, and one that claims less is the wrong type.
+         */
+        io.capabilities.commandVersion = 0x31;
+        io.capabilities.jvsVersion = 0x31;
+        io.capabilities.commsVersion = 0x31;
+        /* A title's JVIO master may refuse to talk to a board it does not
+         * recognise, so the name can come from the title record. */
+        const char *ident = es1TitleQuirks()->jvsBoardIdent;
+        strncpy(io.capabilities.name, ident ? ident : "namco ltd.;ES1-JAMMA;Ver1.00;USA,Driving",
                 sizeof(io.capabilities.name) - 1);
         io.capabilities.name[sizeof(io.capabilities.name) - 1] = '\0';
     }
@@ -258,6 +274,14 @@ JVSStatus processPacket(int *packetSize)
         case CMD_ASSIGN_ADDR:
         {
             size = 2;
+            /* Only an unaddressed board takes a broadcast assignment: answering
+             * a second one makes a master that enumerates the chain keep handing
+             * out addresses and never finish counting nodes. */
+            if (io.deviceID != -1)
+            {
+                pthread_mutex_unlock(&jvsMutex);
+                return JVS_STATUS_NOT_FOR_US;
+            }
             io.deviceID = inputPacket.data[index + 1];
             outputPacket.data[outputPacket.length++] = REPORT_SUCCESS;
             senseLine = 1;
@@ -553,9 +577,47 @@ JVSStatus processPacket(int *packetSize)
          */
         case CMD_NAMCO_SPECIFIC:
         {
+            /* ES1 puts several of these in one packet and expects a report for
+             * each, so the known sub-commands carry their own length here. An
+             * unknown one still has to stop the parse; N2 only wants the ack. */
+            unsigned char subCommand = 0;
+            unsigned char answer = 1;
+            if (getConfig()->platform == ARCADE_PLATFORM_NAMCO_ES1 &&
+                index + 1 < inputPacket.length)
+                subCommand = inputPacket.data[index + 1];
+
+            switch (subCommand)
+            {
+            case 0x03:
+                size = 2;
+                answer = 0;
+                break;
+            case 0x15:
+                /* Serial pass-through: the parser takes the report byte, then a
+                 * count, then that many bytes. A bare acknowledgement is read as
+                 * one byte of rubbish and fails the whole cycle. */
+                size = 4;
+                answer = 0;
+                break;
+            case 0x16:
+                size = 4;
+                answer = 0;
+                break;
+            case 0x18:
+                /* Sent with every poll, and answered with a byte count the title
+                 * copies from: claiming bytes that never arrive overflows its ring
+                 * ("Serial ringbuf overflow"), so report none. */
+                size = 6;
+                answer = 0;
+                break;
+            default:
+                outputPacket.data[outputPacket.length++] = REPORT_SUCCESS;
+                index = inputPacket.length;
+                continue;
+            }
+
             outputPacket.data[outputPacket.length++] = REPORT_SUCCESS;
-            index = inputPacket.length;
-            continue;
+            outputPacket.data[outputPacket.length++] = answer;
         }
         break;
 

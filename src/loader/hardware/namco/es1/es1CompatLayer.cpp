@@ -94,11 +94,6 @@ bool addressIsMapped(uintptr_t address)
            protection == PAGE_EXECUTE_READWRITE || protection == PAGE_EXECUTE_WRITECOPY;
 }
 
-uint16_t analogueValue(LogicalAction action)
-{
-    const float value = std::clamp(gActionStates[PLAYER_1][action].analogValue, 0.0f, 1.0f);
-    return static_cast<uint16_t>(value * 65535.0f + 0.5f);
-}
 }
 
 int es1InstallHookTable(const Es1HookSpec *hooks, size_t count, const char *title)
@@ -220,67 +215,4 @@ int es1CompatWriteBlob(uint8_t *blob, size_t blobSize, int offset, int length,
         return 1;
     std::memcpy(blob + offset, buffer, static_cast<size_t>(length));
     return 0;
-}
-
-void es1CompatUpdateJvioInput(uint8_t *testSwitch, uint16_t *switches,
-                              uint16_t analogueInputs[16], uint16_t *coin,
-                              const Es1JvioInputProfile &profile,
-                              Es1JvioInputState &state)
-{
-    if (!testSwitch || !switches || !analogueInputs || !coin)
-        return;
-
-    /* A real cabinet switch remains electrically visible for more than one
-     * JVIO poll. SDL can queue key-down and key-up together, so reading only
-     * isActive could lose a quick tap before the title sees it. */
-    constexpr Uint64 MinimumCabinetPulseMs = 120;
-    const auto active = [](JVSPlayer player, LogicalAction action) {
-        return isActionActiveOrRecentlyPressed(player, action,
-                                               MinimumCabinetPulseMs);
-    };
-
-    const bool testActive = active(SYSTEM, LA_Test);
-    *testSwitch = testActive ? profile.testSwitchActiveValue : 0;
-    if (testActive && !state.previousTest)
-        log_info("System ES1: TEST switch pressed");
-    state.previousTest = testActive;
-    *switches = 0;
-    if (active(PLAYER_1, LA_Intrude))
-        *switches |= profile.interruptSwitch;
-    if (active(PLAYER_1, LA_ViewChange))
-        *switches |= profile.viewChangeSwitch;
-    if (active(PLAYER_1, LA_Service))
-        *switches |= profile.serviceSwitch;
-    if (active(PLAYER_1, LA_Enter))
-        *switches |= profile.testEnterSwitch;
-    if (active(PLAYER_1, LA_TestDown))
-        *switches |= profile.testDownSwitch;
-    if (active(PLAYER_1, LA_TestUp))
-        *switches |= profile.testUpSwitch;
-    if (getConfig()->namcoES1.cabinetMode == NAMCO_ES1_CABINET_TERMINAL)
-        *switches |= profile.terminalSwitch;
-
-    const bool gearUp = active(PLAYER_2, LA_GearUp);
-    const bool gearDown = active(PLAYER_2, LA_GearDown);
-    if (gearUp && !state.previousGearUp)
-        state.sequentialGear = std::min(state.sequentialGear + 1, 6);
-    if (gearDown && !state.previousGearDown)
-        state.sequentialGear = std::max(state.sequentialGear - 1, 1);
-    state.previousGearUp = gearUp;
-    state.previousGearDown = gearDown;
-
-    const int directGear = getWmmtDirectGear();
-    const int gear = directGear ? directGear : state.sequentialGear;
-    if (gear >= 1 && gear <= 6)
-        *switches |= profile.gearMasks[gear];
-
-    analogueInputs[profile.steeringInput] = analogueValue(LA_Steer);
-    analogueInputs[profile.gasInput] = analogueValue(LA_Gas);
-    analogueInputs[profile.brakeInput] = analogueValue(LA_Brake);
-
-    const bool coinPressed = active(PLAYER_1, LA_Coin);
-    if (coinPressed && !state.previousCoin)
-        ++state.coinCount;
-    state.previousCoin = coinPressed;
-    *coin = static_cast<uint16_t>(std::max(state.coinCount, 0));
 }

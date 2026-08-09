@@ -179,6 +179,73 @@ const ControlBinding gDefaultWmmtBindings[] = {
 const size_t gDefaultWmmtBindingsSize = sizeof(gDefaultWmmtBindings) / sizeof(gDefaultWmmtBindings[0]);
 
 /*
+ * Wangan Midnight Maximum Tune 4 on Namco System ES1.  The same cabinet as
+ * WMMT3 but a different panel, so it keeps its own section: no four-way cursor,
+ * a test menu on ENTER with TEST UP and TEST DOWN, and an H pattern shifter.
+ */
+const ControlBinding gDefaultWmmt4Bindings[] = {
+    // Cabinet axes.  The joystick indices are DirectInput's axis order - X, Y,
+    // Z, Rx, Ry, Rz - which is where a direct drive wheel puts the wheel on X,
+    // the accelerator on Z and the brake on Rz.
+    {INPUT_TYPE_KEY, 0, SDL_SCANCODE_LEFT, AXIS_MODE_DIGITAL, 0, false, PLAYER_1, LA_Steer_Left, -1, 0},
+    {INPUT_TYPE_KEY, 0, SDL_SCANCODE_RIGHT, AXIS_MODE_DIGITAL, 0, false, PLAYER_1, LA_Steer_Right, -1, 0},
+    {INPUT_TYPE_KEY, 0, SDL_SCANCODE_UP, AXIS_MODE_DIGITAL, 0, false, PLAYER_1, LA_Gas_Digital, -1, 0},
+    {INPUT_TYPE_KEY, 0, SDL_SCANCODE_DOWN, AXIS_MODE_DIGITAL, 0, false, PLAYER_1, LA_Brake_Digital, -1, 0},
+    {INPUT_TYPE_GAMEPAD_AXIS, 0, SDL_GAMEPAD_AXIS_LEFTX, AXIS_MODE_FULL, 0, false, PLAYER_1, LA_Steer, -1, 0},
+    {INPUT_TYPE_JOY_AXIS, 0, 0, AXIS_MODE_FULL, 0, false, PLAYER_1, LA_Steer, -1, 0},
+    {INPUT_TYPE_GAMEPAD_AXIS, 0, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, AXIS_MODE_FULL, 0, false, PLAYER_1, LA_Gas, -1, 0},
+    {INPUT_TYPE_JOY_AXIS, 0, 2, AXIS_MODE_FULL, 0, false, PLAYER_1, LA_Gas, -1, 0},
+    {INPUT_TYPE_GAMEPAD_AXIS, 0, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, AXIS_MODE_FULL, 0, false, PLAYER_1, LA_Brake, -1, 0},
+    {INPUT_TYPE_JOY_AXIS, 0, 5, AXIS_MODE_FULL, 0, false, PLAYER_1, LA_Brake, -1, 0},
+
+    // Sequential shifter
+    {INPUT_TYPE_KEY, 0, SDL_SCANCODE_A, AXIS_MODE_DIGITAL, 0, false, PLAYER_2, LA_GearUp, -1, 0},
+    {INPUT_TYPE_GAMEPAD_BUTTON, 0, SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, AXIS_MODE_DIGITAL, 0, false, PLAYER_2, LA_GearUp, -1, 0},
+    {INPUT_TYPE_JOY_BUTTON, 0, 13, AXIS_MODE_DIGITAL, 0, false, PLAYER_2, LA_GearUp, -1, 0},
+    {INPUT_TYPE_KEY, 0, SDL_SCANCODE_Z, AXIS_MODE_DIGITAL, 0, false, PLAYER_2, LA_GearDown, -1, 0},
+    {INPUT_TYPE_GAMEPAD_BUTTON, 0, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, AXIS_MODE_DIGITAL, 0, false, PLAYER_2, LA_GearDown, -1, 0},
+    {INPUT_TYPE_JOY_BUTTON, 0, 12, AXIS_MODE_DIGITAL, 0, false, PLAYER_2, LA_GearDown, -1, 0},
+
+    // Direct six-speed shifter
+    {INPUT_TYPE_KEY, 0, SDL_SCANCODE_KP_1, AXIS_MODE_DIGITAL, 0, false, PLAYER_1, LA_Gear1, -1, 0},
+    {INPUT_TYPE_KEY, 0, SDL_SCANCODE_KP_2, AXIS_MODE_DIGITAL, 0, false, PLAYER_1, LA_Gear2, -1, 0},
+    {INPUT_TYPE_KEY, 0, SDL_SCANCODE_KP_3, AXIS_MODE_DIGITAL, 0, false, PLAYER_1, LA_Gear3, -1, 0},
+    {INPUT_TYPE_KEY, 0, SDL_SCANCODE_KP_4, AXIS_MODE_DIGITAL, 0, false, PLAYER_1, LA_Gear4, -1, 0},
+    {INPUT_TYPE_KEY, 0, SDL_SCANCODE_KP_5, AXIS_MODE_DIGITAL, 0, false, PLAYER_1, LA_Gear5, -1, 0},
+    {INPUT_TYPE_KEY, 0, SDL_SCANCODE_KP_6, AXIS_MODE_DIGITAL, 0, false, PLAYER_1, LA_Gear6, -1, 0},
+
+    // Cabinet buttons
+    {INPUT_TYPE_KEY, 0, SDL_SCANCODE_V, AXIS_MODE_DIGITAL, 0, false, PLAYER_1, LA_ViewChange, -1, 0},
+    {INPUT_TYPE_GAMEPAD_BUTTON, 0, SDL_GAMEPAD_BUTTON_NORTH, AXIS_MODE_DIGITAL, 0, false, PLAYER_1, LA_ViewChange, -1, 0},
+    {INPUT_TYPE_JOY_BUTTON, 0, 22, AXIS_MODE_DIGITAL, 0, false, PLAYER_1, LA_ViewChange, -1, 0},
+    {INPUT_TYPE_KEY, 0, SDL_SCANCODE_M, AXIS_MODE_DIGITAL, 0, false, PLAYER_1, LA_Intrude, -1, 0},
+    {INPUT_TYPE_GAMEPAD_BUTTON, 0, SDL_GAMEPAD_BUTTON_WEST, AXIS_MODE_DIGITAL, 0, false, PLAYER_1, LA_Intrude, -1, 0},
+    {INPUT_TYPE_JOY_BUTTON, 0, 35, AXIS_MODE_DIGITAL, 0, false, PLAYER_1, LA_Intrude, -1, 0},
+
+    // Test menu
+    {INPUT_TYPE_KEY, 0, SDL_SCANCODE_T, AXIS_MODE_DIGITAL, 0, false, SYSTEM, LA_Test, -1, 0},
+    {INPUT_TYPE_JOY_BUTTON, 0, 24, AXIS_MODE_DIGITAL, 0, false, SYSTEM, LA_Test, -1, 0},
+    {INPUT_TYPE_KEY, 0, SDL_SCANCODE_S, AXIS_MODE_DIGITAL, 0, false, PLAYER_1, LA_Service, -1, 0},
+    {INPUT_TYPE_JOY_BUTTON, 0, 37, AXIS_MODE_DIGITAL, 0, false, PLAYER_1, LA_Service, -1, 0},
+    {INPUT_TYPE_KEY, 0, SDL_SCANCODE_RETURN, AXIS_MODE_DIGITAL, 0, false, PLAYER_1, LA_Enter, -1, 0},
+    {INPUT_TYPE_GAMEPAD_BUTTON, 0, SDL_GAMEPAD_BUTTON_SOUTH, AXIS_MODE_DIGITAL, 0, false, PLAYER_1, LA_Enter, -1, 0},
+    {INPUT_TYPE_JOY_BUTTON, 0, 21, AXIS_MODE_DIGITAL, 0, false, PLAYER_1, LA_Enter, -1, 0},
+    {INPUT_TYPE_KEY, 0, SDL_SCANCODE_I, AXIS_MODE_DIGITAL, 0, false, PLAYER_1, LA_TestUp, -1, 0},
+    {INPUT_TYPE_GAMEPAD_BUTTON, 0, SDL_GAMEPAD_BUTTON_DPAD_UP, AXIS_MODE_DIGITAL, 0, false, PLAYER_1, LA_TestUp, -1, 0},
+    {INPUT_TYPE_JOY_BUTTON, 0, 4, AXIS_MODE_DIGITAL, 0, false, PLAYER_1, LA_TestUp, -1, 0},
+    {INPUT_TYPE_KEY, 0, SDL_SCANCODE_K, AXIS_MODE_DIGITAL, 0, false, PLAYER_1, LA_TestDown, -1, 0},
+    {INPUT_TYPE_GAMEPAD_BUTTON, 0, SDL_GAMEPAD_BUTTON_DPAD_DOWN, AXIS_MODE_DIGITAL, 0, false, PLAYER_1, LA_TestDown, -1, 0},
+    {INPUT_TYPE_JOY_BUTTON, 0, 6, AXIS_MODE_DIGITAL, 0, false, PLAYER_1, LA_TestDown, -1, 0},
+
+    // Banapassport reader, driven through the external YaCardEmu API.
+    {INPUT_TYPE_KEY, 0, SDL_SCANCODE_INSERT, AXIS_MODE_DIGITAL, 0, false, PLAYER_1, LA_CardInsert, -1, 0},
+    {INPUT_TYPE_JOY_BUTTON, 0, 34, AXIS_MODE_DIGITAL, 0, false, PLAYER_1, LA_CardInsert, -1, 0},
+    {INPUT_TYPE_KEY, 0, SDL_SCANCODE_DELETE, AXIS_MODE_DIGITAL, 0, false, PLAYER_1, LA_CardEject, -1, 0},
+};
+
+const size_t gDefaultWmmt4BindingsSize = sizeof(gDefaultWmmt4Bindings) / sizeof(gDefaultWmmt4Bindings[0]);
+
+/*
  * Maximum Heat 3D on Namco System ES1.
  *
  * The executable's clInputDeviceJamma::update() consumes the steering,
@@ -540,6 +607,8 @@ int createDefaultControlsIni(const char *fileName)
     addBindingsToIni(ini, "Digital", gDefaultDigitalBindings, gDefaultDigitalBindingsSize);
     addBindingsToIni(ini, "Driving", gDefaultDrivingBindings, gDefaultDrivingBindingsSize);
     addBindingsToIni(ini, "WMMT", gDefaultWmmtBindings, gDefaultWmmtBindingsSize);
+    addBindingsToIni(ini, "WMMT4", gDefaultWmmt4Bindings, gDefaultWmmt4BindingsSize);
+    iniSetValue(ini, "WMMT4", "TestToggle", "1");
     addBindingsToIni(ini, "MaximumHeat3D", gDefaultMaximumHeat3dBindings,
                      gDefaultMaximumHeat3dBindingsSize);
     iniSetValue(ini, "MaximumHeat3D", "TestToggle", "1");

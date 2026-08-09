@@ -22,6 +22,8 @@ int64_t clockNow(void);
 void fpsLimiter(FpsLimit *stats);
 double calculateFps(void);
 void frameTiming(void);
+uint64_t videoSyncCount(void);
+void waitVideoSync(uint64_t index);
 
 #ifdef __cplusplus
 }

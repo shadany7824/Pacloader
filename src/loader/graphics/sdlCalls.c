@@ -507,6 +507,8 @@ void pollEvents()
     {
         if (gGrp == GROUP_HOD4 || gGrp == GROUP_HOD4_TEST)
             updateGunShake();
+        if (gGrp == GROUP_WMMT4_ES1)
+            updateWmmtEs1Shifter();
         updateCombinedAxes();
         processChangedActions();
     }

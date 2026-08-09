@@ -23,6 +23,24 @@ constexpr size_t MaximumQueuedBytes = 1024;
 constexpr uint8_t FrameHeader = 0xff;
 constexpr uint8_t HealthyResult[3] = {'E', '0', '0'};
 
+/* WMMT4's steering PCB is framed instead: 02, command, lengthHigh, lengthLow,
+ * payload, checksum, 03, the checksum a plain sum from the command byte on. The
+ * answer repeats the command with the payload length the title expects. */
+constexpr uint8_t FramedStart = 0x02;
+constexpr uint8_t FramedEnd = 0x03;
+constexpr size_t FramedOverhead = 6;
+
+int framedReplyLength(uint8_t command)
+{
+    /* Indexed from '0', as the title's own table is. */
+    static const int lengths[] = {1, 16, 4, 1, 1, 1, 1, 2, 2, 0, 0, 0, 0, 0, 0,
+                                  0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 24};
+    const int index = command - '0';
+    if (index < 0 || index >= (int)(sizeof(lengths) / sizeof(lengths[0])))
+        return 0;
+    return lengths[index];
+}
+
 std::mutex boardMutex;
 std::deque<uint8_t> commandBytes;
 std::deque<uint8_t> replyBytes;
@@ -43,13 +61,57 @@ void describeFrame(const uint8_t *frame, char *text, size_t size)
     }
 }
 
+/* Answers one framed command, or returns false when more bytes are needed. */
+bool consumeFramedCommand(void)
+{
+    if (commandBytes.size() < FramedOverhead)
+        return false;
+
+    const size_t payload = ((size_t)commandBytes[2] << 8) | commandBytes[3];
+    const size_t total = payload + FramedOverhead;
+    if (payload > MaximumQueuedBytes || commandBytes.size() < total)
+        return false;
+
+    const uint8_t command = commandBytes[1];
+    commandBytes.erase(commandBytes.begin(), commandBytes.begin() + total);
+
+    const int replyPayload = framedReplyLength(command);
+    if (replyPayload <= 0)
+        return true;
+
+    uint8_t reply[FramedOverhead + 32] = {};
+    reply[0] = FramedStart;
+    reply[1] = command;
+    reply[2] = (uint8_t)(replyPayload >> 8);
+    reply[3] = (uint8_t)replyPayload;
+    uint8_t checksum = 0;
+    for (int i = 1; i < 4 + replyPayload; ++i)
+        checksum = (uint8_t)(checksum + reply[i]);
+    reply[4 + replyPayload] = checksum;
+    reply[5 + replyPayload] = FramedEnd;
+    replyBytes.insert(replyBytes.end(), reply, reply + replyPayload + FramedOverhead);
+
+    if (++framesSeen == 1)
+        log_warn("System ES1 steering: first framed STR command '%c', answered %d bytes",
+                 command, replyPayload + (int)FramedOverhead);
+    return true;
+}
+
 void consumeCommands(void)
 {
     std::lock_guard<std::mutex> lock(boardMutex);
     for (;;)
     {
-        while (!commandBytes.empty() && commandBytes.front() != FrameHeader)
+        while (!commandBytes.empty() && commandBytes.front() != FrameHeader &&
+               commandBytes.front() != FramedStart)
             commandBytes.pop_front();
+
+        if (!commandBytes.empty() && commandBytes.front() == FramedStart)
+        {
+            if (!consumeFramedCommand())
+                return;
+            continue;
+        }
 
         if (commandBytes.size() < CommandLength)
             return;

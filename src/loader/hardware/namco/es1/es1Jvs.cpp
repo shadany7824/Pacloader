@@ -222,6 +222,17 @@ extern "C" int es1JvsSerialIoctl(int fd, unsigned long request, void *argument)
         return 0;
     }
 
+    /* The cabinet wires the JVS sense line to CTS, and the master keeps handing
+     * out addresses while it reads that bit as clear. Leaving the caller's word
+     * untouched left it reading the stack, so enumeration never finished. */
+    constexpr unsigned long LinuxTiocmget = 0x5415;
+    constexpr int LinuxTiocmCts = 0x020;
+    if (request == LinuxTiocmget && argument)
+    {
+        *static_cast<int *>(argument) = getSenseLine() == 1 ? LinuxTiocmCts : 0;
+        return 0;
+    }
+
     /* The ES1 game only uses termios/RS485 setup here; a queue needs neither. */
     return 0;
 }

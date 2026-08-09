@@ -26,10 +26,12 @@ constexpr Es1Title Titles[] = {
         {
             {192, 168, 92, 11},
             {255, 255, 255, 0},
-            /* The IC card reader owns /dev/ttyS1 here, so the shared kickback
-             * device must not answer for it. */
-            nullptr,
+            /* The IC card reader owns /dev/ttyS1 here; the steering PCB is on
+             * /dev/ttyS0 at 19200, which the title calls "Str2". */
+            "/dev/ttyS0",
             1,
+            /* The JVIO master will not talk to a board whose name lacks this. */
+            "namco ltd.;NA-JV;Ver1.00;JPN,Multipurpose",
         },
     },
     {
@@ -47,11 +49,12 @@ constexpr Es1Title Titles[] = {
             {0, 0, 0, 0},
             "/dev/ttyS1",
             0,
+            nullptr,
         },
     },
 };
 
-constexpr Es1TitleQuirks NeutralQuirks = {{0, 0, 0, 0}, {0, 0, 0, 0}, nullptr, 0};
+constexpr Es1TitleQuirks NeutralQuirks = {{0, 0, 0, 0}, {0, 0, 0, 0}, nullptr, 0, nullptr};
 
 const Es1Title *g_current = nullptr;
 } // namespace

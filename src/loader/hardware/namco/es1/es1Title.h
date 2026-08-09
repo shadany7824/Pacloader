@@ -32,6 +32,13 @@ typedef struct Es1TitleQuirks
      * error, so end of directory has to be signalled as EBADF.
      */
     int readdirEndOfDirectoryIsError;
+
+    /*
+     * What the loader's JVS board calls itself, or NULL for the ES1 default.
+     * A title's JVIO master checks this before it will talk to the board: WMMT4
+     * requires the string to contain "NA-JV".
+     */
+    const char *jvsBoardIdent;
 } Es1TitleQuirks;
 
 /*

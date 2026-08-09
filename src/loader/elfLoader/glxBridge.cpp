@@ -291,20 +291,31 @@ extern "C" int bridgeGlxSwapIntervalSGI(int interval)
     return setSDLSwapInterval(interval) ? 0 : 1;
 }
 
+/* The title paces its race simulation on this counter, so it has to advance with
+ * time rather than with each read - counting reads ran the race far too fast.
+ * It comes from the frame limiter so the two pace against one grid. */
 extern "C" int bridgeGlxGetVideoSyncSGI(unsigned int *count)
 {
-    static unsigned int videoSyncCount = 0;
     if (count)
-        *count = ++videoSyncCount;
+        *count = (unsigned int)videoSyncCount();
     return 0;
 }
 
 extern "C" int bridgeGlxWaitVideoSyncSGI(int divisor, int remainder,
                                            unsigned int *count)
 {
-    (void)divisor;
-    (void)remainder;
-    return bridgeGlxGetVideoSyncSGI(count);
+    if (divisor <= 0)
+        divisor = 1;
+    remainder = remainder < 0 ? 0 : remainder % divisor;
+
+    uint64_t target = videoSyncCount() + 1;
+    while ((target % (uint64_t)divisor) != (uint64_t)remainder)
+        ++target;
+    waitVideoSync(target);
+
+    if (count)
+        *count = (unsigned int)videoSyncCount();
+    return 0;
 }
 
 extern "C" void *bridgeGlxGetProcAddress(const char *name)

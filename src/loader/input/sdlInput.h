@@ -271,6 +271,7 @@ void setDefaultMappings();
 void remapPerGame();
 void initActionProperties();
 void updateGunShake();
+void updateWmmtEs1Shifter();
 void updateCombinedAxes();
 void detectCombinedAxes();
 void getLogicalActionString(const ControlBinding *binding, char *out_str, size_t str_size, const char *name);

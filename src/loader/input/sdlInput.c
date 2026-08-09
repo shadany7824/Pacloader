@@ -205,6 +205,7 @@ extern const ControlBinding gDefaultCommonBindings[];
 extern const ControlBinding gDefaultDigitalBindings[];
 extern const ControlBinding gDefaultDrivingBindings[];
 extern const ControlBinding gDefaultWmmtBindings[];
+extern const ControlBinding gDefaultWmmt4Bindings[];
 extern const ControlBinding gDefaultMaximumHeat3dBindings[];
 extern const ControlBinding gDefaultFlyingBindings[];
 extern const ControlBinding gDefaultShootingBindings[];
@@ -214,6 +215,7 @@ extern const size_t gDefaultCommonBindingsSize;
 extern const size_t gDefaultDigitalBindingsSize;
 extern const size_t gDefaultDrivingBindingsSize;
 extern const size_t gDefaultWmmtBindingsSize;
+extern const size_t gDefaultWmmt4BindingsSize;
 extern const size_t gDefaultMaximumHeat3dBindingsSize;
 extern const size_t gDefaultFlyingBindingsSize;
 extern const size_t gDefaultShootingBindingsSize;
@@ -293,8 +295,10 @@ int initSdlInput(const char *controlsPath)
         loadGlobalConfig(ini);
         loadProfileFromIni(iniGetSection(ini, "Common"));
         // Namco N2 reports itself as a driving game but has its own panel.
-        if (gGrp == GROUP_WMMT3 || gGrp == GROUP_WMMT4_ES1)
+        if (gGrp == GROUP_WMMT3)
             isProfileLoaded = loadProfileFromIni(iniGetSection(ini, "WMMT"));
+        else if (gGrp == GROUP_WMMT4_ES1)
+            isProfileLoaded = loadProfileFromIni(iniGetSection(ini, "WMMT4"));
         else if (gGrp == GROUP_MAXIMUM_HEAT_3D)
             isProfileLoaded = loadProfileFromIni(iniGetSection(ini, "MaximumHeat3D"));
         else if (gameType == DRIVING)
@@ -613,6 +617,23 @@ void remapPerGame()
          * shifter, and WMMT3 reads its card through /dev/ttyM2 anyway. */
         gJvsMap[PLAYER_1][LA_CardInsert] = (JVSActionMapping){JVS_CALL_NONE, NONE};
     }
+    else if (gGrp == GROUP_WMMT4_ES1)
+    {
+        /* The switch bits the cabinet's JVS board reports.  The shifter is an H
+         * pattern whose gears each close two of them, so it is applied by
+         * updateWmmtEs1Shifter() rather than mapped action by action. */
+        gJvsMap[PLAYER_1][LA_ViewChange] = (JVSActionMapping){JVS_CALL_SWITCH, BUTTON_9};
+        gJvsMap[PLAYER_1][LA_Intrude] = (JVSActionMapping){JVS_CALL_SWITCH, BUTTON_10};
+        gJvsMap[PLAYER_1][LA_Enter] = (JVSActionMapping){JVS_CALL_SWITCH, BUTTON_1};
+        gJvsMap[PLAYER_1][LA_TestUp] = (JVSActionMapping){JVS_CALL_SWITCH, BUTTON_UP};
+        gJvsMap[PLAYER_1][LA_TestDown] = (JVSActionMapping){JVS_CALL_SWITCH, BUTTON_DOWN};
+        gJvsMap[PLAYER_1][LA_Service] = (JVSActionMapping){JVS_CALL_SWITCH, BUTTON_SERVICE};
+        gJvsMap[PLAYER_2][LA_GearUp] = (JVSActionMapping){JVS_CALL_NONE, NONE};
+        gJvsMap[PLAYER_2][LA_GearDown] = (JVSActionMapping){JVS_CALL_NONE, NONE};
+
+        /* The card goes through the reader on ttyS1, not a panel switch. */
+        gJvsMap[PLAYER_1][LA_CardInsert] = (JVSActionMapping){JVS_CALL_NONE, NONE};
+    }
     else if (gGrp == GROUP_MAXIMUM_HEAT_3D)
     {
         /* Maximum Heat 3D's ES1 Jamma panel: clInputDeviceJamma::update()
@@ -718,6 +739,11 @@ void initActionProperties()
             gActionProperties[p][LA_CardInsert].isToggle = false;
         }
     }
+    /* The cabinet's TEST switch is a latching one, so holding a key down is not
+     * how it is operated; controls.ini can still override this with TestToggle. */
+    if (gGrp == GROUP_WMMT4_ES1)
+        gActionProperties[SYSTEM][LA_Test].isToggle = true;
+
     gActionProperties[PLAYER_1][LA_Flying_X].isCentering = true;
     gActionProperties[PLAYER_1][LA_Flying_Y].isCentering = true;
     gActionProperties[PLAYER_1][LA_Throttle].isCentering = true;
@@ -916,10 +942,15 @@ void setDefaultMappings()
     const ControlBinding *game_bindings = NULL;
     size_t bindingsCount = 0;
 
-    if (gGrp == GROUP_WMMT3 || gGrp == GROUP_WMMT4_ES1)
+    if (gGrp == GROUP_WMMT3)
     {
         game_bindings = gDefaultWmmtBindings;
         bindingsCount = gDefaultWmmtBindingsSize;
+    }
+    else if (gGrp == GROUP_WMMT4_ES1)
+    {
+        game_bindings = gDefaultWmmt4Bindings;
+        bindingsCount = gDefaultWmmt4BindingsSize;
     }
     else if (gGrp == GROUP_MAXIMUM_HEAT_3D)
     {
@@ -2258,6 +2289,40 @@ void processChangedActions()
         }
     }
     gNumChangedActions = 0; // Clear the list for the next frame
+}
+
+/* The WMMT4 cabinet's shifter is an H pattern: every gear closes two of the four
+ * shifter switches, which the one action per switch mapping cannot express, so
+ * the gear is folded into the switch state here. */
+void updateWmmtEs1Shifter()
+{
+    /* Starts in neutral, which closes none of the shifter switches; the first
+     * GearUp selects first and GearDown never goes back below it. */
+    static int sequentialGear = 0;
+    static bool previousUp = false;
+    static bool previousDown = false;
+
+    const bool up = gActionStates[PLAYER_2][LA_GearUp].isActive;
+    const bool down = gActionStates[PLAYER_2][LA_GearDown].isActive;
+    if (up && !previousUp && sequentialGear < gShifterGears)
+        sequentialGear++;
+    if (down && !previousDown && sequentialGear > 1)
+        sequentialGear--;
+    previousUp = up;
+    previousDown = down;
+
+    const int directGear = getWmmtDirectGear();
+    const int gear = directGear ? directGear : sequentialGear;
+
+    setSwitch(PLAYER_1, BUTTON_5, gear == 1 || gear == 2);
+    setSwitch(PLAYER_1, BUTTON_6, gear == 5 || gear == 6);
+    setSwitch(PLAYER_1, BUTTON_3, gear == 1 || gear == 3 || gear == 5);
+    setSwitch(PLAYER_1, BUTTON_4, gear == 2 || gear == 4 || gear == 6);
+
+    /* The title reads its own cabinet role from this switch rather than a
+     * setting, so it follows the configured cabinet mode. */
+    setSwitch(PLAYER_1, BUTTON_2,
+              getConfig()->namcoES1.cabinetMode == NAMCO_ES1_CABINET_TERMINAL);
 }
 
 /* HOD4 gun shake.  The direction threshold is in the game's native resolution
