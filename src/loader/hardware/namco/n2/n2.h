@@ -6,16 +6,6 @@
 extern "C" {
 #endif
 
-typedef enum
-{
-    N2_GAME_NONE = 0,
-    N2_GAME_WMMT3,
-    N2_GAME_WMMT3DX,
-    N2_GAME_WMMT3DX_PLUS,
-    N2_GAME_WMMT3_FAMILY,
-    N2_GAME_CSNEO
-} N2Game;
-
 // True for the Wangan Midnight titles, which share an engine and a cabinet
 int n2IsWanganTitle(void);
 
@@ -31,12 +21,9 @@ int n2InitializeGraphics(void);
 int n2HandleSystemCommand(const char *command);
 // Handles N2-specific host hotkeys before SDL 1.2 passes them to the game.
 int n2HandleHostKey(int key, uint32_t modifiers);
-/*
- * Runs the sequential shifter from the GearUp/GearDown bindings and reports
- * the selected gear, or 0 when the raw shifter switches are in use.
- * n2GearSwitchBits() turns that gear into the PLAYER_1 JVS switch bits the
- * cabinet's shifter is wired to.
- */
+/* Runs the sequential shifter from the GearUp/GearDown bindings and reports the
+ * gear, or 0 when the raw shifter switches are in use.  n2GearSwitchBits()
+ * turns that gear into the JVS switch bits the cabinet is wired to. */
 int n2UpdateShifter(void);
 uint16_t n2GearSwitchBits(int gear);
 
@@ -53,7 +40,6 @@ enum
 };
 uint16_t n2AnalogueCount(int channel, float normalized);
 
-N2Game n2GetGame(void);
 const char *n2GetGameTitle(void);
 const char *n2GetGameShortTitle(void);
 const char *n2GetGameId(void);

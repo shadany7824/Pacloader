@@ -88,6 +88,10 @@ namespace NetworkBridge
     extern "C" void bridgeFreeaddrinfo(LinuxAddrinfo *result);
     extern "C" unsigned int bridgeIf_nametoindex(const char *name);
     extern "C" char *bridgeIf_indextoname(unsigned int index, char *name);
+    void primaryHostInterface(unsigned long &address, unsigned long &netmask,
+                              unsigned char mac[6]);
+    extern "C" int bridgeGetifaddrs(void **result);
+    extern "C" void bridgeFreeifaddrs(void *list);
     extern "C" uint16_t bridgeNtohs(uint16_t netshort);
     extern "C" uint16_t bridgeHtons(uint16_t hostshort);
     extern "C" uint32_t bridgeNtohl(uint32_t netlong);

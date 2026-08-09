@@ -1,4 +1,6 @@
 #include "es1Network.h"
+#include "es1.h"
+#include "es1Title.h"
 
 #include "../../../log/log.h"
 
@@ -51,6 +53,18 @@ void parseDottedQuad(const char *text, unsigned char out[4])
         out[i] = static_cast<unsigned char>(parts[i] & 0xff);
 }
 
+/* Some titles need a fixed private address on the guest's eth0 rather than the
+ * host adapter's, because their cabinet LAN discovery compares against it. */
+void applyTitleEth0(Es1InterfaceState &target)
+{
+    const Es1TitleQuirks *quirks = es1TitleQuirks();
+    const unsigned char *address = quirks->eth0Address;
+    if (!address[0] && !address[1] && !address[2] && !address[3])
+        return;
+    std::memcpy(target.guestAddress, address, sizeof(target.guestAddress));
+    std::memcpy(target.mask, quirks->eth0Mask, sizeof(target.mask));
+}
+
 void initializeStateLocked()
 {
     if (state.initialized)
@@ -76,6 +90,7 @@ void initializeStateLocked()
         parseDottedQuad(ip.IpAddress.String, state.adapterAddress);
         std::memcpy(state.guestAddress, state.adapterAddress, sizeof(state.guestAddress));
         parseDottedQuad(ip.IpMask.String, state.mask);
+        applyTitleEth0(state);
         const UINT copied = std::min<UINT>(adapter->AddressLength, 6);
         std::memcpy(state.mac, adapter->Address, copied);
         state.link = 1;
@@ -86,6 +101,7 @@ void initializeStateLocked()
     }
 
     log_warn("System ES1: no usable host adapter; using loopback eth0");
+    applyTitleEth0(state);
 }
 
 std::string redirectPath(const char *command)
@@ -183,13 +199,9 @@ int writeInterfaceReport(const char *command)
 
 void clearConflictReports()
 {
-    /*
-     * The ES1 bootstrap normally fills these files with replies from the
-     * cabinet LAN.  An isolated virtual cabinet has no ARP/pinger replies;
-     * leaving a report from an earlier run in place makes the game's
-     * clIPConflictChecker compare our own address twice and raise the real
-     * PCB-ID duplicate error.
-     */
+    /* The bootstrap fills these from cabinet LAN replies an isolated virtual
+     * cabinet never gets, and a report left from an earlier run makes the
+     * conflict checker see our own address twice and raise a duplicate. */
     std::error_code error;
     /* Keep the parser's input valid while pointing it at a non-local address.
      * The following arping operation is virtualized and produces no reply;

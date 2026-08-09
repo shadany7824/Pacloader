@@ -120,11 +120,11 @@ int PthreadEmu::pthreadCondWait(void* cond, void* mutex) {
     
     // Wait on condition
     BOOL result = SleepConditionVariableCS(&c->cv, &m->cs, INFINITE);
-    
+
     // Restore lock state
     m->owner_thread = GetCurrentThreadId();
     m->lock_count = saved_count;
-    
+
     return result ? 0 : LINUX_EINVAL;
 }
 
@@ -149,18 +149,15 @@ int PthreadEmu::pthreadCondTimedwait(void* cond, void* mutex,
     // Wait on condition with timeout
     BOOL result = SleepConditionVariableCS(&c->cv, &m->cs, timeout_ms);
     DWORD error = result ? 0 : GetLastError();
-    
+
     // Restore lock state
     m->owner_thread = GetCurrentThreadId();
     m->lock_count = saved_count;
-    
+
     if (!result) {
-        if (error == ERROR_TIMEOUT) {
-            return LINUX_ETIMEDOUT;
-        }
-        return LINUX_EINVAL;
+        return error == ERROR_TIMEOUT ? LINUX_ETIMEDOUT : LINUX_EINVAL;
     }
-    
+
     return 0;
 }
 

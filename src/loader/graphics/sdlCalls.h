@@ -16,6 +16,7 @@ SDL_GLContext getSDLContext();
 bool makeSDLCurrent(SDL_Window *win, SDL_GLContext ctx);
 bool setSDLSwapInterval(int interval);
 bool runOnSDLMainThread(SDL_MainThreadCallback callback, void *userdata, bool waitComplete);
+void raiseSDLWindow(void);
 void sdlQuit();
 void pollEvents();
 

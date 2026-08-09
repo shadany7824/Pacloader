@@ -190,6 +190,10 @@ extern "C"
     int bridgeUngetc(int c, FILE *stream);
 
     void *bridgeOpendir(const char *name);
+    /* Plain readdir with no title-specific behaviour; bridgeReaddir() is the
+     * same thing plus the WMMT4 end-of-directory quirk documented at its
+     * definition. */
+    struct linux_dirent *bridgeReaddirPosix(void *dirp);
     struct linux_dirent *bridgeReaddir(void *dirp);
     int bridgeClosedir(void *dirp);
 

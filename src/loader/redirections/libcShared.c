@@ -7,6 +7,7 @@
 #include "libcShared.h"
 #include "../config/config.h"
 #include "loader/elfLoader/symbolResolver.hpp"
+#include "../hardware/namco/es1/es1AlinCompat.h"
 
 #ifdef __linux__
 #include <dlfcn.h>
@@ -156,6 +157,10 @@ char *sharedGetenv(const char *name)
     {
         return "";
     }
+    if (strcmp(name, "__NU_SCREEN_WINDOWED") == 0 && gGrp == GROUP_WMMT4_ES1)
+    {
+        return "1";
+    }
     return _getenv(name);
 }
 
@@ -264,6 +269,10 @@ void *sharedDlopen(const char *filename, int flags)
         es1AudioDlopen(filename, &handle))
         return handle;
 
+    if (getConfig()->platform == ARCADE_PLATFORM_NAMCO_ES1 &&
+        es1AlinDlopen(filename, &handle))
+        return handle;
+
     bridgeLoadNeededLibrary(filename);
 
     handle = bridgeLibraryHandle(filename);
@@ -277,6 +286,10 @@ void *sharedDlsym(void *handle, const char *symbol)
 {
 #ifdef _WIN32
     void *es1Function = es1AudioDlsym(handle, symbol);
+    if (es1Function)
+        return es1Function;
+
+    es1Function = es1AlinDlsym(handle, symbol);
     if (es1Function)
         return es1Function;
 
@@ -294,6 +307,8 @@ int sharedDlclose(void *handle)
 {
 #ifdef _WIN32
     if (es1AudioDlclose(handle) == 0)
+        return 0;
+    if (es1AlinDlclose(handle) == 0)
         return 0;
     return 0;
 #else

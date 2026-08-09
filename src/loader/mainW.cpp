@@ -21,6 +21,7 @@
 #include "elfLoader/networkBridge.hpp"
 #include "elfLoader/mathBridge.hpp"
 #include "elfLoader/symbolResolver.hpp"
+#include "elfLoader/threadWatchdog.hpp"
 #include "elfLoader/pthread/pthreadEmu.hpp"
 #include "log/log.h"
 #include "graphics/gpuVendor.h"
@@ -82,12 +83,9 @@ void initBridges()
 int main(int argc, char *argv[], char *envp[])
 {
     pacFrontendInitialize();
-    /*
-     * Warnings and above by default, but a crash usually needs the lines under
-     * that - which shared object landed at which address, which symbol was
-     * resolved where - and rebuilding to get them is a poor trade when the
-     * failure is hard to reproduce.  LL_LOG_LEVEL opens it up in place.
-     */
+    /* Warnings and above by default, but a crash usually needs what is under
+     * that - where each shared object landed, where each symbol resolved - and
+     * rebuilding for it is a poor trade.  LL_LOG_LEVEL opens it up in place. */
     logSetMinLevel(LOG_WARN);
     if (const char *requested = std::getenv("LL_LOG_LEVEL"))
     {
@@ -230,6 +228,8 @@ int main(int argc, char *argv[], char *envp[])
     }
 
     final_argv_arr[final_argc] = NULL;
+
+    ThreadWatchdog::Start();
 
     if (!loader.Execute(final_argc, final_argv_arr, envp))
     {

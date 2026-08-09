@@ -3,10 +3,38 @@
 #include <cstdlib>
 #include <cstring>
 #include <cerrno>
+#include <mutex>
+#include <unordered_set>
 #include <wchar.h>
 
 #include "../log/log.h"
 #include <stdio.h>
+
+namespace
+{
+std::mutex &guestAllocationMutex()
+{
+    static auto *mutex = new std::mutex();
+    return *mutex;
+}
+
+std::unordered_set<void *> &guestAllocations()
+{
+    static auto *allocations = new std::unordered_set<void *>();
+    return *allocations;
+}
+
+void *trackedAlignedMalloc(size_t size, size_t alignment)
+{
+    void *ptr = _aligned_malloc(size, alignment);
+    if (ptr)
+    {
+        std::lock_guard<std::mutex> lock(guestAllocationMutex());
+        guestAllocations().insert(ptr);
+    }
+    return ptr;
+}
+}
 
 void *MemoryManager::AllocateExecutable(size_t size, void *requestedAddr)
 {
@@ -237,7 +265,7 @@ size_t MemoryManager::customStrxfrm(char *dest, const char *src, size_t n)
 
 void *MemoryManager::customMalloc(size_t size)
 {
-    return _aligned_malloc(size, 16);
+    return trackedAlignedMalloc(size, 16);
 }
 
 struct mallinfo MemoryManager::customMallinfo(void)
@@ -271,6 +299,17 @@ struct mallinfo MemoryManager::customMallinfo(void)
 
 void MemoryManager::customFree(void *ptr)
 {
+    if (!ptr)
+        return;
+
+    {
+        std::lock_guard<std::mutex> lock(guestAllocationMutex());
+        if (guestAllocations().erase(ptr) == 0)
+        {
+            log_warn("MemoryManager: ignored free of an unowned guest pointer %p", ptr);
+            return;
+        }
+    }
     _aligned_free(ptr);
 }
 
@@ -281,7 +320,7 @@ void *MemoryManager::customCalloc(size_t nmemb, size_t size)
         return NULL;
     }
     size_t total = nmemb * size;
-    void *ptr = _aligned_malloc(total, 16);
+    void *ptr = trackedAlignedMalloc(total, 16);
     if (ptr)
         memset(ptr, 0, total);
     return ptr;
@@ -289,12 +328,35 @@ void *MemoryManager::customCalloc(size_t nmemb, size_t size)
 
 void *MemoryManager::customRealloc(void *ptr, size_t size)
 {
-    return _aligned_realloc(ptr, size, 16);
+    if (!ptr)
+        return customMalloc(size);
+    if (size == 0)
+    {
+        customFree(ptr);
+        return nullptr;
+    }
+
+    std::lock_guard<std::mutex> lock(guestAllocationMutex());
+    auto &allocations = guestAllocations();
+    const auto entry = allocations.find(ptr);
+    if (entry == allocations.end())
+    {
+        log_warn("MemoryManager: rejected realloc of an unowned guest pointer %p", ptr);
+        return nullptr;
+    }
+
+    void *replacement = _aligned_realloc(ptr, size, 16);
+    if (replacement)
+    {
+        allocations.erase(entry);
+        allocations.insert(replacement);
+    }
+    return replacement;
 }
 
 void *MemoryManager::customMemalign(size_t alignment, size_t size)
 {
-    return _aligned_malloc(size, alignment);
+    return trackedAlignedMalloc(size, alignment);
 } 
 
 int MemoryManager::customPosixMemalign(void **ptr, size_t alignment, size_t size)
@@ -304,7 +366,7 @@ int MemoryManager::customPosixMemalign(void **ptr, size_t alignment, size_t size
         return EINVAL;
     }
 
-    *ptr = _aligned_malloc(size, alignment);
+    *ptr = trackedAlignedMalloc(size, alignment);
     return *ptr ? 0 : ENOMEM;
 }
 
@@ -312,7 +374,7 @@ char *MemoryManager::customStrndup(const char *src, size_t size)
 {
     size_t len = strnlen(src, size);
     len = len < size ? len : size;
-    char *dst = (char *)_aligned_malloc(len + 1, 16);
+    char *dst = static_cast<char *>(trackedAlignedMalloc(len + 1, 16));
     if (!dst)
         return NULL;
     memcpy(dst, src, len);
@@ -325,7 +387,7 @@ char *MemoryManager::customStrdup(const char *s)
     if (!s)
         return nullptr;
     size_t len = strlen(s) + 1;
-    void *ptr = _aligned_malloc(len, 16);
+    void *ptr = trackedAlignedMalloc(len, 16);
     if (ptr)
         memcpy(ptr, s, len);
     return (char *)ptr;

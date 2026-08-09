@@ -24,25 +24,28 @@
 #include "../../common/cardControl.h"
 #include "../../../log/log.h"
 
-/*
- * The card reader on /dev/ttyM2, here a named pipe served by an external
- * YaCardEmu. The game polls it from the frame path, so nothing on its side may
- * block - one waiting Win32 call under a lock the frame path also takes is
- * enough to stall rendering.
- *
- * So a background thread owns the pipe and does all the connecting and moving
- * of bytes. The game-facing entry points touch two byte queues and an atomic
- * flag, and no blocking call is ever made while the lock is held.
- */
+/* The card reader on /dev/ttyM2, a named pipe served by an external YaCardEmu.
+ * The game polls it from the frame path, so a background thread owns the pipe
+ * and no blocking call is ever made while the lock is held. */
 
 namespace
 {
 constexpr int cardDescriptor = 0x7202;
-constexpr char cardDevicePath[] = "/dev/ttyM2";
 constexpr DWORD reconnectIntervalMs = 1000;
 // Plenty for the reader's framing; a stuck consumer must not grow this without
 // bound, and dropping the oldest bytes of a dead conversation is harmless.
 constexpr size_t maximumQueuedBytes = 64 * 1024;
+
+/* The same Sanwa reader appears on N2 and on the ES1 terminal cabinet, so one
+ * implementation serves both; only the serial device and the config block
+ * differ, and the two platforms never run at once. */
+const char *g_devicePath = "/dev/ttyM2";
+bool g_useEs1Config = false;
+
+const YaCardEmuConfig &cardConfig()
+{
+    return g_useEs1Config ? getConfig()->namcoES1.card : getConfig()->namcoN2.card;
+}
 
 enum class LinkState
 {
@@ -75,7 +78,7 @@ std::atomic<bool> cardInserted{false};
 
 void logFrame(const char *direction, const uint8_t *bytes, size_t size)
 {
-    if (!getConfig()->namcoN2.card.diagnostics || !bytes || !size)
+    if (!cardConfig().diagnostics || !bytes || !size)
         return;
 
     std::ostringstream line;
@@ -103,7 +106,7 @@ std::string urlEncode(const char *value)
 
 bool httpRequest(const char *method, const std::string &path, std::string *body)
 {
-    const NamcoN2CardConfig &card = getConfig()->namcoN2.card;
+    const YaCardEmuConfig &card = cardConfig();
     if (!card.apiHost[0] || card.apiPort <= 0 || card.apiPort > 65535)
         return false;
 
@@ -205,8 +208,8 @@ bool refreshApiStatus(bool announce)
     }
     if (okay != wasConnected)
         log_info("Namco N2 card API: %s at http://%s:%d",
-                 okay ? "connected" : "disconnected", getConfig()->namcoN2.card.apiHost,
-                 getConfig()->namcoN2.card.apiPort);
+                 okay ? "connected" : "disconnected", cardConfig().apiHost,
+                 cardConfig().apiPort);
     if (announce)
         log_info("Namco N2 card status: pipe=%s api=%s inserted=%s",
                  linkState.load() == LinkState::Connected ? "connected" : "disconnected",
@@ -217,7 +220,7 @@ bool refreshApiStatus(bool announce)
 
 void performControlRequest(ControlRequest request)
 {
-    const char *cardName = getConfig()->namcoN2.card.cardName;
+    const char *cardName = cardConfig().cardName;
     std::string ignored;
     switch (request)
     {
@@ -292,13 +295,12 @@ void cardControlWorker()
 
 bool launchYaCardEmu()
 {
-    EmulatorConfig *config = getConfig();
-    if (!config->namcoN2.card.autoStart || !config->namcoN2.card.executablePath[0] ||
+    if (!cardConfig().autoStart || !cardConfig().executablePath[0] ||
         launchAttempted)
         return false;
 
     launchAttempted = true;
-    std::filesystem::path executable(config->namcoN2.card.executablePath);
+    std::filesystem::path executable(cardConfig().executablePath);
     std::string commandLine = "\"" + executable.string() + "\"";
     std::vector<char> mutableCommand(commandLine.begin(), commandLine.end());
     mutableCommand.push_back('\0');
@@ -328,8 +330,7 @@ bool launchYaCardEmu()
 // Runs on the worker thread only, so it is free to block.
 HANDLE openCardPipe()
 {
-    EmulatorConfig *config = getConfig();
-    const char *pipeName = config->namcoN2.card.pipeName;
+    const char *pipeName = cardConfig().pipeName;
     if (!pipeName[0])
         return INVALID_HANDLE_VALUE;
 
@@ -355,12 +356,9 @@ HANDLE openCardPipe()
         return INVALID_HANDLE_VALUE;
     }
 
-    /*
-     * Byte mode, and deliberately not PIPE_NOWAIT: the worker owns this handle
-     * and is allowed to block, while a non-blocking pipe would hand back short
-     * writes that are easy to drop silently.  Reads are always preceded by a
-     * PeekNamedPipe, so ReadFile never waits either.
-     */
+    /* Byte mode, deliberately not PIPE_NOWAIT: the worker owns this handle and
+     * may block, and a non-blocking pipe would hand back short writes.  Reads
+     * are always preceded by PeekNamedPipe, so ReadFile never waits. */
     DWORD mode = PIPE_READMODE_BYTE;
     SetNamedPipeHandleState(pipe, &mode, nullptr, nullptr);
     connectFailureReported = false;
@@ -368,12 +366,9 @@ HANDLE openCardPipe()
     return pipe;
 }
 
-/*
- * Reader frames are STX, LEN, payload..., ETX, BCC, where LEN counts every
- * byte from the command through the BCC, so a frame is LEN + 2 bytes long.
- * ACK/NACK/ENQ travel as single bytes.  Returns 0 while the head of the buffer
- * is still an incomplete frame.
- */
+/* Frames are STX, LEN, payload, ETX, BCC, with LEN counting the command through
+ * the BCC, so a frame is LEN + 2 bytes.  ACK/NACK/ENQ are single bytes, and 0
+ * means the head of the buffer is still incomplete. */
 size_t framedLength(const std::deque<uint8_t> &bytes)
 {
     if (bytes.empty())
@@ -389,16 +384,9 @@ size_t framedLength(const std::deque<uint8_t> &bytes)
     return bytes.size() < length ? 0 : length;
 }
 
-/*
- * YaCardEmu answers Cancel (0x40) with ILLEGAL_COMMAND and keeps reporting it
- * until another command clears it. That hangs the "no card" branch:
- * runSelect() leaves its wait loop only on a plain job-end result, and
- * ILLEGAL_COMMAND maps to CANT EXEC ERR, which re-arms the insert instead - so
- * the new-card sequence is never reached.
- *
- * Real hardware answers a cancel that aborted a command with NO_JOB. Only the
- * status reply to a cancel is touched.
- */
+/* YaCardEmu answers Cancel with ILLEGAL_COMMAND, which re-arms the insert and
+ * hangs the "no card" branch; real hardware answers NO_JOB.  Only the status
+ * reply to a cancel is touched. */
 void neutraliseCancelStatus(std::vector<uint8_t> &frame)
 {
     constexpr uint8_t cancelCommand = 0x40;
@@ -415,24 +403,16 @@ void neutraliseCancelStatus(std::vector<uint8_t> &frame)
 
 void dropQueues()
 {
-    /*
-     * A reconnect starts a fresh conversation.  Carrying half of the previous
-     * one across would leave the game parsing a reply to a command the new
-     * reader never saw, which is the kind of desync that only clears by
-     * restarting both sides.
-     */
+    /* A reconnect starts a fresh conversation; carrying half of the previous one
+     * across leaves the game parsing a reply the new reader never sent. */
     std::lock_guard<std::mutex> lock(bufferMutex);
     receiveQueue.clear();
     transmitQueue.clear();
 }
 
-/*
- * Replies are paced to the cabinet's line speed. clCardPrinter caches the last
- * status byte it saw, and a pipe delivering a whole reply at once puts a
- * briefly-held status into that cache far more often than 38400 baud would.
- *
- * etc/config.ini runs the emulator at 38400 8N1, ten bits per byte.
- */
+/* Replies are paced to the cabinet's 38400 8N1 line speed: clCardPrinter caches
+ * the last status byte, and a pipe delivering a whole reply at once caches a
+ * briefly-held status far more often than the wire would. */
 constexpr double serialBytesPerMillisecond = 38400.0 / 10.0 / 1000.0;
 
 double millisecondsSince(LARGE_INTEGER &previous, const LARGE_INTEGER &frequency)
@@ -464,7 +444,7 @@ void cardWorker()
     {
         if (pipe == INVALID_HANDLE_VALUE)
         {
-            if (!getConfig()->namcoN2.card.enabled)
+            if (!cardConfig().enabled)
             {
                 Sleep(200);
                 continue;
@@ -548,12 +528,9 @@ void cardWorker()
                             pending.insert(pending.end(), frame.begin(), frame.end());
                     }
 
-                    /*
-                     * A length byte that never resolves would otherwise hold
-                     * the conversation forever; past that point the framing is
-                     * already lost, so let the game resynchronise on the bytes
-                     * themselves.
-                     */
+                    /* A length byte that never resolves would hold the
+                     * conversation forever, and the framing is already lost, so
+                     * let the game resynchronise on the bytes themselves. */
                     if (incoming.size() > maximumQueuedBytes)
                     {
                         pending.insert(pending.end(), incoming.begin(), incoming.end());
@@ -623,9 +600,25 @@ bool linkIsUp()
 }
 } // namespace
 
+extern "C" void n2CardReaderUseEs1Terminal(void)
+{
+    /* WMMT4's DeviceSetting puts the magnetic reader on /dev/ttyS1 at 38400
+     * 8E1 with hardware flow control - the same Sanwa unit N2 drives on
+     * /dev/ttyM2.  Must be called before the title opens the device. */
+    g_devicePath = "/dev/ttyS1";
+    g_useEs1Config = true;
+}
+
+extern "C" void n2CardReaderStart(void)
+{
+    /* Bring the pipe up ahead of time: started by the first open() instead, it
+     * has not connected yet, and the title reads that as a missing reader. */
+    ensureWorkerStarted();
+}
+
 extern "C" int n2CardReaderOpen(const char *path, int)
 {
-    if (!path || std::strcmp(path, cardDevicePath) != 0)
+    if (!path || std::strcmp(path, g_devicePath) != 0)
         return -1;
 
     if (!linkIsUp())
@@ -796,11 +789,8 @@ extern "C" int n2CardReaderClose(int fd)
     if (fd != cardDescriptor)
         return -1;
 
-    /*
-     * The game closes and reopens the port around some sequences.  The link
-     * itself stays up - tearing the pipe down here would restart YaCardEmu's
-     * conversation and lose whatever command was in flight.
-     */
+    /* The game closes and reopens the port around some sequences, so the link
+     * stays up; tearing it down would lose the command in flight. */
     return 0;
 }
 
@@ -809,11 +799,8 @@ extern "C" int n2CardReaderIoctl(int fd, unsigned long request, void *argument)
     if (fd != cardDescriptor)
         return -1;
 
-    /*
-     * FIONREAD is how the card layer decides whether a reply is worth reading.
-     * Reporting success without filling the count in leaves it believing the
-     * port is permanently empty.
-     */
+    /* FIONREAD is how the card layer decides whether a reply is worth reading,
+     * so success without a count leaves it believing the port is empty. */
     constexpr unsigned long linuxFionread = 0x541B;
     if (request == linuxFionread && argument)
     {

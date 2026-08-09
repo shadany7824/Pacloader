@@ -121,6 +121,7 @@ typedef enum
     GROUP_UNKNOWN,
     GROUP_WMMT3,
     GROUP_MAXIMUM_HEAT_3D,
+    GROUP_WMMT4_ES1,
     GROUP_ABC,
     GROUP_HOD4,
     GROUP_HOD4_TEST,
@@ -268,6 +269,8 @@ typedef struct
     int generalPurposeInputs;
 } NamcoN2JvsConfig;
 
+/* Settings for an external YaCardEmu.  The same Sanwa reader appears on N2 and
+ * on the ES1 terminal, so the shape is shared but the values are per-platform. */
 typedef struct
 {
     int enabled;
@@ -278,7 +281,9 @@ typedef struct
     char pipeName[MAX_PATH_LENGTH];
     char apiHost[MAX_PATH_LENGTH];
     char cardName[MAX_PATH_LENGTH];
-} NamcoN2CardConfig;
+} YaCardEmuConfig;
+
+typedef YaCardEmuConfig NamcoN2CardConfig;
 
 typedef struct
 {
@@ -298,12 +303,9 @@ typedef struct
     int forceFeedbackEnabled;
     int forceFeedbackDiagnostics;
 
-    /*
-     * Force feedback tuning, all percentages except the reflection range. The
-     * cabinet's fields are wider than a race uses - reflection is a signed byte
-     * but only swings about thirty five counts - so the range says what counts
-     * as full deflection. Lower means heavier.
-     */
+    /* Force feedback tuning, percentages except the reflection range: a race
+     * swings about thirty five of reflection's 127 counts, so the range says
+     * what counts as full deflection.  Lower means heavier. */
     int ffbGain;
     int ffbSpringGain;
     int ffbDamperGain;
@@ -311,45 +313,51 @@ typedef struct
     int ffbReflectRange;
     int ffbInvert;
 
-    /*
-     * Feel rather than strength, both percentages, both off by default. Neither
-     * reproduces the cabinet - WMMT3 and 3DX+ are direct drive, so the game's
-     * own viscosity is the damping it intends. A floor keeps a wheel from going
-     * fully slack, a deadband stops a strong spring hunting at centre. Zero is
-     * what the game asks for.
-     */
+    /* Feel rather than strength, off by default.  The cabinet is direct drive,
+     * so the game's own viscosity is the damping it intends; a floor stops a
+     * wheel going slack, a deadband stops a spring hunting at centre. */
     int ffbDamperFloor;
     int ffbSpringDeadband;
-    /*
-     * Raw counts the cabinet's potentiometers report at each end of their
-     * travel. The test menu's steering initialisation screen shows these
-     * divided by 64, so a wheel that reads +/-512 there swings the full 16 bit
-     * range. The pedals rest at their minimum.
-     */
+    /* Raw counts the potentiometers report at each end of travel.  The test
+     * menu shows these divided by 64, so a wheel reading +/-512 there swings
+     * the full 16-bit range.  The pedals rest at their minimum. */
     NamcoN2AxisRange steering;
     NamcoN2AxisRange accelerator;
     NamcoN2AxisRange brake;
-    /*
-     * What the loader's JVS I/O board reports about itself. The counts are the
-     * ones clSystemN2::initSystemN2() asks for; lowering one makes the game
-     * claim fewer of that function, which is only useful for working out what
-     * a cabinet actually needs.
-    */
+    /* What the loader's JVS I/O board reports about itself.  The counts are the
+     * ones initSystemN2() asks for; lowering one is only useful for working out
+     * what a cabinet actually needs. */
     NamcoN2JvsConfig jvs;
     NamcoN2CardConfig card;
     NamcoN2NetworkConfig network;
 } NamcoN2Config;
 
-/*
- * System ES1 is not a System N2 variant.  Keep its knobs separate so an ES1
- * launch can never silently inherit N2 card, FFB, network, or JVS settings.
- */
+/* System ES1 is not an N2 variant: separate knobs, so an ES1 launch can never
+ * inherit N2's card, FFB, network or JVS settings. */
+typedef enum
+{
+    NAMCO_ES1_CABINET_DRIVE = 0,
+    NAMCO_ES1_CABINET_TERMINAL = 1,
+} NamcoES1CabinetMode;
+
 typedef struct
 {
     int cameraEnabled;
     int dongleEnabled;
     int serialDiagnostics;
     int emulateJamma;
+    NamcoES1CabinetMode cabinetMode;
+    /* Let a WMMT4 drive cabinet boot without a separate terminal process. */
+    int terminalEmulatorEnabled;
+    /* Optional WMMT4 DNS overrides. Empty strings use normal host DNS. */
+    char dnsNbgiLoc[MAX_PATH_LENGTH];
+    char dnsTenporouterLoc[MAX_PATH_LENGTH];
+    char dnsBbrouterLoc[MAX_PATH_LENGTH];
+    char dnsMuchaLocal[MAX_PATH_LENGTH];
+    char dnsNaominetJp[MAX_PATH_LENGTH];
+    /* The terminal cabinet carries a magnetic card reader for transferring
+     * WMMT3DX+ cards; the drive cabinet has none. */
+    YaCardEmuConfig card;
 } NamcoES1Config;
 
 typedef struct
@@ -369,6 +377,7 @@ typedef struct
     char idCardFolder[MAX_PATH_LENGTH];
     int emulateJVS;
     int fullscreen;
+    int alwaysOnTop;
     char eepromPath[MAX_PATH_LENGTH];
     char sramPath[MAX_PATH_LENGTH];
     char libCgPath[MAX_PATH_LENGTH];

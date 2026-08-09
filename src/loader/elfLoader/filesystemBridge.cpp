@@ -2,11 +2,15 @@
 #include "../redirections/filesystem.h"
 #include "filesystemBridge.hpp"
 #include "libcBridge.hpp"
+#include "memoryManager.hpp"
 #include "networkBridge.hpp"
+#include "randomDevice.hpp"
 #include "symbolResolver.hpp"
 #include "virtualDeviceRegistry.hpp"
 #include "../graphics/sdlCalls.h"
 #include "../hardware/namco/n2/n2VirtualDevices.h"
+#include "../hardware/namco/es1/es1.h"
+#include "../hardware/namco/es1/es1Title.h"
 #include "../platform/platformBackend.h"
 #include "../log/log.h"
 #include <string>
@@ -25,6 +29,7 @@ bool isEventfd(int fd);
 int readEventfd(int fd, void *buffer, size_t length);
 int writeEventfd(int fd, const void *buffer, size_t length);
 int closeEventfd(int fd);
+void forgetDescriptor(int fd);
 }
 
 #define MAP(name, func) SymbolResolver::GetInstance().RegisterVTable(name, reinterpret_cast<void *>(func))
@@ -47,15 +52,16 @@ namespace FileSystemBridge
             mode = va_arg(arguments, int);
             va_end(arguments);
         }
-        return sharedOpen(path, flags, mode);
+        const int descriptor = sharedOpen(path, flags, mode);
+        log_debug("open(\"%s\", flags=0x%x, mode=0%o) -> %d (errno=%d)",
+                  path ? path : "NULL", flags, mode, descriptor,
+                  descriptor < 0 ? errno : 0);
+        return descriptor;
     }
 
-    /*
-     * Loading a course is a long stretch of reads with no frame presented in
-     * between, which is all Windows needs to call the window hung and put a
-     * ghost over it. Reads are where the game spends that time, so the message
-     * queue is drained from here; the call rate limits itself.
-     */
+    /* A long load presents no frame, which is all Windows needs to call the
+     * window hung, so the message queue is drained from the reads the game
+     * spends that time in. */
     static size_t bridgeFread(void *buffer, size_t size, size_t count, FILE *stream)
     {
         keepWindowResponsive();
@@ -87,6 +93,10 @@ namespace FileSystemBridge
 
     static int bridgeCloseDescriptor(int fd)
     {
+        /* Linux drops a closed descriptor from every epoll set it was in, and
+         * Boost.Asio leaves the removal to the kernel.  Do it here, before the
+         * number can be handed out again. */
+        Es1CompatBridge::forgetDescriptor(fd);
         if (Es1CompatBridge::isEventfd(fd))
             return Es1CompatBridge::closeEventfd(fd);
         if (const auto *device = VirtualDeviceRegistry::find(fd))
@@ -114,12 +124,12 @@ namespace FileSystemBridge
     {
         log_info("Initializing FileSystemBridge...");
 
-        /*
-         * Bridge symbols are installed before initConfig() identifies the
-         * loaded ELF. Register the N2 providers now and let each claimsPath()
-         * predicate consult the live platform when the guest opens a device.
-         */
+        /* Bridge symbols go in before initConfig() identifies the ELF, so
+         * register every provider now and let claimsPath() decide later. */
         VirtualDeviceRegistry::clear();
+        /* Not hardware: /dev/urandom is part of the platform every Linux
+         * program assumes, and OpenSSL will not start a handshake without it. */
+        registerRandomDevices();
         platformRegisterVirtualDevices();
 
         // Standard I/O functions
@@ -160,6 +170,11 @@ namespace FileSystemBridge
         MAP("lseek", bridgeLseek);
         MAP("open", bridgeOpenDescriptor);
         MAP("open64", bridgeOpenDescriptor);
+        /* _FORTIFY_SOURCE rewrites two-argument open() calls to __open_2; it
+         * differs only in rejecting a missing mode for O_CREAT, which the
+         * variadic bridge already tolerates. */
+        MAP("__open_2", bridgeOpenDescriptor);
+        MAP("__open64_2", bridgeOpenDescriptor);
         MAP("readlink", bridgeReadlink);
         MAP("fdopen", bridgeFdopen);
         MAP("setvbuf", bridgeSetvbuf);
@@ -223,13 +238,9 @@ namespace FileSystemBridge
     int bridgeFgetc(FILE *stream)
     {
         log_trace("Intercepted fgetc: %p", stream);
-        /*
-         * Intrinsic Alchemy configures stdin with O_NONBLOCK and polls it once
-         * per frame.  The Windows CRT ignores the Linux fcntl flags used by the
-         * game, so a normal fgetc(stdin) would block the N2 main/render loop.
-         * SDL remains the primary keyboard/JVS path; this preserves the legacy
-         * terminal path without ever waiting for console input.
-         */
+        /* Alchemy polls a non-blocking stdin once per frame, and the CRT
+         * ignores the Linux fcntl flags, so a plain fgetc() would block the
+         * render loop.  Keep the legacy path without ever waiting. */
         if (getConfig()->platform == ARCADE_PLATFORM_NAMCO_N2 && stream == stdin)
             return _kbhit() ? _getch() : EOF;
         return fgetc(stream);
@@ -390,13 +401,13 @@ namespace FileSystemBridge
         size_t len = strlen(tmp) + 1;
         if (size > 0 && size < len)
             len = size;
-        char *aligned_ptr = (char *)_aligned_malloc(len, 16);
+        char *aligned_ptr = static_cast<char *>(MemoryManager::customMalloc(len));
         if (aligned_ptr)
         {
             strncpy(aligned_ptr, tmp, len);
             aligned_ptr[len - 1] = '\0';
         }
-        _aligned_free(tmp);
+        free(tmp);
         return aligned_ptr;
     }
 } // namespace FileSystemBridge
@@ -447,7 +458,7 @@ extern "C"
         return (void *)dir;
     }
 
-    struct linux_dirent *bridgeReaddir(void *dirp)
+    struct linux_dirent *bridgeReaddirPosix(void *dirp)
     {
         if (!dirp)
         {
@@ -498,6 +509,17 @@ extern "C"
         return &dir->ent;
     }
 
+    /* Some enumerators leave the scan only on a non-zero errno and loop forever
+     * otherwise, so end of directory is reported as EBADF.  Only for plain
+     * readdir(), and only where the title's record asks for it. */
+    struct linux_dirent *bridgeReaddir(void *dirp)
+    {
+        struct linux_dirent *entry = bridgeReaddirPosix(dirp);
+        if (!entry && dirp && es1TitleQuirks()->readdirEndOfDirectoryIsError)
+            errno = EBADF;
+        return entry;
+    }
+
     int bridgeClosedir(void *dirp)
     {
         if (!dirp)
@@ -530,11 +552,8 @@ extern "C"
         ConvertPath(winOld, redirectTempPath(oldpath), MAX_PATH);
         ConvertPath(winNew, redirectTempPath(newpath), MAX_PATH);
 
-        /*
-         * POSIX rename() replaces an existing destination atomically, while the
-         * CRT's rename() fails with EEXIST.  Games rely on the POSIX behaviour
-         * for save-to-temp-then-swap writes.
-         */
+        /* POSIX rename() replaces the destination atomically where the CRT's
+         * fails with EEXIST, and saves are written temp-then-swap. */
         if (!MoveFileExA(winOld, winNew, MOVEFILE_REPLACE_EXISTING))
         {
             log_warn("rename(\"%s\", \"%s\") failed (Win32 error %lu)", winOld, winNew, GetLastError());
@@ -543,13 +562,71 @@ extern "C"
         return 0;
     }
 
-    static void CopyStatVer3(const struct _stat64 &src, void *dst_ptr)
+    /* The CRT reports st_ino as 0 for every file, and POSIX code treats
+     * (st_dev, st_ino) as identity - SQLite keys its lock table on it.  Report
+     * the volume serial and NTFS file reference number instead. */
+    struct FileIdentity
+    {
+        uint64_t dev;
+        uint64_t ino;
+        bool valid;
+    };
+
+    static FileIdentity IdentityFromHandle(HANDLE handle)
+    {
+        FileIdentity identity{0, 0, false};
+        BY_HANDLE_FILE_INFORMATION info{};
+
+        if (handle == INVALID_HANDLE_VALUE || !GetFileInformationByHandle(handle, &info))
+            return identity;
+
+        identity.dev = info.dwVolumeSerialNumber;
+        identity.ino = ((uint64_t)info.nFileIndexHigh << 32) | info.nFileIndexLow;
+        identity.valid = true;
+        return identity;
+    }
+
+    static FileIdentity IdentityFromFd(int fd)
+    {
+        const intptr_t osHandle = _get_osfhandle(fd);
+        if (osHandle == -1)
+            return FileIdentity{0, 0, false};
+        return IdentityFromHandle(reinterpret_cast<HANDLE>(osHandle));
+    }
+
+    static FileIdentity IdentityFromPath(const char *winPath)
+    {
+        if (!winPath)
+            return FileIdentity{0, 0, false};
+
+        /* FILE_READ_ATTRIBUTES with full sharing never disturbs other openers,
+         * and the backup semantics flag lets directories resolve too. */
+        HANDLE handle = CreateFileA(winPath, FILE_READ_ATTRIBUTES,
+                                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                    nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        if (handle == INVALID_HANDLE_VALUE)
+            return FileIdentity{0, 0, false};
+
+        const FileIdentity identity = IdentityFromHandle(handle);
+        CloseHandle(handle);
+        return identity;
+    }
+
+    /* An i386 struct stat only has room for a 32-bit inode, so fold the file
+     * reference number rather than truncating away its high half. */
+    static uint32_t FoldInode(uint64_t ino)
+    {
+        return (uint32_t)(ino ^ (ino >> 32));
+    }
+
+    static void CopyStatVer3(const struct _stat64 &src, void *dst_ptr,
+                             const FileIdentity &identity = FileIdentity{0, 0, false})
     {
         struct linux_stat_ver3 *dst = (struct linux_stat_ver3 *)dst_ptr;
         memset(dst, 0, sizeof(struct linux_stat_ver3));
 
-        dst->st_dev = (uint64_t)src.st_dev;
-        dst->st_ino = (uint32_t)src.st_ino;
+        dst->st_dev = identity.valid ? identity.dev : (uint64_t)src.st_dev;
+        dst->st_ino = identity.valid ? FoldInode(identity.ino) : (uint32_t)src.st_ino;
         dst->st_nlink = src.st_nlink;
         dst->st_uid = src.st_uid;
         dst->st_gid = src.st_gid;
@@ -573,14 +650,15 @@ extern "C"
         dst->st_mode |= (src.st_mode & 0777);
     }
 
-    static void CopyStat64(const struct _stat64 &src, void *dst_ptr)
+    static void CopyStat64(const struct _stat64 &src, void *dst_ptr,
+                           const FileIdentity &identity = FileIdentity{0, 0, false})
     {
         struct linux_stat64_safe dst;
         memset(&dst, 0, sizeof(dst));
 
-        dst.st_dev = (unsigned long long)src.st_dev;
-        dst.__st_ino = (uint32_t)src.st_ino;
-        dst.st_ino = (unsigned long long)src.st_ino;
+        dst.st_dev = identity.valid ? identity.dev : (unsigned long long)src.st_dev;
+        dst.__st_ino = identity.valid ? FoldInode(identity.ino) : (uint32_t)src.st_ino;
+        dst.st_ino = identity.valid ? identity.ino : (unsigned long long)src.st_ino;
         dst.st_nlink = src.st_nlink;
         dst.st_uid = src.st_uid;
         dst.st_gid = src.st_gid;
@@ -604,6 +682,40 @@ extern "C"
         dst.st_mode |= (src.st_mode & 0777);
 
         memcpy(dst_ptr, &dst, sizeof(dst));
+    }
+
+    /* A virtual device descriptor has no Windows handle, so _fstat64() fails and
+     * callers such as OpenSSL's RAND_poll() write the file off.  Answer with a
+     * character device keyed by descriptor, so two never look like one file. */
+    static bool statVirtualDescriptor(int fd, void *buf, bool use_stat64)
+    {
+        if (!buf || !VirtualDeviceRegistry::find(fd))
+            return false;
+
+        if (use_stat64)
+        {
+            struct linux_stat64_safe *s = (struct linux_stat64_safe *)buf;
+            memset(s, 0, sizeof(*s));
+            s->st_mode = LINUX_S_IFCHR | 0666;
+            s->st_dev = 1;
+            s->st_rdev = 1;
+            s->st_nlink = 1;
+            s->__st_ino = (uint32_t)fd;
+            s->st_ino = (unsigned long long)fd;
+            s->st_blksize = 4096;
+        }
+        else
+        {
+            struct linux_stat_ver3 *s = (struct linux_stat_ver3 *)buf;
+            memset(s, 0, sizeof(*s));
+            s->st_mode = LINUX_S_IFCHR | 0666;
+            s->st_dev = 1;
+            s->st_rdev = 1;
+            s->st_nlink = 1;
+            s->st_ino = (uint32_t)fd;
+            s->st_blksize = 4096;
+        }
+        return true;
     }
 
     static int myStatImpl(const char *path, void *buf, bool use_stat64)
@@ -644,13 +756,14 @@ extern "C"
             return -1;
         }
 
+        const FileIdentity identity = IdentityFromPath(winPath);
         if (use_stat64)
         {
-            CopyStat64(win_stat, buf);
+            CopyStat64(win_stat, buf, identity);
         }
         else
         {
-            CopyStatVer3(win_stat, buf);
+            CopyStatVer3(win_stat, buf, identity);
         }
 
         return 0;
@@ -664,10 +777,12 @@ extern "C"
     int bridgeFstat(int fd, struct linux_stat64 *buf)
     {
         log_debug("fstat called: fd=%d", fd);
+        if (statVirtualDescriptor(fd, buf, false))
+            return 0;
         struct _stat64 win_stat;
         if (_fstat64(fd, &win_stat) != 0)
             return -1;
-        CopyStatVer3(win_stat, buf);
+        CopyStatVer3(win_stat, buf, IdentityFromFd(fd));
         return 0;
     }
 
@@ -700,31 +815,35 @@ extern "C"
         log_debug("__fxstat called: ver=%d, fd=%d", ver, fd);
         if (!buf)
             return -1;
+        if (statVirtualDescriptor(fd, buf, false))
+            return 0;
         struct _stat64 win_stat;
         if (_fstat64(fd, &win_stat) != 0)
             return -1;
 
-        CopyStatVer3(win_stat, buf);
+        CopyStatVer3(win_stat, buf, IdentityFromFd(fd));
         return 0;
     }
 
     int bridgeFxstat64(int ver, int fd, struct linux_stat64 *buf)
     {
-        log_debug("__fxstat64 called: ver=%d, fd=%d", ver, fd);
         if (!buf)
             return -1;
+        if (statVirtualDescriptor(fd, buf, true))
+            return 0;
         struct _stat64 win_stat;
         if (_fstat64(fd, &win_stat) != 0)
             return -1;
 
-        if (ver == 3)
-        {
-            CopyStatVer3(win_stat, buf);
-        }
-        else
-        {
-            CopyStat64(win_stat, buf);
-        }
+        /* ver is the stat ABI revision, not a choice of layout: glibc passes 3
+         * to both and picks the struct by function name.  The wrong one puts
+         * st_blksize where stat64 keeps the high half of st_size. */
+        const FileIdentity identity = IdentityFromFd(fd);
+        CopyStat64(win_stat, buf, identity);
+        log_debug("__fxstat64: ver=%d fd=%d size=%lld dev=%llu ino=%llu", ver, fd,
+                  static_cast<long long>(win_stat.st_size),
+                  static_cast<unsigned long long>(identity.dev),
+                  static_cast<unsigned long long>(identity.ino));
         return 0;
     }
 

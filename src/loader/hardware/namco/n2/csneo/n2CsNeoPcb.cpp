@@ -7,8 +7,9 @@
 #include <cstdint>
 #include <cstring>
 
-#include "n2.h"
-#include "../../../log/log.h"
+#include "../n2Title.h"
+#include "n2CsNeo.h"
+#include "../../../../log/log.h"
 
 namespace
 {
@@ -23,13 +24,10 @@ void makeInputPacket(uint8_t packet[pcbPacketSize])
 {
     std::memset(packet, 0, pcbPacketSize);
 
-    // Byte zero contains cabinet fault lines and stays clear. PC reset/test
-    // and service are active-low cabinet inputs, so both must idle high. If
-    // bit 2 is left low CS Neo remains in TEST MODE; changing it back to low
-    // after startup also raises PC RESET ERROR.
-    //
-    // Player keyboard and mouse input is read through SDL. The virtual PCB
-    // therefore only reports a neutral cabinet state.
+    // Byte zero is cabinet fault lines and stays clear.  Reset/test and service
+    // are active-low and must idle high: bit 2 low keeps the game in TEST MODE,
+    // and dropping it after startup raises PC RESET ERROR.  Player input comes
+    // through SDL, so the virtual PCB only reports a neutral cabinet.
     packet[1] = (1u << 2) | (1u << 3);
 
     unsigned int checksum = 0;
@@ -41,7 +39,7 @@ void makeInputPacket(uint8_t packet[pcbPacketSize])
 
 extern "C" int n2CsNeoPcbEnabled(void)
 {
-    return n2GetGame() == N2_GAME_CSNEO;
+    return n2TitleIs(N2_TITLE_ID_CSNEO);
 }
 
 extern "C" int n2CsNeoPcbOpen(const char *path, int)

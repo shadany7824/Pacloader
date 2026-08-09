@@ -1,8 +1,8 @@
 #include "n2CsNeo.h"
 
-#include "n2.h"
-#include "n2Hasp.h"
-#include "n2Hook.h"
+#include "../n2.h"
+#include "../n2Hasp.h"
+#include "../n2Hook.h"
 
 #if defined(_WIN32) || defined(__MINGW32__)
 
@@ -10,8 +10,8 @@
 
 #include <SDL3/SDL.h>
 
-#include "../../../elfLoader/symbolResolver.hpp"
-#include "../../../log/log.h"
+#include "../../../../elfLoader/symbolResolver.hpp"
+#include "../../../../log/log.h"
 
 namespace
 {
@@ -121,6 +121,11 @@ extern "C" int n2CsNeoHandleHostKey(int key, uint32_t modifiers)
     addText(localLoginCommandText);
     log_info("Namco N2 CS Neo: requested local login 12 (Alt+F7)");
     return 1;
+}
+
+extern "C" int n2CsNeoDetect(const char *elfPath)
+{
+    return n2CsNeoLooksLikeGame(elfPath);
 }
 
 #endif

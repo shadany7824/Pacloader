@@ -11,9 +11,11 @@
 #include "../platform/platformBackend.h"
 #include "../config/config.h"
 #include "../graphics/sdlCalls.h"
+#include <atomic>
 #include <csignal>
 #include <cctype>
 #include <cmath>
+#include <chrono>
 #include <cstdint>
 #include <mutex>
 #include <cstdarg>
@@ -74,9 +76,30 @@ namespace LibcBridge
         MAP("vfprintf", bridgeVfprintf);
         MAP("vsprintf", bridgeVsprintf);
         MAP("vsnprintf", bridgeVsnprintf);
+
+        /* _FORTIFY_SOURCE forms of the same calls; see the implementations. */
+        MAP("__printf_chk", bridgePrintfChk);
+        MAP("__fprintf_chk", bridgeFprintfChk);
+        MAP("__sprintf_chk", bridgeSprintfChk);
+        MAP("__snprintf_chk", bridgeSnprintfChk);
+        MAP("__vprintf_chk", bridgeVprintfChk);
+        MAP("__vfprintf_chk", bridgeVfprintfChk);
+        MAP("__vsprintf_chk", bridgeVsprintfChk);
+        MAP("__vsnprintf_chk", bridgeVsnprintfChk);
+        MAP("__memcpy_chk", bridgeMemcpyChk);
+        MAP("__memmove_chk", bridgeMemmoveChk);
+        MAP("__memset_chk", bridgeMemsetChk);
+        MAP("__strcpy_chk", bridgeStrcpyChk);
+        MAP("__strncpy_chk", bridgeStrncpyChk);
+        MAP("__strcat_chk", bridgeStrcatChk);
+        MAP("__strncat_chk", bridgeStrncatChk);
+
         MAP("fscanf", bridgeFscanf);
         MAP("sscanf", bridgeSscanf);
         MAP("index", bridgeIndex);
+        MAP("strtok", bridgeStrtok);
+        MAP("strtok_r", bridgeStrtokR);
+        MAP("__strtok_r", bridgeStrtokR);
         MAP("strerror_r", bridgeStrerrorR);
 
         MAP("stdin", &native_stdin);
@@ -229,6 +252,25 @@ namespace LibcBridge
         MAP("_setjmp", bridgeSetjmp);
         MAP("__sigsetjmp", bridgeSigsetjmp);
         MAP("longjmp", bridgeLongjmp);
+        MAP("_longjmp", bridgeLongjmp);
+        /* The _FORTIFY_SOURCE variant differs only in the checking glibc does
+         * on its own jump buffer, which we do not model. */
+        MAP("__longjmp_chk", bridgeLongjmp);
+
+        MAP("__stack_chk_fail", bridgeStackChkFail);
+        MAP("_IO_putc", bridgePutcUnlocked);
+        MAP("nice", bridgeNice);
+        MAP("getrlimit", bridgeGetrlimit);
+        MAP("getrusage", bridgeGetrusage);
+        MAP("sched_getscheduler", bridgeSchedGetscheduler);
+        MAP("ftruncate64", bridgeFtruncate64);
+        MAP("posix_fallocate64", bridgePosixFallocate64);
+        MAP("utimes", bridgeUtimes);
+        MAP("sincosf", bridgeSincosf);
+        MAP("strnlen", bridgeStrnlen);
+        MAP("strtoll", bridgeStrtoll);
+        MAP("strtoul", bridgeStrtoul);
+        MAP("strtoull", bridgeStrtoull);
 
         // Library handles
         MAP("dlopen", sharedDlopen);
@@ -775,6 +817,134 @@ namespace LibcBridge
         return ::vsnprintf(buffer, count, format, args);
     }
 
+    /* glibc's _FORTIFY_SOURCE wrappers, where `flag` is the fortification level
+     * and `slen` the destination size.  The bounds are honoured, or checked
+     * outright where the plain function takes no size. */
+    int bridgePrintfChk(int, const char *format, ...)
+    {
+        va_list args;
+        va_start(args, format);
+        const int result = ::vprintf(format, args);
+        va_end(args);
+        return result;
+    }
+
+    int bridgeFprintfChk(void *stream, int, const char *format, ...)
+    {
+        va_list args;
+        va_start(args, format);
+        const int result = ::vfprintf(stream ? (FILE *)stream : stdout, format, args);
+        va_end(args);
+        return result;
+    }
+
+    int bridgeSprintfChk(char *buffer, int, size_t destinationSize, const char *format, ...)
+    {
+        va_list args;
+        va_start(args, format);
+        /* Unlike sprintf() the destination size is known here, so use it. */
+        const int result = destinationSize == (size_t)-1
+                               ? ::vsprintf(buffer, format, args)
+                               : ::vsnprintf(buffer, destinationSize, format, args);
+        va_end(args);
+        return result;
+    }
+
+    int bridgeSnprintfChk(char *buffer, size_t count, int, size_t destinationSize,
+                          const char *format, ...)
+    {
+        if (destinationSize < count)
+        {
+            log_fatal("__snprintf_chk: %zu bytes requested into a %zu byte buffer", count,
+                      destinationSize);
+            count = destinationSize;
+        }
+        va_list args;
+        va_start(args, format);
+        const int result = ::vsnprintf(buffer, count, format, args);
+        va_end(args);
+        return result;
+    }
+
+    int bridgeVprintfChk(int, const char *format, va_list args)
+    {
+        return ::vprintf(format, args);
+    }
+
+    int bridgeVfprintfChk(void *stream, int, const char *format, va_list args)
+    {
+        return ::vfprintf(stream ? (FILE *)stream : stdout, format, args);
+    }
+
+    int bridgeVsprintfChk(char *buffer, int, size_t destinationSize, const char *format,
+                          va_list args)
+    {
+        return destinationSize == (size_t)-1 ? ::vsprintf(buffer, format, args)
+                                             : ::vsnprintf(buffer, destinationSize, format, args);
+    }
+
+    int bridgeVsnprintfChk(char *buffer, size_t count, int, size_t destinationSize,
+                           const char *format, va_list args)
+    {
+        if (destinationSize < count)
+            count = destinationSize;
+        return ::vsnprintf(buffer, count, format, args);
+    }
+
+    void *bridgeMemcpyChk(void *destination, const void *source, size_t count,
+                          size_t destinationSize)
+    {
+        if (count > destinationSize)
+            log_fatal("__memcpy_chk: %zu bytes into a %zu byte buffer", count, destinationSize);
+        return ::memcpy(destination, source, count);
+    }
+
+    void *bridgeMemmoveChk(void *destination, const void *source, size_t count,
+                           size_t destinationSize)
+    {
+        if (count > destinationSize)
+            log_fatal("__memmove_chk: %zu bytes into a %zu byte buffer", count, destinationSize);
+        return ::memmove(destination, source, count);
+    }
+
+    void *bridgeMemsetChk(void *destination, int value, size_t count, size_t destinationSize)
+    {
+        if (count > destinationSize)
+            log_fatal("__memset_chk: %zu bytes into a %zu byte buffer", count, destinationSize);
+        return ::memset(destination, value, count);
+    }
+
+    char *bridgeStrcpyChk(char *destination, const char *source, size_t destinationSize)
+    {
+        if (::strlen(source) + 1 > destinationSize)
+            log_fatal("__strcpy_chk: %zu bytes into a %zu byte buffer", ::strlen(source) + 1,
+                      destinationSize);
+        return ::strcpy(destination, source);
+    }
+
+    char *bridgeStrncpyChk(char *destination, const char *source, size_t count,
+                           size_t destinationSize)
+    {
+        if (count > destinationSize)
+            log_fatal("__strncpy_chk: %zu bytes into a %zu byte buffer", count, destinationSize);
+        return ::strncpy(destination, source, count);
+    }
+
+    char *bridgeStrcatChk(char *destination, const char *source, size_t destinationSize)
+    {
+        if (::strlen(destination) + ::strlen(source) + 1 > destinationSize)
+            log_fatal("__strcat_chk: result exceeds a %zu byte buffer", destinationSize);
+        return ::strcat(destination, source);
+    }
+
+    char *bridgeStrncatChk(char *destination, const char *source, size_t count,
+                           size_t destinationSize)
+    {
+        if (::strlen(destination) + count + 1 > destinationSize)
+            log_fatal("__strncat_chk: result exceeds a %zu byte buffer", destinationSize);
+        return ::strncat(destination, source, count);
+    }
+
     int bridgeFscanf(FILE *stream, const char *format, ...)
     {
         if (!stream)
@@ -803,16 +973,134 @@ namespace LibcBridge
         return strchr(str, c);
     }
 
-    /*
-     * A System N2 cabinet runs with TZ=UTC (set by .execrc) while its clock
-     * holds local wall time, and clDateTime::setLocalTime() relies on that: it
-     * converts with gmtime_r(), never localtime_r(). A true UTC epoch would put
-     * the attract clock off by the host's offset.
-     *
-     * So the loader reproduces the convention rather than rewriting the
-     * conversion: the clock sources report local wall time and localtime()
-     * behaves as UTC, which also keeps gmtime()/timegm() round-tripping.
-     */
+    namespace
+    {
+        constexpr size_t MaxDelimiterLength = 256;
+
+        bool guestReadable(const void *address, bool writable)
+        {
+            if (!address)
+                return false;
+
+            MEMORY_BASIC_INFORMATION info{};
+            if (VirtualQuery(address, &info, sizeof(info)) != sizeof(info) ||
+                info.State != MEM_COMMIT)
+                return false;
+
+            const DWORD protect = info.Protect & 0xff;
+            if (protect == PAGE_NOACCESS || (info.Protect & PAGE_GUARD))
+                return false;
+
+            if (!writable)
+                return protect == PAGE_READONLY || protect == PAGE_READWRITE ||
+                       protect == PAGE_WRITECOPY || protect == PAGE_EXECUTE ||
+                       protect == PAGE_EXECUTE_READ ||
+                       protect == PAGE_EXECUTE_READWRITE ||
+                       protect == PAGE_EXECUTE_WRITECOPY;
+
+            return protect == PAGE_READWRITE || protect == PAGE_WRITECOPY ||
+                   protect == PAGE_EXECUTE_READWRITE ||
+                   protect == PAGE_EXECUTE_WRITECOPY;
+        }
+
+        bool copyGuestString(const char *source, char (&destination)[MaxDelimiterLength],
+                             size_t &length)
+        {
+            if (!source)
+                return false;
+
+            for (size_t i = 0; i < MaxDelimiterLength; ++i)
+            {
+                if (!guestReadable(source + i, false))
+                    return false;
+                destination[i] = source[i];
+                if (destination[i] == '\0')
+                {
+                    length = i;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        bool isDelimiter(char value, const char *delimiters, size_t length)
+        {
+            for (size_t i = 0; i < length; ++i)
+            {
+                if (value == delimiters[i])
+                    return true;
+            }
+            return false;
+        }
+
+        char *nextGuestToken(char *cursor, char *delimiters, size_t delimiterLength,
+                             char **saveptr)
+        {
+            if (!cursor || !saveptr || !guestReadable(saveptr, true))
+                return nullptr;
+
+            while (guestReadable(cursor, true) && *cursor &&
+                   isDelimiter(*cursor, delimiters, delimiterLength))
+                ++cursor;
+
+            if (!guestReadable(cursor, true) || *cursor == '\0')
+            {
+                *saveptr = nullptr;
+                return nullptr;
+            }
+
+            char *token = cursor;
+            while (guestReadable(cursor, true) && *cursor &&
+                   !isDelimiter(*cursor, delimiters, delimiterLength))
+                ++cursor;
+
+            if (!guestReadable(cursor, true))
+            {
+                *saveptr = nullptr;
+                return nullptr;
+            }
+
+            if (*cursor == '\0')
+                *saveptr = nullptr;
+            else
+            {
+                *cursor = '\0';
+                *saveptr = cursor + 1;
+            }
+            return token;
+        }
+    }
+
+    char *bridgeStrtok(char *str, const char *delim)
+    {
+        static thread_local char *next = nullptr;
+        char delimiters[MaxDelimiterLength]{};
+        size_t delimiterLength = 0;
+        if (!copyGuestString(delim, delimiters, delimiterLength))
+            return nullptr;
+
+        if (str)
+            next = str;
+        if (!next)
+            return nullptr;
+
+        return nextGuestToken(next, delimiters, delimiterLength, &next);
+    }
+
+    char *bridgeStrtokR(char *str, const char *delim, char **saveptr)
+    {
+        char delimiters[MaxDelimiterLength]{};
+        size_t delimiterLength = 0;
+        if (!saveptr || !copyGuestString(delim, delimiters, delimiterLength))
+            return nullptr;
+
+        char *next = str ? str : *saveptr;
+        return nextGuestToken(next, delimiters, delimiterLength, saveptr);
+    }
+
+    /* An N2 cabinet runs TZ=UTC while its clock holds local time, and the game
+     * converts with gmtime_r().  So the clock sources report local time and
+     * localtime() behaves as UTC, keeping gmtime()/timegm() round-tripping. */
     long hostUtcOffsetSeconds()
     {
         static long cachedOffset = 0;
@@ -873,15 +1161,127 @@ namespace LibcBridge
         return _utime(winPath, (struct _utimbuf *)times);
     }
 
+    void bridgeStackChkFail(void)
+    {
+        /* Reaching this means the guest detected a smashed stack canary.  The
+         * process cannot be trusted from here, and glibc does not return. */
+        log_fatal("__stack_chk_fail: guest stack protector tripped");
+        std::abort();
+    }
+
+    int bridgePutcUnlocked(int character, FILE *stream)
+    {
+        return fputc(character, stream);
+    }
+
+    int bridgeNice(int increment)
+    {
+        /* Scheduling priority is not emulated; report the unchanged niceness
+         * rather than an error, which callers treat as a failure. */
+        (void)increment;
+        return 0;
+    }
+
+    int bridgeGetrlimit(int resource, void *limit)
+    {
+        /* i386 struct rlimit is two 32-bit words.  Report RLIM_INFINITY so a
+         * guest sizing itself against the limit picks its own default. */
+        log_trace("getrlimit(%d) -> unlimited", resource);
+        if (!limit)
+            return -1;
+        uint32_t *values = static_cast<uint32_t *>(limit);
+        values[0] = 0xFFFFFFFFu; // rlim_cur
+        values[1] = 0xFFFFFFFFu; // rlim_max
+        return 0;
+    }
+
+    int bridgeGetrusage(int who, void *usage)
+    {
+        /* Callers use this for coarse timing/diagnostics; zeros keep them from
+         * dividing by an unset field. */
+        (void)who;
+        if (!usage)
+            return -1;
+        memset(usage, 0, 72); // sizeof(struct rusage) on i386
+        return 0;
+    }
+
+    int bridgeSchedGetscheduler(int pid)
+    {
+        (void)pid;
+        return 0; // SCHED_OTHER
+    }
+
+    int bridgeFtruncate64(int descriptor, int64_t length)
+    {
+        return _chsize_s(descriptor, length) == 0 ? 0 : -1;
+    }
+
+    int bridgePosixFallocate64(int descriptor, int64_t offset, int64_t length)
+    {
+        /* Windows has no fallocate; growing the file to the requested end has
+         * the same observable effect for the callers that use this. */
+        const int64_t end = offset + length;
+        const int64_t current = _filelengthi64(descriptor);
+        if (current < 0)
+            return EBADF;
+        if (current >= end)
+            return 0;
+        return _chsize_s(descriptor, end) == 0 ? 0 : EIO;
+    }
+
+    int bridgeUtimes(const char *path, const struct timeval times[2])
+    {
+        char winPath[MAX_PATH];
+        ConvertPath(winPath, path, MAX_PATH);
+        if (!times)
+            return _utime(winPath, nullptr);
+
+        struct _utimbuf buffer{};
+        buffer.actime = static_cast<time_t>(times[0].tv_sec);
+        buffer.modtime = static_cast<time_t>(times[1].tv_sec);
+        return _utime(winPath, &buffer);
+    }
+
+    void bridgeSincosf(float angle, float *sine, float *cosine)
+    {
+        if (sine)
+            *sine = sinf(angle);
+        if (cosine)
+            *cosine = cosf(angle);
+    }
+
+    size_t bridgeStrnlen(const char *text, size_t limit)
+    {
+        if (!text)
+            return 0;
+        size_t length = 0;
+        while (length < limit && text[length] != '\0')
+            ++length;
+        return length;
+    }
+
+    long long bridgeStrtoll(const char *text, char **end, int base)
+    {
+        return strtoll(text, end, base);
+    }
+
+    unsigned long bridgeStrtoul(const char *text, char **end, int base)
+    {
+        return strtoul(text, end, base);
+    }
+
+    unsigned long long bridgeStrtoull(const char *text, char **end, int base)
+    {
+        return strtoull(text, end, base);
+    }
+
     int bridgeGettimeofday(struct timeval *tv, void *tz)
     {
         log_trace("Intercepted gettimeofday");
-        /*
-         * clKickback's power/self-check waits poll cabinet time from the
-         * guest main thread instead of sleeping.  Keep the SDL/Win32 queue
-         * alive there too, otherwise Windows marks the test window hung and
-         * the TEST key can never be delivered to the JVS state.
-         */
+        /* clKickback's waits poll cabinet time from the main thread rather than
+         * sleeping, so pump here too or Windows calls the window hung and the
+         * TEST key never arrives. */
         keepWindowResponsive();
         if (tv)
         {
@@ -932,11 +1332,8 @@ namespace LibcBridge
 
     int bridgeNanosleep(const struct timespec *req, struct timespec *rem)
     {
-        /*
-         * A thread waiting out a load is usually doing it here.  If that is the
-         * one that owns the window, this is the only chance to keep its message
-         * queue moving, since no frame is being presented.
-         */
+        /* A thread waiting out a load usually waits here, and if it owns the
+         * window this is the only chance to keep its queue moving. */
         keepWindowResponsive();
 
         long long duration_ns = (long long)req->tv_sec * 1000000000LL + req->tv_nsec;
@@ -1001,6 +1398,11 @@ namespace LibcBridge
     {
         log_trace("Intercepted clock_gettime");
         keepWindowResponsive();
+        if (!tp)
+        {
+            errno = EINVAL;
+            return -1;
+        }
         if (clk_id == CLOCK_REALTIME)
         {
             const unsigned long long t = cabinetClockMicroseconds();
@@ -1008,6 +1410,18 @@ namespace LibcBridge
             tp->tv_nsec = (long)(t % 1000000) * 1000;
             return 0;
         }
+        /* Linux CLOCK_MONOTONIC is 1; RAW and BOOTTIME are 4 and 7.  ES1's
+         * Boost.Asio reactor uses this epoch to arm timerfd with an absolute
+         * deadline, so it must match the steady clock used by timerfd. */
+        if (clk_id == 1 || clk_id == 4 || clk_id == 7)
+        {
+            const auto nanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count();
+            tp->tv_sec = static_cast<long>(nanoseconds / 1000000000ll);
+            tp->tv_nsec = static_cast<long>(nanoseconds % 1000000000ll);
+            return 0;
+        }
+        errno = EINVAL;
         return -1;
     }
 
@@ -1123,13 +1537,28 @@ namespace LibcBridge
 
     int bridgeWaitpid(int pid, int *wstatus, int options)
     {
-        log_info("Intercepted waitpid(%d, %p, %d)", pid, wstatus, options);
-        // For now, we just return a dummy status.
-        // In a real implementation, you might want to hook into the Windows process
-        // management to get the actual exit status.
+        /* fork() is faked, so the child never existed and can never exit; a poll
+         * has to answer "no state change" or the caller concludes its helper
+         * process died. */
+        constexpr int LINUX_WNOHANG = 1;
+        if (options & LINUX_WNOHANG)
+        {
+            static bool reported = false;
+            if (!reported)
+            {
+                reported = true;
+                log_debug("waitpid(%d, %p, WNOHANG) -> 0; the faked child stays alive",
+                          pid, wstatus);
+            }
+            return 0;
+        }
+
+        /* A blocking wait has nothing to wait for, so reap immediately rather
+         * than deadlock the caller. */
+        log_info("Intercepted blocking waitpid(%d, %p, %d)", pid, wstatus, options);
         if (wstatus)
-            *wstatus = 0; // 0 indicates normal termination
-        return pid;       // Return the PID as if it terminated normally
+            *wstatus = 0; // Normal termination, exit code 0
+        return pid;
     }
 
     pid_t bridgeGetuid(void)
@@ -1333,13 +1762,9 @@ namespace LibcBridge
         return 0;
     }
 
-    /*
-     * Namco System N2 runs its I/O service off an interval timer:
-     * clSystemN2::execSystemN2() blocks SIGALRM and SIGTERM, arms a 20 ms
-     * ITIMER_REAL and then loops on sigwait(), driving one JVIO exchange per
-     * tick.  Windows has no POSIX signals, so the timer is kept here and
-     * sigwait() simply waits out the period and reports the alarm.
-     */
+    /* N2 runs its I/O service off an interval timer: a 20 ms ITIMER_REAL and a
+     * sigwait() loop, one JVIO exchange per tick.  Windows has no POSIX
+     * signals, so the timer lives here and sigwait() waits out the period. */
     constexpr int linuxSigalrm = 14;
 
     struct LinuxTimeval
@@ -1413,21 +1838,16 @@ namespace LibcBridge
             std::lock_guard<std::mutex> lock(intervalTimerMutex);
             if (intervalTimerNextUs == 0)
             {
-                /*
-                 * Nothing armed. The N2 service loop retries on any non-zero
-                 * return, so answering with an error would spin; pace it at
-                 * the cabinet's period instead and report the alarm anyway.
-                 */
+                /* Nothing armed.  The service loop retries on any non-zero
+                 * return, so pace it at the cabinet's period and report the
+                 * alarm rather than spinning on an error. */
                 intervalTimerPeriodUs = intervalTimerPeriodUs ? intervalTimerPeriodUs : 20000;
                 intervalTimerNextUs = monotonicMicroseconds() + intervalTimerPeriodUs;
             }
             waitUntil = intervalTimerNextUs;
 
-            /*
-             * Advance from the previous deadline rather than from now so the
-             * ticks do not drift, but resynchronise if the caller fell far
-             * enough behind that catching up would fire a burst of them.
-             */
+            /* Advance from the previous deadline so ticks do not drift, but
+             * resynchronise when catching up would fire a burst of them. */
             const int64_t period = intervalTimerPeriodUs > 0 ? intervalTimerPeriodUs : 20000;
             const int64_t now = monotonicMicroseconds();
             intervalTimerNextUs =

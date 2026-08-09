@@ -3,7 +3,7 @@
 #include "n2VirtualDevices.h"
 
 #include "n2CardReader.h"
-#include "n2CsNeoPcb.h"
+#include "csneo/n2CsNeoPcb.h"
 #include "n2Jvio.h"
 #include "n2Kickback.h"
 #include "../../../config/config.h"

@@ -188,17 +188,17 @@ typedef struct
 {
     bool isActive;
     bool isPhysicalActive;
+    /* SDL can deliver press and release in one pump. Keep the press time so
+     * cabinet adapters can expose a minimum hardware-like switch pulse. */
+    Uint64 lastActivatedAt;
     float analogValue;
     float positiveContribution;
     float negativeContribution;
 } ActionState;
 
-/*
- * Where every logical action's current value lives. Force feedback reads
- * LA_Steer out of it so a wheel with no condition effects can still be given a
- * centring force worked out here instead - which is what the cabinet's own
- * board does against its encoder.
- */
+/* Where every logical action's current value lives.  Force feedback reads
+ * LA_Steer from here so a wheel with no condition effects can still be centred
+ * in software, which is what the cabinet's own board does. */
 extern ActionState gActionStates[MAX_ENTITIES][NUM_LOGICAL_ACTIONS];
 
 typedef struct
@@ -285,6 +285,10 @@ int getShifterGears(void);
 
 /* Active WMMT H-pattern position, 1..6, or 0 when none is pressed. */
 int getWmmtDirectGear(void);
+
+/* True while held, or briefly after the most recent press. */
+bool isActionActiveOrRecentlyPressed(JVSPlayer player, LogicalAction action,
+                                     Uint64 minimumPulseMs);
 
 #ifdef __cplusplus
 }

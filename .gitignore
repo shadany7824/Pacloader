@@ -2,3 +2,13 @@
 build*/
 compile_commands.json
 logs/
+
+# Server certificates: regenerate with tools/wmmt4_make_server_cert.sh.
+wmmt4-certs/
+tools/certs/
+
+# Runtime libraries that ship with a title. Copy them in locally if a title
+# needs them; they are not ours to redistribute.
+libs/win32/ll-deps/libcrypto.so.0.9.8
+libs/win32/ll-deps/libssl.so.0.9.8
+libs/win32/ll-deps/libprotobuf.so.7

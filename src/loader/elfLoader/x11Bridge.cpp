@@ -19,18 +19,9 @@
 namespace
 {
 /*
- * These are not native C++ representations.  The guest is a 32-bit Xlib
- * client, while the loader is normally a 64-bit process.  Using ordinary
- * structs here lets the host compiler insert 64-bit pointer alignment gaps;
- * the guest then reads the Display/Screen fields at the wrong offsets.  Keep
- * the byte layout used by Xlib (and by KittenTools) explicitly instead.
- *
- * Important fields:
- *   Display.default_screen: 0x84
- *   Display.screens:        0x8c
- *   Screen.root:            0x00
- *   Screen.width:           0x0c
- *   Screen.height:          0x10
+ * Byte layouts, not native structs: the guest is a 32-bit Xlib client and host
+ * alignment would move the fields it reads.  Display.default_screen is at 0x84
+ * and Display.screens at 0x8c; Screen.root, .width and .height at 0, 0xc, 0x10.
  */
 std::array<unsigned char, 0x400> g_screen{};
 std::array<unsigned char, 0x1000> g_display{};
@@ -51,17 +42,9 @@ void writeX11DisplayField(size_t offset, T value)
 }
 
 /*
- * Maximum Heat 3D does not use the SDL 1.2 event entry point for its cabinet
- * input.  Its clInputDeviceKey::update() calls the game's X11 PollEvent(),
- * which in turn calls XPending/XNextEvent and translates the keycode with
- * XKeycodeToKeysym().  The Windows X11 compatibility layer used to return no
- * events, so keyboard input could never reach the guest input bitfield.
- *
- * Keep a small X11-shaped queue fed from SDL.  The event layout below only
- * contains the fields consumed by the guest's PollEvent implementation:
- * offset 8 is the X event type and offset 0x3c is the keycode passed to
- * XKeycodeToKeysym().  The actual X11 ABI layout is otherwise irrelevant to
- * this compatibility path.
+ * Some titles read cabinet input through X11 rather than SDL 1.2, so keep a
+ * small X11-shaped queue fed from SDL.  Only the fields the guest's PollEvent
+ * consumes matter: offset 8 is the event type, 0x3c the keycode.
  */
 struct PendingKeyEvent
 {
@@ -140,12 +123,8 @@ void pumpX11KeyboardEvents()
         }
         break;
 
-        /*
-         * This pump drains the whole SDL queue, so anything it does not hand
-         * to the input layer is discarded rather than left for another poll.
-         * The wheel, pedals and panel buttons all arrive as these events, and
-         * dropping them left a guest that only ever saw the keyboard.
-         */
+        /* This pump drains the whole SDL queue, so anything not handed to the
+         * input layer is lost - including the wheel, pedals and panel buttons. */
         case SDL_EVENT_MOUSE_BUTTON_DOWN:
         case SDL_EVENT_MOUSE_BUTTON_UP:
         case SDL_EVENT_MOUSE_MOTION:
@@ -207,6 +186,12 @@ extern "C" void *bridgeXOpenDisplay(const char *name)
     writeX11DisplayField(0x84, defaultScreen);
     writeX11DisplayField(0x8c, g_screen.data());
     return g_display.data();
+}
+
+extern "C" int bridgeXInitThreads()
+{
+    /* The SDL-backed X11 shim is already synchronized by its bridge mutexes. */
+    return 1;
 }
 
 extern "C" int bridgeXCloseDisplay(void *display)
@@ -284,6 +269,37 @@ extern "C" int bridgeXFreeGC(void *display, ...)
     return 0;
 }
 
+extern "C" int bridgeXChangeProperty(void *display, ...)
+{
+    (void)display;
+    return 0;
+}
+
+extern "C" int bridgeXFillRectangle(void *display, ...)
+{
+    (void)display;
+    return 0;
+}
+
+extern "C" int bridgeXSetForeground(void *display, ...)
+{
+    (void)display;
+    return 0;
+}
+
+extern "C" unsigned long bridgeXInternAtom(void *display, const char *name, int onlyIfExists)
+{
+    (void)display;
+    (void)name;
+    (void)onlyIfExists;
+    return 1;
+}
+
+extern "C" void bridgeXSetWMProperties(void *display, ...)
+{
+    (void)display;
+}
+
 extern "C" int bridgeXFreePixmap(void *display, ...)
 {
     (void)display;
@@ -298,6 +314,39 @@ extern "C" int bridgeXGetScreenSaver(void *display, int *timeout, int *interval,
     if (interval) *interval = 0;
     if (preferBlanking) *preferBlanking = 0;
     if (allowExposures) *allowExposures = 1;
+    return 1;
+}
+
+extern "C" int bridgeXGetWindowAttributes(void *display, unsigned long window,
+                                           void *attributes)
+{
+    (void)display;
+    (void)window;
+    if (!attributes)
+        return 0;
+
+    /* XWindowAttributes is a 32-bit Xlib structure from the guest's point of
+     * view.  Keep this explicit instead of writing a host struct containing
+     * 64-bit pointers into guest memory. */
+    std::memset(attributes, 0, 92);
+    auto write = [attributes](size_t offset, auto value) {
+        std::memcpy(static_cast<unsigned char *>(attributes) + offset,
+                    &value, sizeof(value));
+    };
+    const int width = getConfig()->width;
+    const int height = getConfig()->height;
+    const uint32_t root = 1;
+    const int depth = 24;
+    const int inputOutput = 1;
+    const int viewable = 2;
+    write(0, 0);                  // x
+    write(4, 0);                  // y
+    write(8, width);
+    write(12, height);
+    write(20, depth);
+    write(28, root);              // root
+    write(32, inputOutput);       // class
+    write(68, viewable);          // map_state
     return 1;
 }
 
@@ -317,7 +366,21 @@ extern "C" int bridgeXMapWindow(void *display, unsigned long window)
 {
     (void)display;
     (void)window;
+    if (!getSDLWindow())
+        startSDL();
+    SDL_ShowWindow(getSDLWindow());
+    raiseSDLWindow();
     return 0;
+}
+
+extern "C" unsigned long bridgeXRootWindow(void *display, int screen)
+{
+    (void)display;
+    (void)screen;
+    /* XRootWindow is a convenience accessor for Screen.root.  The ES1
+     * display shim exposes one synthetic root window, matching the value
+     * populated by bridgeXOpenDisplay(). */
+    return 1;
 }
 
 extern "C" int bridgeXMoveResizeWindow(void *display, ...)
@@ -367,6 +430,7 @@ extern "C" int bridgeXPutImage(void *display, ...)
 extern "C" int bridgeXRaiseWindow(void *display, ...)
 {
     (void)display;
+    raiseSDLWindow();
     return 0;
 }
 
@@ -438,6 +502,11 @@ extern "C" int bridgeDPMSDisable(void *display)
     return 1;
 }
 
+extern "C" void *bridgeX11CurrentDisplay()
+{
+    return g_display.data();
+}
+
 template <typename T>
 void map(const char *name, T function)
 {
@@ -454,6 +523,7 @@ void initBridges()
     map("XAllocSizeHints", +[]() -> void * { return std::calloc(1, 256); });
     map("XClearWindow", bridgeXFlush);
     map("XCloseDisplay", bridgeXCloseDisplay);
+    map("XChangeProperty", bridgeXChangeProperty);
     map("XCreateColormap", bridgeXCreateColormap);
     map("XCreateGC", bridgeXCreateGC);
     map("XCreateImage", bridgeXCreateImage);
@@ -467,7 +537,11 @@ void initBridges()
     map("XFreeCursor", bridgeXFreeCursor);
     map("XFreeGC", bridgeXFreeGC);
     map("XFreePixmap", bridgeXFreePixmap);
+    map("XFillRectangle", bridgeXFillRectangle);
     map("XGetScreenSaver", bridgeXGetScreenSaver);
+    map("XGetWindowAttributes", bridgeXGetWindowAttributes);
+    map("XInitThreads", bridgeXInitThreads);
+    map("XInternAtom", bridgeXInternAtom);
     map("XGrabKeyboard", bridgeXGrabKeyboard);
     map("XKeycodeToKeysym", bridgeXKeycodeToKeysym);
     map("XMapWindow", bridgeXMapWindow);
@@ -478,7 +552,10 @@ void initBridges()
     map("XPutImage", bridgeXPutImage);
     map("XRaiseWindow", bridgeXRaiseWindow);
     map("XReparentWindow", bridgeXReparentWindow);
+    map("XRootWindow", bridgeXRootWindow);
     map("XSetScreenSaver", bridgeXSetScreenSaver);
+    map("XSetForeground", bridgeXSetForeground);
+    map("XSetWMProperties", bridgeXSetWMProperties);
     map("XSetWindowBackground", bridgeXSetWindowBackground);
     map("XSetWMNormalHints", bridgeXSetWMNormalHints);
     map("XStringToKeysym", bridgeXStringToKeysym);

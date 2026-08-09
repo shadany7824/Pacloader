@@ -1,6 +1,8 @@
 #include "es1VirtualDevices.h"
 #include "es1Jvs.h"
 #include "es1Kickback.h"
+#include "../n2/n2CardReader.h"
+#include "../../../config/config.h"
 
 #include "../../../platform/platformBackend.h"
 #include "../../../elfLoader/virtualDeviceRegistry.hpp"
@@ -655,7 +657,37 @@ const VirtualDeviceRegistry::Device serialDevice{
     closeDevice,
     ioctlDevice,
     mapDevice};
+} // namespace
+
+extern "C" int es1MagneticCardEnabled(void)
+{
+    return platformIsES1() &&
+           getConfig()->namcoES1.cabinetMode == NAMCO_ES1_CABINET_TERMINAL &&
+           getConfig()->namcoES1.card.enabled;
 }
+
+extern "C" void es1MagneticCardStart(void)
+{
+    if (!es1MagneticCardEnabled())
+        return;
+
+    n2CardReaderUseEs1Terminal();
+    n2CardReaderRegisterCardControl();
+    /* Connect now: the title opens the port once and treats a single failure
+     * as a missing reader, so the pipe must already be up by then. */
+    n2CardReaderStart();
+    log_info("System ES1: magnetic card reader on /dev/ttyS1 via YaCardEmu pipe \"%s\"",
+             getConfig()->namcoES1.card.pipeName);
+}
+
+namespace
+{
+/* Claimed only by an ES1 terminal cabinet with the reader enabled. */
+bool es1MagneticCardClaimsPath(const char *path)
+{
+    return es1MagneticCardEnabled() && path && std::strcmp(path, "/dev/ttyS1") == 0;
+}
+} // namespace
 
 extern "C" void es1RegisterVirtualDevices(void)
 {
@@ -685,5 +717,24 @@ extern "C" void es1RegisterVirtualDevices(void)
         es1JvsSerialIoctl,
         nullptr};
     VirtualDeviceRegistry::registerDevice(jvsDevice);
+
+    /*
+     * Only the terminal cabinet has a magnetic card reader, on the port the
+     * drive cabinet leaves unused; without it the boot check stops at E0611.
+     * Registration runs before detection, so the decision is made in the claim.
+     */
+    const VirtualDeviceRegistry::Device magneticCardDevice{
+        "System ES1 magnetic card R/W (/dev/ttyS1)",
+        es1MagneticCardClaimsPath,
+        n2CardReaderOpen,
+        n2CardReaderIsDescriptor,
+        n2CardReaderBytesAvailable,
+        n2CardReaderRead,
+        n2CardReaderWrite,
+        n2CardReaderClose,
+        n2CardReaderIoctl,
+        nullptr};
+    VirtualDeviceRegistry::registerDevice(magneticCardDevice);
+
     VirtualDeviceRegistry::registerDevice(serialDevice);
 }

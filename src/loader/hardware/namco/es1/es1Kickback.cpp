@@ -12,17 +12,12 @@
 
 #include "../../../platform/platformBackend.h"
 #include "../../../log/log.h"
+#include "es1.h"
+#include "es1Title.h"
 
 namespace
 {
 constexpr int Descriptor = 0x4e20;
-/*
- * clKickback::init() in Maximum Heat 3D builds clSerialParam with device
- * index 1.  clSerialN2::open() indexes the game's table at
- * 0x85e1cd8, where index 1 is /dev/ttyS1.  This is the separate steering
- * PCB port; it must not be confused with the ES1 JVS serial ports.
- */
-constexpr char DevicePath[] = "/dev/ttyS1";
 constexpr size_t CommandLength = 10;
 constexpr size_t MaximumQueuedBytes = 1024;
 constexpr uint8_t FrameHeader = 0xff;
@@ -78,7 +73,11 @@ void consumeCommands(void)
 
 extern "C" bool es1KickbackClaimsPath(const char *path)
 {
-    return platformIsES1() && path && std::strcmp(path, DevicePath) == 0;
+    /* The serial port layout is per-title, not per-platform - another title may
+     * put its IC card reader on this board's port - so the port comes from the
+     * running title rather than from this file. */
+    const char *devicePath = es1TitleQuirks()->kickbackDevicePath;
+    return platformIsES1() && devicePath && path && std::strcmp(path, devicePath) == 0;
 }
 
 extern "C" int es1KickbackOpen(const char *path, int)
@@ -96,7 +95,7 @@ extern "C" int es1KickbackOpen(const char *path, int)
     if (!opened)
     {
         opened = true;
-        log_warn("System ES1 steering: %s answered by the virtual STR PCB", DevicePath);
+        log_warn("System ES1 steering: %s answered by the virtual STR PCB", path);
     }
     return Descriptor;
 }

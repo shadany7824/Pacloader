@@ -10,10 +10,12 @@
 #include "../hardware/namco/n2/n2Host.h"
 #include "../hardware/namco/es1/es1.h"
 #include "../hardware/namco/es1/es1Network.h"
+#include "../hardware/namco/es1/wmmt4/es1Wmmt4Network.hpp"
 #include "virtualDeviceRegistry.hpp"
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <iphlpapi.h>
 #include <algorithm>
 #include <climits>
 #include <mutex>
@@ -156,10 +158,8 @@ bool makeEs1GuestAddress(const sockaddr *source, int sourceLength,
     std::memset(&destination, 0, sizeof(destination));
     std::memcpy(&destination, source,
                 static_cast<size_t>(std::min(sourceLength, static_cast<int>(sizeof(destination)))));
-    // The guest socket is bound to the host adapter address.  Send the
-    // virtual cabinet packet back to that same adapter so Winsock delivers it
-    // to the listener, while the guest still observes its ES1 address in the
-    // received sockaddr/clLanBuffer fields.
+    // The guest socket is bound to the host adapter, so send there and let the
+    // guest still see its ES1 address in the received sockaddr.
     in_addr hostAddress = {};
     if (!getHostIPv4(&hostAddress))
         return false;
@@ -218,12 +218,9 @@ void rewriteEs1MessagePeerAddress(sockaddr *address, int addressLength,
     const uint32_t type = *reinterpret_cast<const uint32_t *>(data + 0x14);
     if (type == 0x903 && length >= 0x1c)
     {
-        /* clNet::receive uses the low octet of the peer address as the ES1
-         * PCB slot.  On the physical LAN every cabinet shares the subnet and
-         * owns one such address; the packet's status payload carries that
-         * slot in its fourth byte.  Passing the host adapter address through
-         * unchanged (e.g. 192.168.32.115) makes the game index slot 115 and
-         * report a false duplicate. */
+        /* clNet::receive takes the low octet of the peer address as the PCB
+         * slot, so passing the host adapter address through unchanged makes the
+         * game index a nonexistent slot and report a false duplicate. */
         const unsigned char pcb = data[0x1b];
         if (pcb >= 1 && pcb <= 4)
             peerBytes[3] = pcb;
@@ -251,10 +248,8 @@ bool makeEs1MulticastAddress(const sockaddr *source, int sourceLength,
     std::memset(&destination, 0, sizeof(destination));
     std::memcpy(&destination, source,
                 static_cast<size_t>(std::min(sourceLength, static_cast<int>(sizeof(destination)))));
-    // A single virtual cabinet must receive its own discovery datagrams.  The
-    // socket is bound to the host adapter, so use that address as the local
-    // endpoint instead of sending the guest multicast address to the physical
-    // network.
+    // A lone virtual cabinet has to hear its own discovery datagrams, so the
+    // local endpoint is the host adapter rather than the multicast address.
     in_addr hostAddress = {};
     if (!getHostIPv4(&hostAddress))
         return false;
@@ -293,195 +288,151 @@ bool makeConfiguredBroadcastAddress(const sockaddr *source, int sourceLength,
 
 #define MAP(name, func) SymbolResolver::GetInstance().RegisterVTable(name, reinterpret_cast<void *>(func))
 
-// Helper to map WSA errors to POSIX errno
-
-// Some POSIX error codes might not be defined in MinGW's <cerrno>
-#ifndef ENOTSOCK
-#define ENOTSOCK EINVAL
-#endif
-#ifndef EDESTADDRREQ
-#define EDESTADDRREQ EINVAL
-#endif
-#ifndef EMSGSIZE
-#define EMSGSIZE EINVAL
-#endif
-#ifndef EPROTOTYPE
-#define EPROTOTYPE EINVAL
-#endif
-#ifndef ENOPROTOOPT
-#define ENOPROTOOPT EINVAL
-#endif
-#ifndef EPROTONOSUPPORT
-#define EPROTONOSUPPORT EINVAL
-#endif
-#ifndef ESOCKTNOSUPPORT
-#define ESOCKTNOSUPPORT EINVAL
-#endif
-#ifndef EOPNOTSUPP
-#define EOPNOTSUPP EINVAL
-#endif
-#ifndef EPFNOSUPPORT
-#define EPFNOSUPPORT EINVAL
-#endif
-#ifndef EAFNOSUPPORT
-#define EAFNOSUPPORT EINVAL
-#endif
-#ifndef EADDRINUSE
-#define EADDRINUSE EINVAL
-#endif
-#ifndef EADDRNOTAVAIL
-#define EADDRNOTAVAIL EINVAL
-#endif
-#ifndef ENETDOWN
-#define ENETDOWN EINVAL
-#endif
-#ifndef ENETUNREACH
-#define ENETUNREACH EINVAL
-#endif
-#ifndef ENETRESET
-#define ENETRESET EINVAL
-#endif
-#ifndef ECONNABORTED
-#define ECONNABORTED EINVAL
-#endif
-#ifndef ECONNRESET
-#define ECONNRESET EINVAL
-#endif
-#ifndef ENOBUFS
-#define ENOBUFS EINVAL
-#endif
-#ifndef EISCONN
-#define EISCONN EINVAL
-#endif
-#ifndef ENOTCONN
-#define ENOTCONN EINVAL
-#endif
-#ifndef ESHUTDOWN
-#define ESHUTDOWN EINVAL
-#endif
-#ifndef ETOOMANYREFS
-#define ETOOMANYREFS EINVAL
-#endif
-#ifndef ETIMEDOUT
-#define ETIMEDOUT EINVAL
-#endif
-#ifndef ECONNREFUSED
-#define ECONNREFUSED EINVAL
-#endif
-#ifndef EHOSTDOWN
-#define EHOSTDOWN EINVAL
-#endif
-#ifndef EHOSTUNREACH
-#define EHOSTUNREACH EINVAL
-#endif
-#ifndef EPROCLIM
-#define EPROCLIM EINVAL
-#endif
-#ifndef EUSERS
-#define EUSERS EINVAL
-#endif
-#ifndef EDQUOT
-#define EDQUOT EINVAL
-#endif
-#ifndef ESTALE
-#define ESTALE EINVAL
-#endif
-#ifndef EREMOTE
-#define EREMOTE EINVAL
-#endif
+/*
+ * WSA error to guest errno.  These are Linux i386's numbers, written out
+ * literally because <cerrno> here would give the host CRT's - and the two
+ * disagree on the socket codes that matter (EINPROGRESS is 115, not 112).
+ */
+namespace LinuxErrno
+{
+constexpr int Intr = 4;
+constexpr int Io = 5;
+constexpr int Badf = 9;
+constexpr int Again = 11;
+constexpr int Acces = 13;
+constexpr int Fault = 14;
+constexpr int Inval = 22;
+constexpr int Mfile = 24;
+constexpr int NameTooLong = 36;
+constexpr int NotEmpty = 39;
+constexpr int Loop = 40;
+constexpr int Users = 87;
+constexpr int NotSock = 88;
+constexpr int DestAddrReq = 89;
+constexpr int MsgSize = 90;
+constexpr int ProtoType = 91;
+constexpr int NoProtoOpt = 92;
+constexpr int ProtoNoSupport = 93;
+constexpr int SockTNoSupport = 94;
+constexpr int OpNotSupp = 95;
+constexpr int PfNoSupport = 96;
+constexpr int AfNoSupport = 97;
+constexpr int AddrInUse = 98;
+constexpr int AddrNotAvail = 99;
+constexpr int NetDown = 100;
+constexpr int NetUnreach = 101;
+constexpr int NetReset = 102;
+constexpr int ConnAborted = 103;
+constexpr int ConnReset = 104;
+constexpr int NoBufs = 105;
+constexpr int IsConn = 106;
+constexpr int NotConn = 107;
+constexpr int Shutdown = 108;
+constexpr int TooManyRefs = 109;
+constexpr int TimedOut = 110;
+constexpr int ConnRefused = 111;
+constexpr int HostDown = 112;
+constexpr int HostUnreach = 113;
+constexpr int Already = 114;
+constexpr int InProgress = 115;
+constexpr int Stale = 116;
+constexpr int Remote = 66;
+constexpr int DQuot = 122;
+} // namespace LinuxErrno
 
 static int mapWSAErrorToErrno(int wsaError)
 {
     switch (wsaError)
     {
         case WSAEINTR:
-            return EINTR;
+            return LinuxErrno::Intr;
         case WSAEBADF:
-            return EBADF;
+            return LinuxErrno::Badf;
         case WSAEACCES:
-            return EACCES;
+            return LinuxErrno::Acces;
         case WSAEFAULT:
-            return EFAULT;
+            return LinuxErrno::Fault;
         case WSAEINVAL:
-            return EINVAL;
+            return LinuxErrno::Inval;
         case WSAEMFILE:
-            return EMFILE;
+            return LinuxErrno::Mfile;
         case WSAEWOULDBLOCK:
-            return EAGAIN;
+            return LinuxErrno::Again;
         case WSAEINPROGRESS:
-            return EINPROGRESS;
+        case WSA_IO_PENDING:
+            return LinuxErrno::InProgress;
         case WSAEALREADY:
-            return EALREADY;
+            return LinuxErrno::Already;
         case WSAENOTSOCK:
-            return ENOTSOCK;
+            return LinuxErrno::NotSock;
         case WSAEDESTADDRREQ:
-            return EDESTADDRREQ;
+            return LinuxErrno::DestAddrReq;
         case WSAEMSGSIZE:
-            return EMSGSIZE;
+            return LinuxErrno::MsgSize;
         case WSAEPROTOTYPE:
-            return EPROTOTYPE;
+            return LinuxErrno::ProtoType;
         case WSAENOPROTOOPT:
-            return ENOPROTOOPT;
+            return LinuxErrno::NoProtoOpt;
         case WSAEPROTONOSUPPORT:
-            return EPROTONOSUPPORT;
+            return LinuxErrno::ProtoNoSupport;
         case WSAESOCKTNOSUPPORT:
-            return ESOCKTNOSUPPORT;
+            return LinuxErrno::SockTNoSupport;
         case WSAEOPNOTSUPP:
-            return EOPNOTSUPP;
+            return LinuxErrno::OpNotSupp;
         case WSAEPFNOSUPPORT:
-            return EPFNOSUPPORT;
+            return LinuxErrno::PfNoSupport;
         case WSAEAFNOSUPPORT:
-            return EAFNOSUPPORT;
+            return LinuxErrno::AfNoSupport;
         case WSAEADDRINUSE:
-            return EADDRINUSE;
+            return LinuxErrno::AddrInUse;
         case WSAEADDRNOTAVAIL:
-            return EADDRNOTAVAIL;
+            return LinuxErrno::AddrNotAvail;
         case WSAENETDOWN:
-            return ENETDOWN;
+            return LinuxErrno::NetDown;
         case WSAENETUNREACH:
-            return ENETUNREACH;
+            return LinuxErrno::NetUnreach;
         case WSAENETRESET:
-            return ENETRESET;
+            return LinuxErrno::NetReset;
         case WSAECONNABORTED:
-            return ECONNABORTED;
+            return LinuxErrno::ConnAborted;
         case WSAECONNRESET:
-            return ECONNRESET;
+            return LinuxErrno::ConnReset;
         case WSAENOBUFS:
-            return ENOBUFS;
+            return LinuxErrno::NoBufs;
         case WSAEISCONN:
-            return EISCONN;
+            return LinuxErrno::IsConn;
         case WSAENOTCONN:
-            return ENOTCONN;
+            return LinuxErrno::NotConn;
         case WSAESHUTDOWN:
-            return ESHUTDOWN;
+            return LinuxErrno::Shutdown;
         case WSAETOOMANYREFS:
-            return ETOOMANYREFS;
+            return LinuxErrno::TooManyRefs;
         case WSAETIMEDOUT:
-            return ETIMEDOUT;
+            return LinuxErrno::TimedOut;
         case WSAECONNREFUSED:
-            return ECONNREFUSED;
+            return LinuxErrno::ConnRefused;
         case WSAELOOP:
-            return ELOOP;
+            return LinuxErrno::Loop;
         case WSAENAMETOOLONG:
-            return ENAMETOOLONG;
+            return LinuxErrno::NameTooLong;
         case WSAEHOSTDOWN:
-            return EHOSTDOWN;
+            return LinuxErrno::HostDown;
         case WSAEHOSTUNREACH:
-            return EHOSTUNREACH;
+            return LinuxErrno::HostUnreach;
         case WSAENOTEMPTY:
-            return ENOTEMPTY;
+            return LinuxErrno::NotEmpty;
         case WSAEPROCLIM:
-            return EPROCLIM;
+            return LinuxErrno::Users;
         case WSAEUSERS:
-            return EUSERS;
+            return LinuxErrno::Users;
         case WSAEDQUOT:
-            return EDQUOT;
+            return LinuxErrno::DQuot;
         case WSAESTALE:
-            return ESTALE;
+            return LinuxErrno::Stale;
         case WSAEREMOTE:
-            return EREMOTE;
+            return LinuxErrno::Remote;
         default:
-            return EINVAL;
+            return LinuxErrno::Inval;
     }
 }
 
@@ -577,6 +528,147 @@ namespace NetworkBridge
         MAP("freeaddrinfo", bridgeFreeaddrinfo);
         MAP("if_nametoindex", bridgeIf_nametoindex);
         MAP("if_indextoname", bridgeIf_indextoname);
+        MAP("getifaddrs", bridgeGetifaddrs);
+        MAP("freeifaddrs", bridgeFreeifaddrs);
+    }
+
+    /* Linux struct ifaddrs as the i386 guest sees it.  Titles enumerate
+     * interfaces to find their own address, so the list is the cabinet's:
+     * loopback plus a single eth0. */
+    struct LinuxIfaddrs
+    {
+        LinuxIfaddrs *ifa_next;
+        char *ifa_name;
+        unsigned int ifa_flags;
+        sockaddr *ifa_addr;
+        sockaddr *ifa_netmask;
+        sockaddr *ifa_broadaddr;
+        void *ifa_data;
+    };
+
+    /* Linux IFF_* values, which do not match the Windows ones. */
+    constexpr unsigned int LINUX_IFF_UP = 0x1;
+    constexpr unsigned int LINUX_IFF_BROADCAST = 0x2;
+    constexpr unsigned int LINUX_IFF_LOOPBACK = 0x8;
+    constexpr unsigned int LINUX_IFF_RUNNING = 0x40;
+    constexpr unsigned int LINUX_IFF_MULTICAST = 0x1000;
+
+    /* The address the guest's single "eth0" stands for.  Both getifaddrs and
+     * the SIOCGIF* ioctls answer from here so they never disagree. */
+    void primaryHostInterface(unsigned long &address, unsigned long &netmask,
+                              unsigned char mac[6])
+    {
+        address = 0;
+        netmask = htonl(0xFFFFFF00u);
+        std::memset(mac, 0, 6);
+
+        ULONG adapterInfoSize = 0;
+        if (GetAdaptersInfo(nullptr, &adapterInfoSize) != ERROR_BUFFER_OVERFLOW || !adapterInfoSize)
+            return;
+
+        std::vector<unsigned char> buffer(adapterInfoSize);
+        auto *adapters = reinterpret_cast<IP_ADAPTER_INFO *>(buffer.data());
+        if (GetAdaptersInfo(adapters, &adapterInfoSize) != NO_ERROR)
+            return;
+
+        for (IP_ADAPTER_INFO *adapter = adapters; adapter; adapter = adapter->Next)
+        {
+            const unsigned long candidate = inet_addr(adapter->IpAddressList.IpAddress.String);
+            if (candidate == 0 || candidate == INADDR_NONE)
+                continue;
+
+            address = candidate;
+            const unsigned long mask = inet_addr(adapter->IpAddressList.IpMask.String);
+            if (mask != 0 && mask != INADDR_NONE)
+                netmask = mask;
+            std::memcpy(mac, adapter->Address, std::min<UINT>(adapter->AddressLength, 6));
+            return;
+        }
+    }
+
+    /* One allocation per interface keeps freeifaddrs simple: the guest only
+     * ever hands back the head of the list. */
+    struct IfaddrsEntry
+    {
+        LinuxIfaddrs node;
+        char name[16];
+        sockaddr_in address;
+        sockaddr_in netmask;
+        sockaddr_in broadcast;
+    };
+
+    static IfaddrsEntry *makeIfaddrsEntry(const char *name, unsigned long address,
+                                          unsigned long netmask, unsigned int flags)
+    {
+        IfaddrsEntry *entry = new (std::nothrow) IfaddrsEntry{};
+        if (!entry)
+            return nullptr;
+
+        std::strncpy(entry->name, name, sizeof(entry->name) - 1);
+
+        entry->address.sin_family = AF_INET;
+        entry->address.sin_addr.s_addr = address;
+        entry->netmask.sin_family = AF_INET;
+        entry->netmask.sin_addr.s_addr = netmask;
+        entry->broadcast.sin_family = AF_INET;
+        entry->broadcast.sin_addr.s_addr = (address & netmask) | ~netmask;
+
+        entry->node.ifa_name = entry->name;
+        entry->node.ifa_flags = flags;
+        entry->node.ifa_addr = reinterpret_cast<sockaddr *>(&entry->address);
+        entry->node.ifa_netmask = reinterpret_cast<sockaddr *>(&entry->netmask);
+        entry->node.ifa_broadaddr = reinterpret_cast<sockaddr *>(&entry->broadcast);
+        return entry;
+    }
+
+    int bridgeGetifaddrs(void **result)
+    {
+        if (!result)
+            return -1;
+        *result = nullptr;
+
+        std::vector<IfaddrsEntry *> entries;
+
+        if (IfaddrsEntry *loopback = makeIfaddrsEntry(
+                "lo", htonl(INADDR_LOOPBACK), htonl(0xFF000000u),
+                LINUX_IFF_UP | LINUX_IFF_LOOPBACK | LINUX_IFF_RUNNING))
+            entries.push_back(loopback);
+
+        /* Present the host adapter the ES1 layer already picked for the
+         * virtual eth0, so every path agrees on the cabinet's address. */
+        unsigned long address = 0;
+        unsigned long netmask = 0;
+        unsigned char mac[6]{};
+        primaryHostInterface(address, netmask, mac);
+
+        if (address != 0)
+        {
+            if (IfaddrsEntry *ethernet = makeIfaddrsEntry(
+                    "eth0", address, netmask,
+                    LINUX_IFF_UP | LINUX_IFF_BROADCAST | LINUX_IFF_RUNNING | LINUX_IFF_MULTICAST))
+                entries.push_back(ethernet);
+        }
+
+        for (size_t i = 0; i + 1 < entries.size(); ++i)
+            entries[i]->node.ifa_next = &entries[i + 1]->node;
+
+        if (!entries.empty())
+            *result = &entries.front()->node;
+
+        log_debug("getifaddrs -> %zu interface(s)", entries.size());
+        return 0;
+    }
+
+    void bridgeFreeifaddrs(void *list)
+    {
+        auto *node = static_cast<LinuxIfaddrs *>(list);
+        while (node)
+        {
+            LinuxIfaddrs *next = node->ifa_next;
+            /* Every node is the first member of its IfaddrsEntry. */
+            delete reinterpret_cast<IfaddrsEntry *>(node);
+            node = next;
+        }
     }
 
     unsigned long bridgeInet_addr(const char *cp)
@@ -701,9 +793,17 @@ extern "C" SOCKET bridgeSocket(int af, int type, int protocol)
     return static_cast<SOCKET>(descriptor);
 }
 
+namespace Es1CompatBridge
+{
+void forgetEdgeState(int fd);
+}
+
 extern "C" int bridgeConnect(SOCKET s, const struct sockaddr *name, int namelen)
 {
     const int guestSocket = static_cast<int>(s);
+    /* connect() changes the socket's readiness; the epoll shim's edge memory
+     * for it is stale from here on. */
+    Es1CompatBridge::forgetEdgeState(guestSocket);
     s = NetworkBridge::hostSocket(static_cast<int>(s));
     log_trace(">>> connect called: socket=%lld", (long long)s);
     sockaddr_storage configuredAddress = {};
@@ -729,10 +829,8 @@ extern "C" int bridgeConnect(SOCKET s, const struct sockaddr *name, int namelen)
     if (g_es1NetworkTraceCount.fetch_add(1) < 16)
         log_debug("Network bridge: connect rewritten=%d port=%u", rewritten ? 1 : 0,
                  ntohs(reinterpret_cast<const sockaddr_in *>(destination)->sin_port));
-    // Boost.Asio has already put the guest socket into non-blocking mode.  For
-    // the in-process ES1 terminal, temporarily complete the local handshake
-    // synchronously so the accepted and connecting sessions become a real
-    // pair before the guest begins its LAN protocol exchange.
+    // For the in-process ES1 terminal, finish the loopback handshake here so
+    // the two sessions are a real pair before the guest's protocol starts.
     u_long restoreNonBlocking = 0;
     const bool restoreSocketMode = es1LocalTerminal &&
                                    ioctlsocket(s, FIONBIO, &restoreNonBlocking) == 0;
@@ -750,12 +848,11 @@ extern "C" int bridgeConnect(SOCKET s, const struct sockaddr *name, int namelen)
     if (ret == SOCKET_ERROR)
     {
         const int wsaError = WSAGetLastError();
-        // The ES1 cabinet's virtual terminal is local to this process.  A
-        // Windows non-blocking connect can report WSAEWOULDBLOCK even though
-        // the loopback listener has already completed the handshake.  Finish
-        // that local transition here so the guest's epoll-based connector
-        // observes the same successful session as a physical cabinet LAN.
-        if (es1IsDetected() && wsaError == WSAEWOULDBLOCK)
+        // Winsock can answer WSAEWOULDBLOCK even after the loopback listener
+        // has completed the handshake, so settle it here.  Confined to that
+        // in-process peer: doing it for a remote server turns every async
+        // connect into a blocking wait and reports the wrong errno afterwards.
+        if (es1LocalTerminal && wsaError == WSAEWOULDBLOCK)
         {
             // The peer is the in-process loopback listener.  Complete the
             // short local handshake synchronously, then report success to
@@ -782,9 +879,24 @@ extern "C" int bridgeConnect(SOCKET s, const struct sockaddr *name, int namelen)
         }
         if (ret == SOCKET_ERROR)
         {
-            errno = mapWSAErrorToErrno(WSAGetLastError());
-            log_debug("Network bridge: connect failed WSAError=%d errno=%d", WSAGetLastError(), errno);
+            /* Report what connect() itself produced, not the last-error state
+             * of the select/getsockopt in between.  connect() is the one call
+             * where WSAEWOULDBLOCK means EINPROGRESS rather than EAGAIN, and
+             * callers test for exactly that. */
+            errno = wsaError == WSAEWOULDBLOCK ? LinuxErrno::InProgress
+                                               : mapWSAErrorToErrno(wsaError);
+            log_debug("Network bridge: connect failed WSAError=%d errno=%d", wsaError, errno);
+            WSASetLastError(wsaError);
         }
+    }
+    static const bool traceWait = std::getenv("LL_WAIT_TRACE") != nullptr;
+    if (traceWait && destination && destination->sa_family == AF_INET)
+    {
+        const sockaddr_in *target = reinterpret_cast<const sockaddr_in *>(destination);
+        char text[INET_ADDRSTRLEN] = {};
+        InetNtopA(AF_INET, &target->sin_addr, text, sizeof(text));
+        log_info("LLCONNECT fd=%d -> %s:%u result=%d errno=%d", guestSocket, text,
+                 ntohs(target->sin_port), ret, ret == SOCKET_ERROR ? errno : 0);
     }
     if (es1IsDetected() && g_es1PacketResultTraceCount.fetch_add(1) < 128)
         log_debug("ES1 connect fd=%d result=%d errno=%d wsa=%d", guestSocket, ret,
@@ -847,11 +959,8 @@ extern "C" SOCKET bridgeAccept(SOCKET s, struct sockaddr *addr, int *addrlen)
         errno = mapWSAErrorToErrno(WSAGetLastError());
         return (SOCKET)-1;
     }
-    /* The ES1 client session connects to the virtual PCB address, while the
-     * host listener necessarily sees the selected adapter address.  Restore
-     * the cabinet-visible peer on the accepted socket, just as recvmsg does
-     * for the UDP clLanBuffer path.  Otherwise clLanSession rejects its own
-     * terminal before it can publish client state to clNet. */
+    /* Restore the cabinet-visible peer on the accepted socket, as recvmsg does
+     * for UDP; otherwise clLanSession rejects its own terminal. */
     if (es1IsDetected() && addr && addrlen &&
         *addrlen >= static_cast<int>(sizeof(sockaddr_in)) &&
         addr->sa_family == AF_INET)
@@ -930,9 +1039,16 @@ extern "C" int bridgeSend(SOCKET s, const char *buf, int len, int flags)
     {
         errno = mapWSAErrorToErrno(WSAGetLastError());
     }
+    static const bool traceWait = std::getenv("LL_WAIT_TRACE") != nullptr;
+    if (traceWait)
+        log_info("LLSEND fd=%d len=%d -> %d errno=%d", guestSocket, len, ret,
+                 ret == SOCKET_ERROR ? errno : 0);
     log_trace(">>> send EXIT: returning %d", ret);
     return ret;
 }
+
+static void traceEs1Datagram(const char *direction, const struct sockaddr *peer, int peerLength,
+                             const char *payload, int length);
 
 extern "C" int bridgeRecvfrom(SOCKET s, char *buf, int len, int flags, struct sockaddr *from, int *fromlen)
 {
@@ -944,6 +1060,8 @@ extern "C" int bridgeRecvfrom(SOCKET s, char *buf, int len, int flags, struct so
     if (flags & 0x40)
         flags &= ~0x40;
     int ret = recvfrom(s, buf, len, flags, from, fromlen);
+    if (ret > 0)
+        traceEs1Datagram("recvfrom", from, fromlen ? *fromlen : 0, buf, ret);
     if (ret >= 0)
     {
         rewriteEs1MessagePeerAddress(from, fromlen ? *fromlen : 0,
@@ -956,8 +1074,48 @@ extern "C" int bridgeRecvfrom(SOCKET s, char *buf, int len, int flags, struct so
     {
         errno = mapWSAErrorToErrno(WSAGetLastError());
     }
+    /* The cabinet keeps its own LAN session alive by receiving the beacons it
+     * broadcasts; a gap here is what produces "local: session timeout". */
+    static const bool traceWait = std::getenv("LL_WAIT_TRACE") != nullptr;
+    if (traceWait && ret > 0)
+    {
+        const auto *ipv4 = reinterpret_cast<const sockaddr_in *>(from);
+        log_info("LLRECVFROM fd=%d bytes=%d src=%s:%u", guestSocket, ret,
+                 from && from->sa_family == AF_INET ? inet_ntoa(ipv4->sin_addr) : "?",
+                 from && from->sa_family == AF_INET ? ntohs(ipv4->sin_port) : 0u);
+    }
     log_trace(">>> recvfrom EXIT: returning %d", ret);
     return ret;
+}
+
+/* Dumps the ES1 cabinet-to-terminal beacons (UDP 9388), bounded because they
+ * repeat about twice a second.  Enabled by LL_ES1_PACKET_TRACE. */
+static void traceEs1Datagram(const char *direction, const struct sockaddr *peer, int peerLength,
+                             const char *payload, int length)
+{
+    static const bool enabled = std::getenv("LL_ES1_PACKET_TRACE") != nullptr;
+    if (!enabled || length <= 0 || !payload)
+        return;
+
+    static std::atomic<int> budget{0};
+    if (budget.fetch_add(1) >= 64)
+        return;
+
+    char address[64] = "?";
+    if (peer && peerLength >= static_cast<int>(sizeof(sockaddr_in)) && peer->sa_family == AF_INET)
+    {
+        const auto *in = reinterpret_cast<const sockaddr_in *>(peer);
+        const unsigned char *octets = reinterpret_cast<const unsigned char *>(&in->sin_addr);
+        std::snprintf(address, sizeof(address), "%u.%u.%u.%u:%u", octets[0], octets[1], octets[2],
+                      octets[3], ntohs(in->sin_port));
+    }
+
+    const int shown = std::min(length, 64);
+    char hex[64 * 3 + 1] = {0};
+    for (int i = 0; i < shown; ++i)
+        std::snprintf(hex + i * 3, 4, "%02x ", static_cast<unsigned char>(payload[i]));
+
+    log_debug("ES1 packet %s %s len=%d: %s", direction, address, length, hex);
 }
 
 extern "C" int bridgeSendto(SOCKET s, const char *buf, int len, int flags, const struct sockaddr *to, int tolen)
@@ -970,10 +1128,9 @@ extern "C" int bridgeSendto(SOCKET s, const char *buf, int len, int flags, const
     flags &= ~(0x4000 | 0x40);
     sockaddr_storage configuredAddress = {};
     int configuredLength = tolen;
-    /* Keep the ES1 discovery destination as multicast.  The guest's
-     * IP_MULTICAST_IF option selects the host adapter; rewriting this address
-     * to a unicast self-destination makes the cabinet receive its own status
-     * twice, unlike the physical ES1 LAN. */
+    /* Leave the discovery destination as multicast: the guest's
+     * IP_MULTICAST_IF already selects the adapter, and rewriting it to unicast
+     * makes the cabinet hear its own status twice. */
     bool rewritten = !isEs1MulticastAddress(to, tolen) &&
                      makeEs1MulticastAddress(to, tolen, configuredAddress, configuredLength);
     if (!rewritten)
@@ -986,10 +1143,21 @@ extern "C" int bridgeSendto(SOCKET s, const char *buf, int len, int flags, const
         log_debug("Network bridge: sendto bytes=%d rewritten=%d port=%u", len,
                  rewritten ? 1 : 0,
                  ntohs(reinterpret_cast<const sockaddr_in *>(destination)->sin_port));
+    traceEs1Datagram("sendto", destination, configuredLength, buf, len);
     int ret = sendto(s, buf, len, flags, destination, configuredLength);
+    const int wsaError = ret == SOCKET_ERROR ? WSAGetLastError() : 0;
     if (ret == SOCKET_ERROR)
     {
-        errno = mapWSAErrorToErrno(WSAGetLastError());
+        errno = mapWSAErrorToErrno(wsaError);
+    }
+    static const bool traceWait = std::getenv("LL_WAIT_TRACE") != nullptr;
+    if (traceWait)
+    {
+        const auto *ipv4 = reinterpret_cast<const sockaddr_in *>(destination);
+        log_info("LLSENDTO fd=%d len=%d -> %d wsa=%d errno=%d dest=%s:%u", guestSocket, len, ret,
+                 wsaError, ret == SOCKET_ERROR ? errno : 0,
+                 destination && destination->sa_family == AF_INET ? inet_ntoa(ipv4->sin_addr) : "?",
+                 destination && destination->sa_family == AF_INET ? ntohs(ipv4->sin_port) : 0u);
     }
     log_trace(">>> sendto EXIT: returning %d", ret);
     return ret;
@@ -1077,12 +1245,40 @@ extern "C" int bridgeSendmsg(SOCKET s, const LinuxMsghdr *message, int flags)
                                              : static_cast<const struct sockaddr *>(message->name);
     int ret;
     if (message->name && message->nameLength)
+    {
         ret = WSASendTo(s, buffers.data(), static_cast<DWORD>(buffers.size()), &sent, wsaFlags,
                         destination, configuredLength, nullptr, nullptr);
+        /* The cabinet LAN is a closed segment that is always reachable, so a
+         * WSAEHOSTUNREACH here is our own routing choice lapsing on a host with
+         * VPN or VM adapters.  Re-pin the interface and send once more; the
+         * title drops the message otherwise. */
+        if (ret == SOCKET_ERROR && WSAGetLastError() == WSAEHOSTUNREACH &&
+            isEs1MulticastAddress(destination, configuredLength))
+        {
+            in_addr adapter = {};
+            if (getHostIPv4(&adapter))
+            {
+                setsockopt(s, IPPROTO_IP, IP_MULTICAST_IF,
+                           reinterpret_cast<const char *>(&adapter), sizeof(adapter));
+                ret = WSASendTo(s, buffers.data(), static_cast<DWORD>(buffers.size()), &sent,
+                                wsaFlags, destination, configuredLength, nullptr, nullptr);
+                static std::atomic<unsigned int> repinned{0};
+                if (repinned.fetch_add(1) < 8)
+                    log_warn("Network bridge: multicast send hit WSAEHOSTUNREACH; re-pinned the "
+                             "interface and retried (%s)",
+                             ret == SOCKET_ERROR ? "still failing" : "sent");
+            }
+        }
+    }
     else
         ret = WSASend(s, buffers.data(), static_cast<DWORD>(buffers.size()), &sent, wsaFlags,
                       nullptr, nullptr);
 
+    static const bool traceWait = std::getenv("LL_WAIT_TRACE") != nullptr;
+    if (traceWait)
+        log_info("LLSENDMSG fd=%d iov=%u sent=%lu ret=%d wsa=%d", guestSocket,
+                 message->iovCount, static_cast<unsigned long>(sent), ret,
+                 ret == SOCKET_ERROR ? WSAGetLastError() : 0);
     if (ret == SOCKET_ERROR)
     {
         errno = mapWSAErrorToErrno(WSAGetLastError());
@@ -1128,12 +1324,9 @@ extern "C" int bridgeRecvmsg(SOCKET s, LinuxMsghdr *message, int flags)
             const size_t dataLength = (message->iov && message->iovCount != 0)
                                            ? static_cast<size_t>(received)
                                            : 0;
-            /*
-             * Keep the clLanBuffer source field intact.  It is part of the
-             * ES1 buffer checksum and, for discovery packets, is the logical
-             * multicast address (0xe1000001), not the host adapter address.
-             * Only the outer UDP peer address is virtualized below.
-             */
+            /* The clLanBuffer source field is part of the buffer checksum and
+             * carries the logical multicast address, so only the outer UDP peer
+             * address is virtualised below. */
             rewriteEs1MessagePeerAddress(static_cast<struct sockaddr *>(message->name), nameLength,
                                          data, dataLength);
             if (es1IsDetected() && data && dataLength >= 36 &&
@@ -1179,6 +1372,19 @@ extern "C" int bridgeRecvmsg(SOCKET s, LinuxMsghdr *message, int flags)
     // Windows never reports ancillary data, so the caller must see none.
     message->controlLength = 0;
     message->flags = static_cast<int32_t>(wsaFlags);
+
+    /* Same purpose as the recvfrom trace: the cabinet's LAN session is kept
+     * alive by what arrives here, so a gap explains "local: session timeout".
+     * The ES1 LAN code reads through recvmsg(), not recvfrom(). */
+    static const bool traceWait = std::getenv("LL_WAIT_TRACE") != nullptr;
+    if (traceWait && received > 0)
+    {
+        const auto *ipv4 = static_cast<const sockaddr_in *>(message->name);
+        log_info("LLRECVMSG fd=%d bytes=%lu src=%s:%u", guestSocket,
+                 static_cast<unsigned long>(received),
+                 (message->name && ipv4->sin_family == AF_INET) ? inet_ntoa(ipv4->sin_addr) : "?",
+                 (message->name && ipv4->sin_family == AF_INET) ? ntohs(ipv4->sin_port) : 0u);
+    }
 
     log_trace(">>> recvmsg EXIT: socket=%lld received %lu bytes in %u buffers",
              (long long)s, (unsigned long)received, static_cast<unsigned>(buffers.size()));
@@ -1389,6 +1595,7 @@ extern "C" int bridgeSetsockopt(SOCKET s, int level, int optname, const char *op
 
 extern "C" int bridgeGetsockopt(SOCKET s, int level, int optname, char *optval, int *optlen)
 {
+    const int guestSocket = static_cast<int>(s);
     s = NetworkBridge::hostSocket(static_cast<int>(s));
     log_trace(">>> getsockopt called: socket=%lld, level=%d, optname=%d", (long long)s, level, optname);
 
@@ -1439,16 +1646,32 @@ extern "C" int bridgeGetsockopt(SOCKET s, int level, int optname, char *optval, 
 
     const int ret = getsockopt(s, level, optname, optval, optlen);
     if (ret == SOCKET_ERROR)
+    {
         errno = mapWSAErrorToErrno(WSAGetLastError());
+        return ret;
+    }
+
+    /* SO_ERROR carries a WSA code, and the guest reads it as an errno, so it
+     * needs the same translation as every other error crossing here. */
+    if (guestLevel == linuxSolSocket && guestOption == 4 /* SO_ERROR */ &&
+        optval && optlen && *optlen >= static_cast<int>(sizeof(int)))
+    {
+        int pending = 0;
+        std::memcpy(&pending, optval, sizeof(pending));
+        const int translated = pending ? mapWSAErrorToErrno(pending) : 0;
+        std::memcpy(optval, &translated, sizeof(translated));
+        static const bool traceWait = std::getenv("LL_WAIT_TRACE") != nullptr;
+        if (traceWait)
+            log_info("LLSOERR fd=%d wsa=%d -> errno=%d", guestSocket, pending, translated);
+        else if (es1IsDetected() && pending &&
+                 g_es1PacketResultTraceCount.fetch_add(1) < 128)
+            log_debug("Network bridge: SO_ERROR wsa=%d -> errno=%d", pending, translated);
+    }
     return ret;
 }
 
-/*
- * boost::asio puts every socket into non-blocking mode through ioctl(FIONBIO)
- * and asks for the pending byte count with FIONREAD.  Both requests carry the
- * same numbers on Linux and Windows, but they have to reach ioctlsocket()
- * rather than the CRT's file ioctl, which knows nothing about sockets.
- */
+/* FIONBIO and FIONREAD carry the same numbers on both systems, but they have
+ * to reach ioctlsocket() rather than the CRT's file ioctl. */
 extern "C" int bridgeSocketIoctl(int descriptor, unsigned long request, void *argument)
 {
     const SOCKET handle = NetworkBridge::hostSocket(descriptor);
@@ -1478,7 +1701,96 @@ extern "C" int bridgeSocketIoctl(int descriptor, unsigned long request, void *ar
         return 0;
     }
 
-    log_warn("Network bridge: unsupported socket ioctl 0x%lx", request);
+    /* SIOCGIF*, the pre-getifaddrs interface query ES1's network diagnostic
+     * uses.  The argument is a struct ifreq, and the title polls it every
+     * frame, so an unhandled request both fails the check and floods the log. */
+    constexpr unsigned long siocGifaddr = 0x8915;
+    constexpr unsigned long siocGifflags = 0x8913;
+    constexpr unsigned long siocGifnetmask = 0x891b;
+    constexpr unsigned long siocGifbrdaddr = 0x8919;
+    constexpr unsigned long siocGifhwaddr = 0x8927;
+    constexpr unsigned long siocGifindex = 0x8933;
+
+    if (request == siocGifaddr || request == siocGifflags || request == siocGifnetmask ||
+        request == siocGifbrdaddr || request == siocGifhwaddr || request == siocGifindex)
+    {
+        if (!argument)
+        {
+            errno = EFAULT;
+            return -1;
+        }
+
+        auto *ifreq = static_cast<unsigned char *>(argument);
+        const char *name = reinterpret_cast<const char *>(ifreq);
+        const bool loopback = std::strncmp(name, "lo", 2) == 0 && (name[2] == '\0');
+
+        unsigned long address = 0;
+        unsigned long netmask = 0;
+        unsigned char mac[6]{};
+        NetworkBridge::primaryHostInterface(address, netmask, mac);
+
+        if (loopback)
+        {
+            address = htonl(INADDR_LOOPBACK);
+            netmask = htonl(0xFF000000u);
+        }
+        else if (address == 0)
+        {
+            errno = ENODEV;
+            return -1;
+        }
+
+        /* The union starts right after the 16-byte name. */
+        unsigned char *value = ifreq + 16;
+        std::memset(value, 0, 16);
+
+        if (request == siocGifflags)
+        {
+            const unsigned short flags =
+                loopback ? (0x1 | 0x8 | 0x40)      /* UP | LOOPBACK | RUNNING */
+                         : (0x1 | 0x2 | 0x40 | 0x1000); /* UP | BROADCAST | RUNNING | MULTICAST */
+            std::memcpy(value, &flags, sizeof(flags));
+            return 0;
+        }
+
+        if (request == siocGifindex)
+        {
+            const int index = loopback ? 1 : 2;
+            std::memcpy(value, &index, sizeof(index));
+            return 0;
+        }
+
+        if (request == siocGifhwaddr)
+        {
+            /* sa_family then 14 bytes of address; ARPHRD_ETHER / ARPHRD_LOOPBACK. */
+            const unsigned short family = loopback ? 772 : 1;
+            std::memcpy(value, &family, sizeof(family));
+            if (!loopback)
+                std::memcpy(value + 2, mac, sizeof(mac));
+            return 0;
+        }
+
+        sockaddr_in result{};
+        result.sin_family = AF_INET;
+        if (request == siocGifaddr)
+            result.sin_addr.s_addr = address;
+        else if (request == siocGifnetmask)
+            result.sin_addr.s_addr = netmask;
+        else
+            result.sin_addr.s_addr = (address & netmask) | ~netmask;
+        std::memcpy(value, &result, sizeof(result));
+        return 0;
+    }
+
+    /* An unhandled request usually repeats every frame; say so once per kind
+     * rather than filling the log. */
+    static HostMutex reportedMutex;
+    static std::unordered_set<unsigned long> reported;
+    {
+        std::lock_guard<HostMutex> lock(reportedMutex);
+        if (reported.insert(request).second)
+            log_warn("Network bridge: unsupported socket ioctl 0x%lx", request);
+    }
     errno = EINVAL;
     return -1;
 }
@@ -1591,6 +1903,16 @@ extern "C" int NetworkBridge::bridgePoll(void *rawFds, int nfds, int timeout)
         guestFds[guestIndexes[i]].revents = revents;
         if (revents != 0)
             resultCount++;
+        /* LL_WAIT_TRACE=1: the writable side of poll() is what carries an async
+         * connect to completion, so show those calls and what came back. */
+        static const bool traceWait = std::getenv("LL_WAIT_TRACE") != nullptr;
+        if (traceWait)
+            log_info("LLPOLL fd=%d events=0x%x hostEvents=0x%x hostRevents=0x%x revents=0x%x timeout=%d",
+                     guestFds[guestIndexes[i]].fd,
+                     static_cast<unsigned>(guestFds[guestIndexes[i]].events),
+                     static_cast<unsigned>(hostFds[i].events),
+                     static_cast<unsigned>(hostFds[i].revents),
+                     static_cast<unsigned>(revents), timeout);
     }
 
     log_trace("Network bridge: poll nfds=%d timeout=%d ready=%d", nfds, timeout, resultCount);
@@ -1886,7 +2208,8 @@ extern "C" int NetworkBridge::bridgeGetaddrinfo(const char *node, const char *se
     }
 
     struct addrinfo *hostResult = nullptr;
-    const int error = getaddrinfo(node, service, hostHintsPointer, &hostResult);
+    const char *lookupNode = wmmt4RedirectedHost(node);
+    const int error = getaddrinfo(lookupNode, service, hostHintsPointer, &hostResult);
     if (error != 0)
         return error;
 
@@ -2015,12 +2338,13 @@ namespace
         hints.ai_socktype = SOCK_STREAM;
 
         struct addrinfo *found = nullptr;
-        if (getaddrinfo(name, nullptr, &hints, &found) != 0 || !found)
+        const char *lookupName = wmmt4RedirectedHost(name);
+        if (getaddrinfo(lookupName, nullptr, &hints, &found) != 0 || !found)
             return nullptr;
 
         const struct sockaddr_in *resolved = reinterpret_cast<struct sockaddr_in *>(found->ai_addr);
         memcpy(storage.address, &resolved->sin_addr, sizeof(storage.address));
-        strncpy(storage.name, found->ai_canonname ? found->ai_canonname : name, sizeof(storage.name) - 1);
+        strncpy(storage.name, name, sizeof(storage.name) - 1);
         storage.name[sizeof(storage.name) - 1] = '\0';
         freeaddrinfo(found);
 
@@ -2089,10 +2413,8 @@ extern "C" void *bridgeGethostbyaddr(const void *addr, int len, int type)
     return resolveHost(text);
 }
 
-/*
- * Same shape problem as hostent: Winsock's servent holds the port in a short
- * where i386 glibc holds an int, so the proto pointer moves.
- */
+/* Same shape problem as hostent: Winsock's servent holds the port in a short
+ * where i386 glibc holds an int, so the proto pointer moves. */
 #pragma pack(push, 4)
 struct LinuxServent
 {

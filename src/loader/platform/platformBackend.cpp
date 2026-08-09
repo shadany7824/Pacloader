@@ -8,6 +8,11 @@
 #include "../hardware/namco/n2/n2VirtualDevices.h"
 #include "../log/log.h"
 
+#if defined(_WIN32) || defined(__MINGW32__)
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#endif
+
 namespace
 {
 bool g_detected = false;
@@ -137,4 +142,70 @@ extern "C" void platformRegisterCardControl(void)
 {
     if (platformIsN2())
         n2CardReaderRegisterCardControl();
+}
+
+extern "C" int platformRaiseNativeWindow(void *nativeWindow)
+{
+#if defined(_WIN32) || defined(__MINGW32__)
+    HWND window = static_cast<HWND>(nativeWindow);
+    if (!window || !IsWindow(window))
+        return 0;
+    const bool keepTopmost = getConfig()->alwaysOnTop != 0;
+
+    if (IsIconic(window))
+        ShowWindow(window, SW_RESTORE);
+    else
+        ShowWindow(window, SW_SHOW);
+
+    /* Windows normally rejects SetForegroundWindow when a process was
+     * launched behind another foreground process. Temporarily joining the
+     * relevant input queues makes this equivalent to a user-requested window
+     * activation, which is what the guest's XRaiseWindow call represents. */
+    HWND foreground = GetForegroundWindow();
+    const DWORD currentThread = GetCurrentThreadId();
+    const DWORD windowThread = GetWindowThreadProcessId(window, nullptr);
+    const DWORD foregroundThread = foreground
+                                       ? GetWindowThreadProcessId(foreground, nullptr)
+                                       : 0;
+
+    const bool attachedWindow = windowThread && windowThread != currentThread &&
+                                AttachThreadInput(currentThread, windowThread, TRUE);
+    const bool attachedForeground = foregroundThread && foregroundThread != currentThread &&
+                                    foregroundThread != windowThread &&
+                                    AttachThreadInput(currentThread, foregroundThread, TRUE);
+
+    SetWindowPos(window, HWND_TOP, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+    BringWindowToTop(window);
+    SetForegroundWindow(window);
+    SetActiveWindow(window);
+    SetFocus(window);
+
+    /* A topmost round-trip is a visual fallback for foreground-lock policies.
+     * HWND_NOTOPMOST immediately restores the normal Z-order class, so this
+     * does not turn the game into a permanent always-on-top window. */
+    if (GetForegroundWindow() != window)
+    {
+        SetWindowPos(window, HWND_TOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+        if (!keepTopmost)
+            SetWindowPos(window, HWND_NOTOPMOST, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+        SetForegroundWindow(window);
+    }
+
+    if (keepTopmost)
+        SetWindowPos(window, HWND_TOPMOST, 0, 0, 0, 0,
+                     SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+
+    if (attachedForeground)
+        AttachThreadInput(currentThread, foregroundThread, FALSE);
+    if (attachedWindow)
+        AttachThreadInput(currentThread, windowThread, FALSE);
+
+    return GetForegroundWindow() == window ? 1 : 0;
+#else
+    (void)nativeWindow;
+    return 0;
+#endif
 }

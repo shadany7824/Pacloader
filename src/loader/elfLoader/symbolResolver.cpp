@@ -35,6 +35,7 @@
 #include "elfLoader.hpp"
 #include "../log/log.h"
 #include "../platform/platformBackend.h"
+#include "guestTls.hpp"
 
 extern "C" void __gmon_start__()
 {
@@ -43,6 +44,10 @@ extern "C" void __gmon_start__()
 extern "C" int __libc_start_main(int (*main_func)(int, char **, char **), int argc, char **argv, void (*init)(void), void (*fini)(void),
                                  void (*rtld_fini)(void), void *stack_end)
 {
+    const bool guestTlsInstalled = GuestTls::IsInstalled();
+    if (guestTlsInstalled)
+        GuestTls::EnterHostCall();
+
     log_info("Intercepted __libc_start_main called!");
 
     _CrtSetReportMode(_CRT_ASSERT, 0);
@@ -57,8 +62,12 @@ extern "C" int __libc_start_main(int (*main_func)(int, char **, char **), int ar
 
     if (init)
     {
+        if (guestTlsInstalled)
+            GuestTls::EnterGuestCode();
         log_debug("Calling init from __libc_start_main");
         init();
+        if (guestTlsInstalled)
+            GuestTls::EnterHostCall();
     }
 
     CoInitializeEx(NULL, COINIT_MULTITHREADED);
@@ -66,13 +75,21 @@ extern "C" int __libc_start_main(int (*main_func)(int, char **, char **), int ar
     char **envp = argv + argc + 1;
 
     log_info("Transferring control to main()...");
+    if (guestTlsInstalled)
+        GuestTls::EnterGuestCode();
     int exitCode = main_func(argc, argv, envp);
+    if (guestTlsInstalled)
+        GuestTls::EnterHostCall();
     log_info("Program main() exited with code: %d", exitCode);
 
     if (fini)
     {
+        if (guestTlsInstalled)
+            GuestTls::EnterGuestCode();
         log_debug("Calling fini from __libc_start_main");
         fini();
+        if (guestTlsInstalled)
+            GuestTls::EnterHostCall();
     }
 
     PthreadEmu::Shutdown();
@@ -120,10 +137,11 @@ SymbolResolver::SymbolResolver()
     m_VTables["strrchr"] = reinterpret_cast<void *>(strrchr);
     m_VTables["strstr"] = reinterpret_cast<void *>(strstr);
     m_VTables["strtol"] = reinterpret_cast<void *>(strtol);
+    m_VTables["strtof"] = reinterpret_cast<void *>(strtof);
     m_VTables["strtod"] = reinterpret_cast<void *>(strtod);
     m_VTables["strerror"] = reinterpret_cast<void *>(strerror);
-    m_VTables["strtok"] = reinterpret_cast<void *>(strtok);
-    m_VTables["strtok_r"] = reinterpret_cast<void *>(strtok_r);
+    m_VTables["strtok"] = reinterpret_cast<void *>(LibcBridge::bridgeStrtok);
+    m_VTables["strtok_r"] = reinterpret_cast<void *>(LibcBridge::bridgeStrtokR);
     m_VTables["strncat"] = reinterpret_cast<void *>(strncat);
     m_VTables["strcat"] = reinterpret_cast<void *>(strcat);
     m_VTables["strpbrk"] = reinterpret_cast<void *>(strpbrk);
@@ -169,6 +187,28 @@ void SymbolResolver::InitSearchPaths(const std::string &libraryPathParam, const 
 
     if (!gameElfPath.empty())
     {
+        const DWORD attributes = GetFileAttributesA(gameElfPath.c_str());
+        if (attributes != INVALID_FILE_ATTRIBUTES &&
+            (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+        {
+            /* mainW passes the game's current working directory here. Keep
+             * the legacy parent/lib paths below, but also search the game
+             * root and WMMT4's libso directory so Explorer/frontend launches
+             * do not require an explicit -L argument. */
+            m_LibrarySearchPaths.push_back(gameElfPath);
+            log_info("Added library search path (game root): %s", gameElfPath.c_str());
+
+            const std::string libsoDir = gameElfPath + "\\libso";
+            const DWORD libsoAttributes = GetFileAttributesA(libsoDir.c_str());
+            if (libsoAttributes != INVALID_FILE_ATTRIBUTES &&
+                (libsoAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+            {
+                m_LibrarySearchPaths.push_back(libsoDir);
+                log_info("Added library search path (game libso dir): %s",
+                         libsoDir.c_str());
+            }
+        }
+
         std::string gameDir = gameElfPath;
         size_t lastSlash = gameDir.find_last_of("\\/");
         if (lastSlash != std::string::npos)
@@ -421,7 +461,10 @@ void SymbolResolver::LoadNeededLibrary(const std::string &linuxName)
             m_HandlesByName[targetName] = soLoader;
             m_HandlesByName[fullPath] = soLoader;
             m_NativeLoaders.push_back(soLoader);
-            log_info("Successfully loaded and exported symbols for native Linux SO: %s", fullPath.c_str());
+            /* The base is what turns a faulting EIP back into a file offset;
+             * Windows knows nothing about these mappings. */
+            log_info("Successfully loaded and exported symbols for native Linux SO: %s "
+                     "(mapped at %p)", fullPath.c_str(), soLoader->GetBaseAddress());
             m_PendingSOPatches.push_back({(uintptr_t)soLoader->GetBaseAddress(), fullPath});
         }
         else
@@ -595,6 +638,29 @@ void *SymbolResolver::ResolveSymbol(const std::string &symbolName, std::string *
     void *resolvedAddr = nullptr;
     void *originalAddr = nullptr;
 
+    const size_t versionMarker = symbolName.find('@');
+    const std::string baseSymbol = versionMarker == std::string::npos
+                                       ? symbolName
+                                       : symbolName.substr(0, versionMarker);
+    if (baseSymbol == "strtok")
+    {
+        if (outModuleName)
+            *outModuleName = "Internal VTable";
+        return LibcBridge::bridgeStrtok;
+    }
+    if (baseSymbol == "strtok_r")
+    {
+        if (outModuleName)
+            *outModuleName = "Internal VTable";
+        return LibcBridge::bridgeStrtokR;
+    }
+    if (baseSymbol == "__strtok_r")
+    {
+        if (outModuleName)
+            *outModuleName = "Internal VTable";
+        return LibcBridge::bridgeStrtokR;
+    }
+
     if (strncmp(symbolName.c_str(), "__gmon_start__", 14) == 0 || strncmp(symbolName.c_str(), "_ITM_deregisterTMCloneTable", 27) == 0 ||
         strncmp(symbolName.c_str(), "_ITM_registerTMCloneTable", 27) == 0 || strncmp(symbolName.c_str(), "_Jv_RegisterClasses", 19) == 0 ||
         strncmp(symbolName.c_str(), "__cxa_finalize", 14) == 0)
@@ -602,10 +668,11 @@ void *SymbolResolver::ResolveSymbol(const std::string &symbolName, std::string *
         log_info("Resolved weak symbol '%s' to NULL (Not Implemented/Required)", symbolName.c_str());
         if (outModuleName)
             *outModuleName = "WEAK_SYMBOL";
-        return (void *)&LibcBridge::bridgeStubSuccess;
+        return GuestTls::WrapHostFunction(
+            reinterpret_cast<void *>(&LibcBridge::bridgeStubSuccess));
     }
 
-    if (strncmp(symbolName.c_str(), "_Unwind_", 8) == 0 || symbolName == "__gxx_personality_v0")
+    if (strncmp(symbolName.c_str(), "_Unwind_", 8) == 0)
     {
         HMODULE hMinGwGcc = GetModuleHandleA("libgcc_s_dw2-1.dll");
         if (hMinGwGcc)
@@ -615,12 +682,23 @@ void *SymbolResolver::ResolveSymbol(const std::string &symbolName, std::string *
             {
                 if (outModuleName)
                     *outModuleName = "libgcc_s_dw2-1.dll";
+                /* The DW2 unwinder needs the original guest return addresses,
+                 * which WrapHostFunction hides, so these are called directly -
+                 * they touch only FS-based CRT state.  Not
+                 * __gxx_personality_v0: that has to stay the guest
+                 * libstdc++'s, matching its own type metadata. */
                 return proc;
             }
         }
     }
 
     auto vtableIt = m_VTables.find(symbolName);
+    if (vtableIt == m_VTables.end())
+    {
+        const size_t versionMarker = symbolName.find('@');
+        if (versionMarker != std::string::npos)
+            vtableIt = m_VTables.find(symbolName.substr(0, versionMarker));
+    }
     if (vtableIt != m_VTables.end())
     {
         if (outModuleName)
@@ -790,9 +868,14 @@ bool SymbolResolver::RunAllInits()
 {
     platformInstallAdmHooks();
 
-    for (auto it = m_NativeLoaders.rbegin(); it != m_NativeLoaders.rend(); ++it)
+    /* LoadNeededLibrary appends a shared object only after recursively loading
+     * its DT_NEEDED dependencies.  The resulting list is therefore already in
+     * dependency-first order.  Initializing it in reverse ran protobuf's
+     * static constructors before libstdc++, which made the C++ runtime abort
+     * with std::bad_alloc during WMMT4 startup. */
+    for (ElfLoader *loader : m_NativeLoaders)
     {
-        if (*it && !(*it)->RunInit())
+        if (loader && !loader->RunInit())
         {
             return false;
         }

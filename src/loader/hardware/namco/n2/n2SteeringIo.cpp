@@ -63,11 +63,8 @@ void applySdlSteering(const N2SteeringOutputState *state, void *)
     const int centred = (int)state->center - kickbackCentre + state->centerOffset;
     translated.center = std::clamp(centred * kickbackCentreScale, -32768, 32767);
 
-    /*
-     * Coefficients run to 127. Reflection is the exception: its byte is signed
-     * and nominally reaches 127, but a race only uses about thirty five counts
-     * of it, so FFB_REFLECT_RANGE is what counts as full deflection instead.
-     */
+    /* Coefficients run to 127, except reflection: a race only swings about
+     * thirty five counts of it, so FFB_REFLECT_RANGE is full deflection. */
     const EmulatorConfig *config = getConfig();
     const float gain = (float)config->namcoN2.ffbGain / 100.0f;
     const int range = config->namcoN2.ffbReflectRange > 0
@@ -96,11 +93,8 @@ void applySdlSteering(const N2SteeringOutputState *state, void *)
     translated.vibrationPeriodMs = state->vibrationPeriod;
     translated.vibrationDurationMs = state->vibrationDuration;
 
-    /*
-     * Say when output starts and stops. The game's own scene messages are in
-     * the same log, so this is what tells us which screens are meant to have
-     * force on them without anyone having to time it by hand.
-     */
+    /* Mark where output starts and stops, so the game's own scene messages in
+     * the same log say which screens are meant to have force. */
     static int wasEnabled = -1;
     if (translated.enabled != wasEnabled)
     {
@@ -124,13 +118,9 @@ void shutdownSdlSteering(void *)
 // stays stiff through the attract screen. Runs on the force feedback worker.
 void pollBoard(void);
 
-/*
- * Read the board's fields rather than trusting the setters: onTrq and offTrq
- * write spring and viscosity straight into the object - 0x3f and 0 - without
- * going near setSpring or setViosity.
- *
- * Caller holds outputMutex.
- */
+/* Read the board's fields rather than trusting the setters: onTrq and offTrq
+ * write spring and viscosity straight into the object.  Caller holds
+ * outputMutex. */
 void refreshFromBoard(N2SteeringOutputState &state)
 {
     if (!kickbackInstance || !*kickbackInstance)
@@ -179,16 +169,16 @@ void updateOutput(Update update)
     }
 }
 
-/*
- * Lifecycle tracing. The offsets come from clKickback::init() and send():
- * 0x24 means a frame is staged, 0x33 means not yet transmitted, and 0x6c..0x6e
- * hold the three character error code getPCBError() reports.
- */
+/* Lifecycle tracing.  From clKickback::init() and send(): 0x24 means a frame is
+ * staged, 0x33 not yet transmitted, 0x6c..0x6e the getPCBError() code. */
 using KickbackCall = int (*)(void *);
 using KickbackInit = int (*)(void *, unsigned);
+/* clKickback::create() is a static factory: it takes no this and returns the
+ * new board object. */
+using KickbackCreate = int (*)(void);
 
 KickbackInit originalInit = nullptr;
-KickbackCall originalCreate = nullptr;
+KickbackCreate originalCreate = nullptr;
 KickbackCall originalOnPower = nullptr;
 KickbackCall originalWaitOnPower = nullptr;
 KickbackCall originalChkSelf = nullptr;
@@ -287,18 +277,19 @@ int traceInit(void *object, unsigned argument)
     return result;
 }
 
-int traceCreate(void *object)
+int traceCreate(void)
 {
-    const int result = originalCreate(object);
-    traceState("create", object, result);
+    const int result = originalCreate();
+    /* No this, so there is no board state to dump - only the object the factory
+     * returns.  Tracing it as one dereferenced whatever the caller left in the
+     * first stack slot, which crashed WMMT3DX+ during its boot check. */
+    if (getConfig()->namcoN2.forceFeedbackDiagnostics)
+        log_info("N2 kickback: create -> %d", result);
     return result;
 }
 
-/*
- * Functional, not trace hooks. The board reports the motor running or stopped,
- * and the game blocks in waitOnPower/waitOffPower until it hears the matching
- * one, so each power transition has to put its report on the wire.
- */
+/* Functional, not trace hooks: the game blocks in waitOnPower/waitOffPower
+ * until the board reports the matching motor state. */
 int traceOnPower(void *object)
 {
     const int result = originalOnPower(object);
@@ -317,14 +308,9 @@ int offPowerHook(void *object)
     return result;
 }
 
-/*
- * Both block inside the frame until this->0x2c reaches what they are waiting
- * for - 0 for waitOnPower, which the ordinary acknowledgement gives it, and 1
- * for waitOffPower, which only "C06" sets. So the report is queued before the
- * call, not in reaction to it. waitOffPower is the one that runs after a race:
- * unanswered, it never returns, and the game renders at sixty with its scene
- * progression stopped at the game over screen.
- */
+/* Both block inside the frame until this->0x2c reaches their value - 0 from the
+ * ordinary acknowledgement, 1 only from "C06" - so the report has to be queued
+ * before the call.  An unanswered waitOffPower hangs the game over screen. */
 int traceWaitOnPower(void *object)
 {
     n2KickbackReportMotorPower(1);
@@ -342,12 +328,9 @@ int waitOffPowerHook(void *object)
     const int result = originalWaitOffPower(object);
     traceState("waitOffPower", object, result);
 
-    /*
-     * The wait is what the game actually calls - offPower itself was never seen
-     * - so the output gate has to move here too. Reporting the stop only to the
-     * board left this loader still applying the last race's spring, and the
-     * wheel went on centring itself all through the attract screen.
-     */
+    /* The wait is what the game actually calls, so the output gate closes here
+     * too; otherwise the last race's spring keeps centring the wheel through
+     * the attract screen. */
     updateOutput([](N2SteeringOutputState &s) { s.motorRunning = 0; });
     return result;
 }
@@ -359,12 +342,9 @@ int traceChkSelf(void *object)
     return result;
 }
 
-/*
- * What the test menu's I/F INITIALIZE screen turns into PCB ERROR. getPCBError
- * returns this->0x70 unless the error code starts with 'E' and is not "?00".
- * Only clKickback::init clears that sticky byte, so one bad moment during start
- * up is still being reported long afterwards.
- */
+/* What the test menu turns into PCB ERROR.  getPCBError returns this->0x70, a
+ * sticky byte only clKickback::init clears, so one bad moment during start-up
+ * is still reported long afterwards. */
 KickbackCall originalGetPcbError = nullptr;
 int lastPcbError = -1;
 
@@ -390,12 +370,9 @@ int traceGetPcbError(void *object)
     return result;
 }
 
-/*
- * Where the self check is answered. The request bit - bit 7 of this->0x30, which
- * sendJVS() publishes to the JVS general purpose output - is up for about one
- * frame, so watching for it from the read path catches it by luck at best. This
- * call is the request.
- */
+/* Where the self check is answered.  The request bit is up for about one frame,
+ * so watching for it from the read path catches it by luck at best; this call
+ * is the request itself. */
 int answerSelfCheck(void *object)
 {
     const int result = originalRequestSelfCheck(object);
@@ -404,10 +381,8 @@ int answerSelfCheck(void *object)
     return result;
 }
 
-/*
- * Functional, not a trace hook: waitSelfCheck() re-raises the request bit
- * itself every sixty frames while it waits, so this is where a retry is seen.
- */
+/* Functional, not a trace hook: waitSelfCheck() re-raises the request bit every
+ * sixty frames, so this is where a retry is seen. */
 int traceWaitSelfCheck(void *object)
 {
     const int result = originalWaitSelfCheck(object);
@@ -429,11 +404,8 @@ int traceReceive(void *object)
     return result;
 }
 
-/*
- * The master switch, not a trace hook. clKickback clamps the type to 0..2 and
- * looks the matching scale up in its own table - 0.0, 0.5, 1.0 - so read both
- * back out of the object rather than repeating the table here.
- */
+/* The master switch, not a trace hook.  clKickback clamps the type and looks
+ * its scale up in its own table, so read both back out of the object. */
 int setTrqPowerType(void *object, int type)
 {
     const int result = originalSetTrqPowerType(object, type);
@@ -613,12 +585,8 @@ extern "C" int n2SteeringIoInstallHooks(void)
     installed += n2HookSymbolWithOriginal("_ZN10clKickback12waitOffPowerEv",
                       reinterpret_cast<void *>(waitOffPowerHook),
                       reinterpret_cast<void **>(&originalWaitOffPower));
-    /*
-     * Hand the board clKickback's singleton so it can read the self check
-     * request line itself. Without it the board can only answer while one of
-     * the hooks above happens to be running, and the game stops calling all of
-     * them between races.
-     */
+    /* Hand the board clKickback's singleton so it can read the self check
+     * request line itself; the game stops calling these hooks between races. */
     if (void *instance = n2ResolveSymbol("_ZN10clKickback11sm_instanceE"))
     {
         kickbackInstance = static_cast<void *const *>(instance);

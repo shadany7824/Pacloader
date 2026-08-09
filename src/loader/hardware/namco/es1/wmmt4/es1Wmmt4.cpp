@@ -1,0 +1,887 @@
+#include "es1Wmmt4.h"
+#include "../es1CompatLayer.h"
+#include "../es1Network.h"
+#include "es1Wmmt4Card.hpp"
+#include "es1Wmmt4Network.hpp"
+#include "es1Wmmt4Terminal.hpp"
+#include "../../../../elfLoader/guestTls.hpp"
+
+#include "../../../../config/config.h"
+#include "../../../../input/sdlInput.h"
+#include "../../../../log/log.h"
+#include "../../../common/jvs.h"
+
+#include <algorithm>
+#include <atomic>
+#include <cstdarg>
+#include <cstdlib>
+#include <cstdio>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <filesystem>
+#include <vector>
+
+#include <windows.h>
+
+namespace
+{
+#pragma pack(push, 1)
+struct Wmmt4Coin
+{
+    uint16_t coin;
+    uint16_t inc;
+    uint16_t dec;
+    uint8_t status;
+    uint8_t slotInfo;
+    uint32_t mode;
+    uint32_t retry;
+    uint16_t cid;
+    uint16_t mechCoin;
+    uint16_t mechRate;
+    uint16_t mechPoint;
+    uint16_t mechDec;
+    uint8_t pad[2];
+};
+
+struct Wmmt4Service
+{
+    uint16_t service;
+    uint16_t inc;
+    uint16_t dec;
+    uint16_t timer;
+    uint32_t mode;
+};
+
+struct Wmmt4JvioData
+{
+    uint8_t testSwitch;
+    uint8_t dipSwitch;
+    uint8_t key;
+    uint8_t pad;
+    uint16_t switches[16];
+    Wmmt4Coin coins[4];
+    Wmmt4Service services[4];
+    uint8_t generalOutputs[30];
+    uint16_t analogueOutputs[8];
+    uint16_t analogueInputs[16];
+    uint16_t generalInputs[8];
+    uint8_t serialCount;
+    uint8_t serial[16];
+    uint8_t pad2;
+};
+
+struct Wmmt4JvioControl
+{
+    uint8_t pad[12];
+    Wmmt4JvioData data[2];
+};
+
+struct Wmmt4JvioInstance
+{
+    Wmmt4JvioControl *control;
+};
+#pragma pack(pop)
+
+static_assert(sizeof(Wmmt4JvioData) == 308, "WMMT4 JVIO layout changed");
+
+/* Dongle serials for the two cabinets in a WMMT4 group; they differ in the
+ * fifth digit, the same way the ALL.Net serials do. */
+constexpr char DriveHaspSerial[] = "267610069420";
+constexpr char TerminalHaspSerial[] = "267611069420";
+
+constexpr uintptr_t JvioBootedAddress = 0x8370c00;
+constexpr uintptr_t JvioUpdateAddress = 0x83711c0;
+constexpr uintptr_t JvioGetCoinAddress = 0x8372490;
+constexpr uintptr_t JvioDecCoinAddress = 0x8372600;
+constexpr uintptr_t JvioErrorAddress = 0x8370c30;
+constexpr uintptr_t JvioThreadAddress = 0x8375a90;
+constexpr uintptr_t JvioMonitorAddress = 0x8390ba0;
+constexpr uintptr_t JvioInstanceAddress = 0x921589c;
+
+constexpr uintptr_t HaspLoginAddress = 0x8921fd0;
+constexpr uintptr_t HaspLogoutAddress = 0x89281f4;
+constexpr uintptr_t HaspDecryptAddress = 0x8922248;
+constexpr uintptr_t HaspGetSizeAddress = 0x8922f60;
+constexpr uintptr_t HaspReadAddress = 0x8922dc8;
+constexpr uintptr_t HaspWriteAddress = 0x8922e94;
+constexpr uintptr_t SendCommandAddress = 0x89e5c80;
+
+/* The title runs its own network diagnostic before online authentication.
+ * These entry points adapt the generic ES1 eth0 device to its state layout. */
+constexpr uintptr_t SystemLogAddress = 0x809ddb0;
+constexpr uintptr_t NetworkAddressChangedAddress = 0x821c920;
+constexpr uintptr_t NetworkUpdateStateAddress = 0x80aa7d0;
+constexpr uintptr_t NetworkGetInstanceAddress = 0x80a5c60;
+constexpr uintptr_t NetworkApplyStateAddress = 0x80a9b70;
+constexpr uintptr_t NetworkInterfaceUpdateAddress = 0x821d4f0;
+constexpr uintptr_t GuestStringAssignAddress = 0x80579c8;
+constexpr uintptr_t LoadRequestAddress = 0x809bc40;
+constexpr uintptr_t FileCallbackAddress = 0x809b480;
+constexpr uintptr_t NuMemoryAllocAddress = 0x89955c0;
+constexpr uintptr_t NuMemoryFreeAddress = 0x8995620;
+constexpr uintptr_t HeapAllocAddress = 0x805e4f0;
+constexpr uintptr_t HeapReleaseAddress = 0x805e710;
+
+/* Filename wildcard matcher used by the title's directory enumerator. */
+constexpr uintptr_t FilenameMatchAddress = 0x89adf50;
+
+/* Sys::Device::TouchIo::update().  The terminal cabinet's boot check fails
+ * with E2405 unless the panel reports that it finished booting; the drive
+ * cabinet has no touch panel and never reaches this. */
+constexpr uintptr_t TouchUpdateAddress = 0x837e4a0;
+
+constexpr uint16_t SwitchInterrupt = 0x0001;
+constexpr uint16_t SwitchViewChange = 0x0002;
+constexpr uint16_t SwitchGearRight = 0x0010;
+constexpr uint16_t SwitchGearLeft = 0x0020;
+constexpr uint16_t SwitchGearDown = 0x0040;
+constexpr uint16_t SwitchGearTop = 0x0080;
+constexpr uint16_t SwitchTerminal = 0x0100;
+constexpr uint16_t SwitchTestEnter = 0x0200;
+constexpr uint16_t SwitchTestDown = 0x1000;
+constexpr uint16_t SwitchTestUp = 0x2000;
+constexpr uint16_t SwitchService = 0x4000;
+
+constexpr Es1JvioInputProfile Wmmt4InputProfile = {
+    SwitchInterrupt,
+    SwitchViewChange,
+    SwitchService,
+    SwitchTestEnter,
+    SwitchTestDown,
+    SwitchTestUp,
+    SwitchTerminal,
+    {0, SwitchGearLeft | SwitchGearTop, SwitchGearLeft | SwitchGearDown,
+     SwitchGearTop, SwitchGearDown, SwitchGearRight | SwitchGearTop,
+     SwitchGearRight | SwitchGearDown},
+    0x80,
+    0,
+    1,
+    2,
+};
+
+Es1JvioInputState g_inputState{};
+std::atomic<unsigned int> g_hookTraceMask{0};
+std::atomic<int> g_lastNetworkCheck{-1};
+
+using Wmmt4LoadRequestOriginal = int (*)(void *);
+using Wmmt4FileCallbackOriginal = void (*)(int, void *, int, void *);
+Wmmt4LoadRequestOriginal g_originalLoadRequest = nullptr;
+Wmmt4FileCallbackOriginal g_originalFileCallback = nullptr;
+using Wmmt4FilenameMatchOriginal = int (*)(const char *, const char *);
+Wmmt4FilenameMatchOriginal g_originalFilenameMatch = nullptr;
+
+void traceHook(unsigned int bit, const char *name)
+{
+    const unsigned int mask = 1u << bit;
+    if ((g_hookTraceMask.fetch_or(mask) & mask) == 0)
+    {
+        log_info("System ES1 WMMT4: %s hook invoked", name);
+        std::fflush(stdout);
+    }
+}
+
+extern "C" bool wmmt4JvioBooted()
+{
+    GuestTls::HostCallScope hostCall;
+    traceHook(0, "JVIO booted");
+    return true;
+}
+
+extern "C" void wmmt4JvioUpdate()
+{
+    GuestTls::HostCallScope hostCall;
+    traceHook(1, "JVIO update");
+    auto *instance = reinterpret_cast<Wmmt4JvioInstance *>(JvioInstanceAddress);
+    if (!instance || !instance->control)
+        return;
+
+    Wmmt4JvioData &data = instance->control->data[1];
+    es1CompatUpdateJvioInput(&data.testSwitch, &data.switches[0], data.analogueInputs,
+                             &data.coins[0].coin, Wmmt4InputProfile, g_inputState);
+    data.analogueInputs[3] = 0;
+}
+
+extern "C" int wmmt4JvioGetCoinNow(int node, int channel)
+{
+    GuestTls::HostCallScope hostCall;
+    traceHook(2, "JVIO get coin");
+    (void)node;
+    (void)channel;
+    return g_inputState.coinCount;
+}
+
+extern "C" int wmmt4JvioDecCoin(int node, int channel, int count)
+{
+    GuestTls::HostCallScope hostCall;
+    traceHook(3, "JVIO decrement coin");
+    (void)node;
+    (void)channel;
+    g_inputState.coinCount = std::max(g_inputState.coinCount - count, 0);
+    return 1;
+}
+
+extern "C" bool wmmt4JvioError()
+{
+    GuestTls::HostCallScope hostCall;
+    traceHook(4, "JVIO error");
+    return false;
+}
+
+extern "C" void wmmt4JvioThread(void *)
+{
+    GuestTls::HostCallScope hostCall;
+    traceHook(5, "JVIO thread");
+}
+
+extern "C" char *wmmt4JvioMonitor(int, int, char *buffer, size_t bufferSize)
+{
+    GuestTls::HostCallScope hostCall;
+    traceHook(6, "JVIO monitor");
+    if (buffer && bufferSize)
+        buffer[0] = '\0';
+    return buffer;
+}
+
+#pragma pack(push, 1)
+struct Wmmt4PointLimitData
+{
+    uint8_t initialized;
+    uint8_t pad;
+    uint16_t settlementMonth;
+    uint32_t upperToken;
+    uint32_t lowerToken;
+    uint32_t checksum;
+};
+
+struct Wmmt4PointData
+{
+    uint32_t cost;
+    uint32_t limit;
+    uint32_t current;
+    uint32_t checksum;
+};
+
+struct Wmmt4ApplicationData
+{
+    Wmmt4PointLimitData pointLimit;
+    Wmmt4PointData points[2];
+};
+
+struct Wmmt4SystemData
+{
+    char serial[12];
+    char otherInfo[48];
+    uint16_t reserved;
+    uint8_t checksum;
+    uint8_t negativeChecksum;
+};
+
+struct Wmmt4HaspData
+{
+    Wmmt4ApplicationData application;
+    uint8_t pad[3280];
+    Wmmt4SystemData system;
+};
+#pragma pack(pop)
+
+static_assert(sizeof(Wmmt4HaspData) == 3392, "WMMT4 HASP layout changed");
+
+Wmmt4HaspData g_haspData{};
+
+uint32_t swap32(uint32_t value)
+{
+    return ((value & 0x000000ffu) << 24) | ((value & 0x0000ff00u) << 8) |
+           ((value & 0x00ff0000u) >> 8) | ((value & 0xff000000u) >> 24);
+}
+
+void initializeHaspData()
+{
+    std::memset(&g_haspData, 0, sizeof(g_haspData));
+    g_haspData.application.pointLimit.initialized = 1;
+    g_haspData.application.pointLimit.upperToken = swap32(5);
+    g_haspData.application.points[0].cost = swap32(1);
+    g_haspData.application.points[0].limit = swap32(9999);
+    g_haspData.application.points[0].current = swap32(1);
+    g_haspData.application.points[1] = g_haspData.application.points[0];
+
+    g_haspData.application.pointLimit.checksum = swap32(
+        es1CompatCrc32Mpeg(reinterpret_cast<const uint8_t *>(&g_haspData.application.pointLimit), 12));
+    for (Wmmt4PointData &point : g_haspData.application.points)
+        point.checksum = swap32(es1CompatCrc32Mpeg(reinterpret_cast<const uint8_t *>(&point), 12));
+
+    const bool terminal =
+        getConfig()->namcoES1.cabinetMode == NAMCO_ES1_CABINET_TERMINAL;
+    const char *serial = terminal ? TerminalHaspSerial : DriveHaspSerial;
+    std::memcpy(g_haspData.system.serial, serial, sizeof(g_haspData.system.serial));
+    uint8_t checksum = 0;
+    for (int i = 0; i < 62; ++i)
+        checksum = static_cast<uint8_t>(checksum + reinterpret_cast<uint8_t *>(&g_haspData.system)[i]);
+    g_haspData.system.checksum = checksum;
+    g_haspData.system.negativeChecksum = static_cast<uint8_t>(checksum ^ 0xff);
+}
+
+extern "C" int wmmt4HaspLogin(int, char *, int *handle)
+{
+    GuestTls::HostCallScope hostCall;
+    traceHook(7, "HASP login");
+    if (handle)
+        *handle = 1;
+    return 0;
+}
+
+extern "C" int wmmt4HaspLogout(int)
+{
+    GuestTls::HostCallScope hostCall;
+    traceHook(8, "HASP logout");
+    return 0;
+}
+
+extern "C" int wmmt4HaspDecrypt(int, uint8_t *, int)
+{
+    GuestTls::HostCallScope hostCall;
+    traceHook(9, "HASP decrypt");
+    return 0;
+}
+
+extern "C" int wmmt4HaspGetSize(int, int, int *size)
+{
+    GuestTls::HostCallScope hostCall;
+    traceHook(10, "HASP get size");
+    if (size)
+        *size = static_cast<int>(sizeof(g_haspData));
+    return 0;
+}
+
+extern "C" int wmmt4HaspRead(int, int, int offset, int length, uint8_t *buffer)
+{
+    GuestTls::HostCallScope hostCall;
+    traceHook(11, "HASP read");
+    return es1CompatReadBlob(reinterpret_cast<const uint8_t *>(&g_haspData),
+                              sizeof(g_haspData), offset, length, buffer);
+}
+
+extern "C" int wmmt4HaspWrite(int, int, int offset, int length, uint8_t *buffer)
+{
+    GuestTls::HostCallScope hostCall;
+    traceHook(12, "HASP write");
+    return es1CompatWriteBlob(reinterpret_cast<uint8_t *>(&g_haspData), sizeof(g_haspData),
+                               offset, length, buffer);
+}
+
+extern "C" int wmmt4SendCommand(int, int, int, int, char *)
+{
+    GuestTls::HostCallScope hostCall;
+    traceHook(13, "send command");
+    return 0;
+}
+
+enum class Wmmt4NetworkCheck : uint32_t
+{
+    None = 0,
+    Interface = 1,
+    Cable = 2,
+    Gateway = 3,
+    ShopAddress = 4,
+    Hops = 5,
+    Auth = 6,
+    SyncDate = 7,
+    Done = 8,
+    Renew = 9,
+    Test = 10,
+    Wifi = 11,
+    SetDate = 12,
+    Online = 13,
+    CableCheck = 14,
+    Ntp = 15,
+    PackageFile = 16,
+};
+
+enum class Wmmt4NetworkState : uint32_t
+{
+    None = 0,
+    Busy = 1,
+    Bad = 2,
+    Good = 3,
+};
+
+#pragma pack(push, 1)
+struct Wmmt4NetworkImpl
+{
+    uint8_t pad0[436];
+    Wmmt4NetworkState resolveState;
+    uint8_t pad1[104];
+    Wmmt4NetworkState renewState;
+    Wmmt4NetworkState syncDateState;
+    Wmmt4NetworkState cableState;
+    Wmmt4NetworkState gatewayState;
+    Wmmt4NetworkState contentRouterState;
+    Wmmt4NetworkState shopRouterState;
+    Wmmt4NetworkState hopsState;
+    uint8_t pad2[4];
+    uint32_t hops;
+    Wmmt4NetworkState wifiRouterState;
+    Wmmt4NetworkState onlineState;
+    Wmmt4NetworkState setDateState;
+    Wmmt4NetworkState ntpState;
+    Wmmt4NetworkState packageFileState;
+    uint8_t pad3[28];
+    Wmmt4NetworkCheck check;
+};
+
+struct Wmmt4Network
+{
+    Wmmt4NetworkImpl *impl;
+};
+
+struct Wmmt4NetworkInterface
+{
+    uint8_t pad0[8];
+    uint8_t name[4];
+    uint32_t address;
+    uint32_t netmask;
+    uint32_t gateway;
+    uint8_t pad1[12];
+    uint8_t mac[4];
+};
+
+struct Wmmt4LoadRequest
+{
+    uint8_t pad[276];
+    void *user;
+    void *heap;
+    int alignment;
+};
+#pragma pack(pop)
+
+static_assert(offsetof(Wmmt4NetworkImpl, check) == 628,
+              "WMMT4 network state layout changed");
+static_assert(offsetof(Wmmt4NetworkInterface, address) == 12,
+              "WMMT4 network interface layout changed");
+static_assert(offsetof(Wmmt4NetworkInterface, mac) == 36,
+              "WMMT4 network interface string layout changed");
+static_assert(offsetof(Wmmt4LoadRequest, user) == 276,
+              "WMMT4 load request layout changed");
+
+struct Wmmt4LoadUser
+{
+    void *user;
+    void *heap;
+    int alignment;
+};
+
+extern "C" void wmmt4SystemLog(int type, const char *format, ...)
+{
+    GuestTls::HostCallScope hostCall;
+    char message[2048]{};
+    va_list args;
+    va_start(args, format);
+    std::vsnprintf(message, sizeof(message), format ? format : "", args);
+    va_end(args);
+
+    switch (type)
+    {
+    case 2:
+        log_warn("WMMT4: %s", message);
+        break;
+    case 4:
+        log_error("WMMT4: %s", message);
+        break;
+    default:
+        log_info("WMMT4: %s", message);
+        break;
+    }
+    std::fflush(stdout);
+}
+
+/* Only the fields the title's boot check and menu code read. */
+struct Wmmt4TouchIo
+{
+    uint8_t reserved0[16];
+    int32_t booted;
+    uint8_t reserved1[60];
+    int32_t positionX;
+    int32_t positionY;
+    int32_t touched;
+};
+
+static_assert(offsetof(Wmmt4TouchIo, booted) == 16,
+              "WMMT4 touch panel state layout changed");
+static_assert(offsetof(Wmmt4TouchIo, touched) == 88,
+              "WMMT4 touch panel state layout changed");
+
+extern "C" void wmmt4TouchUpdate(Wmmt4TouchIo *touch)
+{
+    GuestTls::HostCallScope hostCall;
+    traceHook(17, "touch panel update");
+    if (!touch)
+        return;
+
+    /* Report a panel that booted and is not being touched.  Pointer input is
+     * not wired up yet, so the terminal menu stays idle rather than reacting
+     * to stale coordinates. */
+    touch->booted = 1;
+    touch->positionX = 0;
+    touch->positionY = 0;
+    touch->touched = 0;
+}
+
+extern "C" bool wmmt4NetworkAddressChanged(void *)
+{
+    GuestTls::HostCallScope hostCall;
+    traceHook(14, "network address-change check");
+    return false;
+}
+
+extern "C" bool wmmt4NetworkInterfaceUpdate(Wmmt4NetworkInterface *interfaceState)
+{
+    GuestTls::HostCallScope hostCall;
+    traceHook(15, "network interface update");
+    if (!interfaceState)
+        return false;
+
+    /* Report the address the sockets actually use: terminal discovery receives
+     * its own datagram back and recognises it only by comparing the source
+     * against this, so a made-up address makes the cabinet wait forever. */
+    int interfaceIndex = 0;
+    unsigned char address[4] = {127, 0, 0, 1};
+    unsigned char mask[4] = {255, 255, 255, 0};
+    unsigned char mac[6] = {0};
+    int link = 1;
+    es1HostNetworkInterface(&interfaceIndex, address, mask, mac, &link);
+
+    const auto pack = [](const unsigned char octets[4]) {
+        return (static_cast<uint32_t>(octets[0]) << 24) | (static_cast<uint32_t>(octets[1]) << 16) |
+               (static_cast<uint32_t>(octets[2]) << 8) | static_cast<uint32_t>(octets[3]);
+    };
+
+    /* These fields use host-order integer representations in the title. */
+    interfaceState->address = pack(address);
+    interfaceState->netmask = pack(mask);
+    /* The content router check rejects .1: ES1 installations put it at .254,
+     * and reporting anything else fails the boot check with
+     * E0502 "Content Router mismatch". */
+    interfaceState->gateway = (pack(address) & pack(mask)) | 254u;
+
+    char macText[13] = {0};
+    std::snprintf(macText, sizeof(macText), "%02X%02X%02X%02X%02X%02X", mac[0], mac[1], mac[2],
+                  mac[3], mac[4], mac[5]);
+
+    using GuestStringAssign = void (*)(void *, const char *);
+    auto assign = reinterpret_cast<GuestStringAssign>(GuestStringAssignAddress);
+    GuestTls::EnterGuestCode();
+    assign(interfaceState->name, "eth0");
+    assign(interfaceState->mac, macText);
+    GuestTls::EnterHostCall();
+
+    log_info("System ES1 WMMT4: eth0 reported as %u.%u.%u.%u/%u.%u.%u.%u mac %s", address[0],
+             address[1], address[2], address[3], mask[0], mask[1], mask[2], mask[3], macText);
+    return true;
+}
+
+extern "C" void wmmt4NetworkUpdateState(void *stateArray)
+{
+    GuestTls::HostCallScope hostCall;
+    traceHook(16, "network diagnostic update");
+
+    using GuestGetNetwork = Wmmt4Network *(*)();
+    using GuestApplyState = void (*)(Wmmt4NetworkImpl *, void *);
+    auto getNetwork = reinterpret_cast<GuestGetNetwork>(NetworkGetInstanceAddress);
+    auto applyState = reinterpret_cast<GuestApplyState>(NetworkApplyStateAddress);
+
+    GuestTls::EnterGuestCode();
+    Wmmt4Network *network = getNetwork();
+    GuestTls::EnterHostCall();
+    if (!network || !network->impl)
+        return;
+
+    Wmmt4NetworkImpl *impl = network->impl;
+    const int check = static_cast<int>(impl->check);
+    if (g_lastNetworkCheck.exchange(check) != check)
+    {
+        log_info("System ES1 WMMT4: network diagnostic state %d", check);
+        std::fflush(stdout);
+    }
+
+    /* LL_WMMT4_NET_TRACE=1: every change in the per-check verdicts.  The title
+     * shows its online state on the attract screen without logging it, and
+     * these fields are what that display is built from. */
+    static const bool traceNetwork = std::getenv("LL_WMMT4_NET_TRACE") != nullptr;
+    if (traceNetwork)
+    {
+        struct Watched { const char *name; Wmmt4NetworkState value; };
+        const Watched watched[] = {
+            {"cable", impl->cableState},       {"gateway", impl->gatewayState},
+            {"shopRouter", impl->shopRouterState},
+            {"contentRouter", impl->contentRouterState},
+            {"hops", impl->hopsState},         {"resolve", impl->resolveState},
+            {"online", impl->onlineState},     {"ntp", impl->ntpState},
+            {"setDate", impl->setDateState},   {"syncDate", impl->syncDateState},
+            {"renew", impl->renewState},       {"wifi", impl->wifiRouterState},
+            {"packageFile", impl->packageFileState},
+        };
+        static uint32_t previous[sizeof(watched) / sizeof(watched[0])] = {};
+        static bool primed = false;
+        for (size_t i = 0; i < sizeof(watched) / sizeof(watched[0]); ++i)
+        {
+            const uint32_t now = static_cast<uint32_t>(watched[i].value);
+            if (primed && now != previous[i])
+                log_info("LLNET %s: %u -> %u (check=%d)", watched[i].name, previous[i], now,
+                         check);
+            previous[i] = now;
+        }
+        primed = true;
+    }
+
+    /* Once verified the cable stays verified: the title re-checks about once a
+     * second and drops the state to Busy meanwhile, and a virtual LAN cannot
+     * come unplugged.  Only the re-checks are pinned. */
+    static std::atomic<bool> cableVerified{false};
+    if (impl->cableState == Wmmt4NetworkState::Good)
+        cableVerified.store(true, std::memory_order_relaxed);
+    else if (cableVerified.load(std::memory_order_relaxed))
+        impl->cableState = Wmmt4NetworkState::Good;
+
+    /* A standalone cabinet still has a valid local link.  Advance all local
+     * hardware checks and leave Auth untouched, so the title itself produces
+     * its normal offline/service-unavailable result. */
+    switch (impl->check)
+    {
+    case Wmmt4NetworkCheck::Cable:
+    case Wmmt4NetworkCheck::CableCheck:
+        impl->cableState = Wmmt4NetworkState::Good;
+        break;
+    case Wmmt4NetworkCheck::Gateway:
+        impl->gatewayState = Wmmt4NetworkState::Good;
+        break;
+    case Wmmt4NetworkCheck::ShopAddress:
+        impl->resolveState = Wmmt4NetworkState::Good;
+        break;
+    case Wmmt4NetworkCheck::Hops:
+        impl->hops = 1;
+        impl->hopsState = Wmmt4NetworkState::Good;
+        break;
+    case Wmmt4NetworkCheck::SyncDate:
+        impl->syncDateState = Wmmt4NetworkState::Good;
+        break;
+    case Wmmt4NetworkCheck::Renew:
+        impl->renewState = Wmmt4NetworkState::Good;
+        break;
+    case Wmmt4NetworkCheck::Test:
+        impl->cableState = Wmmt4NetworkState::Good;
+        impl->shopRouterState = Wmmt4NetworkState::Good;
+        impl->contentRouterState = Wmmt4NetworkState::Good;
+        impl->hopsState = Wmmt4NetworkState::Good;
+        break;
+    case Wmmt4NetworkCheck::Wifi:
+        impl->wifiRouterState = Wmmt4NetworkState::Good;
+        break;
+    case Wmmt4NetworkCheck::SetDate:
+        impl->setDateState = Wmmt4NetworkState::Good;
+        break;
+    case Wmmt4NetworkCheck::Online:
+        impl->onlineState = Wmmt4NetworkState::Good;
+        break;
+    case Wmmt4NetworkCheck::Ntp:
+        impl->ntpState = Wmmt4NetworkState::Good;
+        break;
+    case Wmmt4NetworkCheck::PackageFile:
+        impl->packageFileState = Wmmt4NetworkState::Good;
+        break;
+    default:
+        break;
+    }
+
+    /* What the title actually publishes, after the fixes above.  The trace at
+     * the top of this hook shows the value the game wrote; this one shows what
+     * the display gets, so the two together say whether a fix took effect. */
+    if (traceNetwork)
+    {
+        static uint32_t lastPublishedCable = 0xffffffffu;
+        const uint32_t published = static_cast<uint32_t>(impl->cableState);
+        if (published != lastPublishedCable)
+        {
+            log_info("LLNET published cable=%u (check=%d)", published, check);
+            lastPublishedCable = published;
+        }
+    }
+
+    GuestTls::EnterGuestCode();
+    applyState(impl, stateArray);
+    GuestTls::EnterHostCall();
+}
+
+extern "C" int wmmt4LoadRequest(Wmmt4LoadRequest *request)
+{
+    GuestTls::HostCallScope hostCall;
+    traceHook(17, "resource load request");
+    if (!request || !g_originalLoadRequest)
+        return -1;
+
+    auto *wrapper = new Wmmt4LoadUser{request->user, request->heap, request->alignment};
+    request->user = wrapper;
+    GuestTls::EnterGuestCode();
+    const int result = g_originalLoadRequest(request);
+    GuestTls::EnterHostCall();
+    return result;
+}
+
+extern "C" void wmmt4FileCallback(int result, void *buffer, int size, void *user)
+{
+    GuestTls::HostCallScope hostCall;
+    traceHook(18, "resource file callback");
+    auto *wrapper = static_cast<Wmmt4LoadUser *>(user);
+    if (!wrapper || !g_originalFileCallback)
+        return;
+
+    auto callOriginal = [&](int callbackResult, void *callbackBuffer, int callbackSize) {
+        GuestTls::EnterGuestCode();
+        g_originalFileCallback(callbackResult, callbackBuffer, callbackSize, wrapper->user);
+        GuestTls::EnterHostCall();
+    };
+
+    std::vector<uint8_t> decompressed;
+    if (result == 0 && size > 1 && buffer &&
+        es1CompatGzipDecompress(static_cast<const uint8_t *>(buffer),
+                                static_cast<size_t>(size), decompressed))
+    {
+        const size_t alignment = wrapper->alignment > 0
+                                     ? static_cast<size_t>(wrapper->alignment)
+                                     : 1u;
+        const size_t alignedSize = (decompressed.size() + alignment - 1) /
+                                   alignment * alignment;
+        using NuMemoryAlloc = void *(*)(int, size_t, size_t);
+        using NuMemoryFree = void (*)(void *);
+        using HeapAlloc = void *(*)(size_t, size_t, void *);
+        using HeapRelease = void (*)(void *, void *);
+        void *newBuffer = nullptr;
+
+        GuestTls::EnterGuestCode();
+        if (wrapper->heap)
+        {
+            reinterpret_cast<HeapRelease>(HeapReleaseAddress)(buffer, wrapper->heap);
+            newBuffer = reinterpret_cast<HeapAlloc>(HeapAllocAddress)(
+                alignedSize, alignment, wrapper->heap);
+        }
+        else
+        {
+            reinterpret_cast<NuMemoryFree>(NuMemoryFreeAddress)(buffer);
+            newBuffer = reinterpret_cast<NuMemoryAlloc>(NuMemoryAllocAddress)(
+                0, alignment, alignedSize);
+        }
+        GuestTls::EnterHostCall();
+
+        if (newBuffer)
+        {
+            std::memcpy(newBuffer, decompressed.data(), decompressed.size());
+            log_debug("System ES1 WMMT4: decompressed resource %d -> %u bytes",
+                      size, static_cast<unsigned>(decompressed.size()));
+            callOriginal(0, newBuffer, static_cast<int>(decompressed.size()));
+            delete wrapper;
+            return;
+        }
+        log_error("System ES1 WMMT4: failed to allocate %u-byte decompressed resource",
+                  static_cast<unsigned>(alignedSize));
+        callOriginal(-1, nullptr, 0);
+        delete wrapper;
+        return;
+    }
+
+    callOriginal(result, buffer, size);
+    delete wrapper;
+}
+
+extern "C" int wmmt4FilenameMatch(const char *name, const char *pattern)
+{
+    GuestTls::HostCallScope hostCall;
+
+    /*
+     * The title's enumerator has no end-of-directory branch and would compute
+     * NULL->d_name here; bridgeReaddir() reports EBADF so it never gets that
+     * far, and this guard stays as an anomaly detector.
+     */
+    if (reinterpret_cast<uintptr_t>(name) < 0x10000u ||
+        reinterpret_cast<uintptr_t>(pattern) < 0x10000u)
+    {
+        static std::atomic<unsigned int> invalidCount{0};
+        const unsigned int count = invalidCount.fetch_add(1) + 1;
+        if (count <= 4)
+            log_warn("System ES1 WMMT4: ignored invalid directory entry name=%p pattern=%p \"%s\"",
+                     name, pattern,
+                     reinterpret_cast<uintptr_t>(pattern) >= 0x10000u ? pattern : "<bad>");
+        return 0;
+    }
+
+    if (!g_originalFilenameMatch)
+        return 0;
+
+    GuestTls::EnterGuestCode();
+    const int result = g_originalFilenameMatch(name, pattern);
+    GuestTls::EnterHostCall();
+    return result;
+}
+}
+
+extern "C" int es1Wmmt4Detect(const char *elfPath)
+{
+    const std::filesystem::path elf(elfPath);
+    const std::filesystem::path gameDir = elf.parent_path();
+    /* Pacloader supplies the complete WMMT4 HASP image internally, so a clean
+     * game folder needs no mt4hasp.so patch or wm4_hasp.bin marker to be
+     * recognised. */
+    return elf.filename() == "WMN4r" &&
+           std::filesystem::exists(gameDir / "wangan4_exec") &&
+           std::filesystem::exists(gameDir / "wangan4_storage") &&
+           std::filesystem::exists(gameDir / "data") &&
+           (std::filesystem::exists(gameDir / "ll-deps") ||
+            std::filesystem::exists(gameDir / "libso"))
+               ? 1
+               : 0;
+}
+
+extern "C" int es1Wmmt4InstallHooks(void)
+{
+    initializeHaspData();
+    const bool terminal =
+        getConfig()->namcoES1.cabinetMode == NAMCO_ES1_CABINET_TERMINAL;
+    log_info("System ES1 WMMT4: cabinet mode %s, virtual HASP S/N %.12s",
+             terminal ? "TERMINAL" : "DRIVE", g_haspData.system.serial);
+    wmmt4StartTerminalEmulator(DriveHaspSerial);
+
+    const Es1HookSpec hooks[] = {
+        {JvioBootedAddress, reinterpret_cast<void *>(wmmt4JvioBooted), "JvioControl_IsBooted"},
+        {JvioUpdateAddress, reinterpret_cast<void *>(wmmt4JvioUpdate), "JvioControl_Update"},
+        {JvioGetCoinAddress, reinterpret_cast<void *>(wmmt4JvioGetCoinNow), "JvioGetCoinNow"},
+        {JvioDecCoinAddress, reinterpret_cast<void *>(wmmt4JvioDecCoin), "JvioDecCoin"},
+        {JvioErrorAddress, reinterpret_cast<void *>(wmmt4JvioError), "JvioControl_IsError"},
+        {JvioThreadAddress, reinterpret_cast<void *>(wmmt4JvioThread), "JvioThread"},
+        {JvioMonitorAddress, reinterpret_cast<void *>(wmmt4JvioMonitor), "JvioMonitor"},
+        {HaspLoginAddress, reinterpret_cast<void *>(wmmt4HaspLogin), "hasp_login"},
+        {HaspLogoutAddress, reinterpret_cast<void *>(wmmt4HaspLogout), "hasp_logout"},
+        {HaspDecryptAddress, reinterpret_cast<void *>(wmmt4HaspDecrypt), "hasp_decrypt"},
+        {HaspGetSizeAddress, reinterpret_cast<void *>(wmmt4HaspGetSize), "hasp_get_size"},
+        {HaspReadAddress, reinterpret_cast<void *>(wmmt4HaspRead), "hasp_read"},
+        {HaspWriteAddress, reinterpret_cast<void *>(wmmt4HaspWrite), "hasp_write"},
+        {SendCommandAddress, reinterpret_cast<void *>(wmmt4SendCommand), "send_command"},
+        {SystemLogAddress, reinterpret_cast<void *>(wmmt4SystemLog), "Sys_LogMes"},
+        {TouchUpdateAddress, reinterpret_cast<void *>(wmmt4TouchUpdate), "Sys_Device_TouchIo_update"},
+        {NetworkAddressChangedAddress, reinterpret_cast<void *>(wmmt4NetworkAddressChanged),
+         "Sys_Net_interface_isAddressChange"},
+        {NetworkUpdateStateAddress, reinterpret_cast<void *>(wmmt4NetworkUpdateState),
+         "Sys_Network_UpdateState"},
+        {NetworkInterfaceUpdateAddress, reinterpret_cast<void *>(wmmt4NetworkInterfaceUpdate),
+         "Sys_Net_Interface_update"},
+        {LoadRequestAddress, reinterpret_cast<void *>(wmmt4LoadRequest),
+         "Sys_LoadRequest_stdLoad", reinterpret_cast<void **>(&g_originalLoadRequest)},
+        {FileCallbackAddress, reinterpret_cast<void *>(wmmt4FileCallback),
+         "Sys_fileDescCallback", reinterpret_cast<void **>(&g_originalFileCallback)},
+        {FilenameMatchAddress, reinterpret_cast<void *>(wmmt4FilenameMatch),
+         "directory_filename_match", reinterpret_cast<void **>(&g_originalFilenameMatch)},
+    };
+    int installed = es1InstallHookTable(hooks, sizeof(hooks) / sizeof(hooks[0]), "WMMT4");
+    installed += wmmt4InstallCardHooks();
+    wmmt4InstallNetworkDiagnostics();
+
+    log_info("System ES1 WMMT4: installed %d version-specific compatibility hooks", installed);
+    return installed >= 2 ? 0 : -1;
+}

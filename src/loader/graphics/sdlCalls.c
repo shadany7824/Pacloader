@@ -70,6 +70,12 @@ void GLAPIENTRY openglDebugCallback(GLenum source, GLenum type, GLuint id, GLenu
 
 int initSDL()
 {
+    /* X11 guests expect XMapWindow/XRaiseWindow to activate their top-level
+     * window. SDL leaves this platform-dependent unless these hints are set,
+     * which can leave the launcher's console in front on Windows. */
+    SDL_SetHint(SDL_HINT_WINDOW_ACTIVATE_WHEN_SHOWN, "1");
+    SDL_SetHint(SDL_HINT_WINDOW_ACTIVATE_WHEN_RAISED, "1");
+
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_JOYSTICK | SDL_INIT_HAPTIC | SDL_INIT_GAMEPAD))
     {
         log_error("SDL could not initialize! SDL_Error: %s\n", SDL_GetError());
@@ -80,13 +86,9 @@ int initSDL()
 }
 
 /*
- * Windows calls a window hung once its owning thread stops taking messages for
- * a few seconds, and replaces it with a grey ghost. Loading a course is exactly
- * that: one long stretch of work with no frame presented.
- *
- * So ghosting is turned off, and the message queue is drained from the loader's
- * file paths, which a load goes through constantly. Only the owning thread may
- * pump, and only every so often, so thousands of reads do not each pay for one.
+ * Windows ghosts a window whose thread stops taking messages, which a long load
+ * looks exactly like.  So ghosting is off and the queue is pumped from the file
+ * paths a load goes through - by the owning thread only, and throttled.
  */
 #define WINDOW_PUMP_INTERVAL_MS 100
 
@@ -96,11 +98,8 @@ static Uint64 g_lastPumpTicks = 0;
 static void disableWindowGhosting(void)
 {
 #if defined(_WIN32) || defined(__MINGW32__)
-    /*
-     * Loaded through SDL rather than windows.h, which does not sit well with
-     * the GL headers this file already pulls in.  user32 is resident for the
-     * window's sake anyway, so the handle is simply left open.
-     */
+    /* Loaded through SDL rather than windows.h, which clashes with the GL
+     * headers here.  user32 is resident anyway, so the handle stays open. */
     SDL_SharedObject *user32 = SDL_LoadObject("user32.dll");
     if (!user32)
         return;
@@ -117,21 +116,20 @@ void keepWindowResponsive(void)
     if (!g_windowThread)
         return;
 
+    /* The thread test comes before the interval test on purpose: a queue belongs
+     * to the thread that created the window, so sharing the throttle lets a busy
+     * worker starve the owning thread until Windows calls the window hung. */
+    if (SDL_GetCurrentThreadID() != g_windowThread)
+        return;
+
     const Uint64 now = SDL_GetTicks();
     if (now - g_lastPumpTicks < WINDOW_PUMP_INTERVAL_MS)
         return;
 
-    if (SDL_GetCurrentThreadID() != g_windowThread)
-        return;
-
     g_lastPumpTicks = now;
-    /*
-     * Pump the native queue without consuming it.  SDL 1.2 games have their
-     * own clInputDeviceKey::update() path; draining events here would make the
-     * loader see TEST but discard the same key before the guest test menu can
-     * see it.  The normal frame path still calls pollEvents() to update JVS
-     * action states.
-     */
+    /* Pump the native queue without consuming it: SDL 1.2 titles read events
+     * themselves, and draining here would swallow TEST before the guest test
+     * menu sees it. */
     SDL_PumpEvents();
 #if defined(_WIN32) || defined(__MINGW32__)
     if (platformIsES1())
@@ -177,6 +175,8 @@ void startSDL()
 
     // Use a pixel-dense backbuffer for custom resolutions.
     uint32_t windowFlags = SDL_WINDOW_OPENGL | SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_HIDDEN;
+    if (getConfig()->alwaysOnTop)
+        windowFlags |= SDL_WINDOW_ALWAYS_ON_TOP;
 
     g_SdlWindow = SDL_CreateWindow(getGameName(), gWidth, gHeight, windowFlags);
 
@@ -184,6 +184,8 @@ void startSDL()
     {
         // Whoever created the window is the only thread allowed to pump for it.
         g_windowThread = SDL_GetCurrentThreadID();
+        log_debug("Window created on thread %llu; only it may pump for the window",
+                  (unsigned long long)g_windowThread);
         disableWindowGhosting();
 
 #ifdef __linux__
@@ -276,6 +278,9 @@ void startSDL()
         SDL_SetWindowResizable(g_SdlWindow, true);
 
     SDL_ShowWindow(g_SdlWindow);
+    if (getConfig()->alwaysOnTop && !SDL_SetWindowAlwaysOnTop(g_SdlWindow, true))
+        log_warn("Failed to keep game window on top: %s", SDL_GetError());
+    raiseSDLWindow();
 
     Uint64 startTime = SDL_GetTicks();
     int running = 1;
@@ -306,6 +311,26 @@ SDL_Window *getSDLWindow()
 SDL_GLContext getSDLContext()
 {
     return g_SdlContext;
+}
+
+void raiseSDLWindow(void)
+{
+    if (!g_SdlWindow)
+        return;
+
+    /* Restoring first also covers a taskbar-minimized game. SDL_RaiseWindow
+     * then asks the native window manager for both Z-order and input focus. */
+    SDL_RestoreWindow(g_SdlWindow);
+    if (!SDL_RaiseWindow(g_SdlWindow))
+        log_warn("Failed to bring game window to foreground: %s", SDL_GetError());
+
+#if defined(_WIN32) || defined(__MINGW32__)
+    void *nativeWindow = SDL_GetPointerProperty(
+        SDL_GetWindowProperties(g_SdlWindow),
+        SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL);
+    if (!platformRaiseNativeWindow(nativeWindow))
+        log_debug("Windows declined the game window foreground request");
+#endif
 }
 
 bool makeSDLCurrent(SDL_Window *win, SDL_GLContext ctx)
@@ -387,7 +412,10 @@ void sdlQuit()
 void pollEvents()
 {
     SDL_Event event;
-    g_lastPumpTicks = SDL_GetTicks();
+    /* Only count this as a pump when it ran on the owning thread and really
+     * drained the queue; otherwise it throttles out the pump that matters. */
+    if (SDL_GetCurrentThreadID() == g_windowThread)
+        g_lastPumpTicks = SDL_GetTicks();
     while (SDL_PollEvent(&event))
     {
 #ifdef __linux__

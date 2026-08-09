@@ -6,6 +6,16 @@
 extern "C" {
 #endif
 
+/*
+ * Point the reader at the System ES1 terminal cabinet: /dev/ttyS1 and the
+ * [NamcoES1] YaCardEmu settings instead of N2's /dev/ttyM2 and [NamcoN2].
+ * Call before the title opens the device.
+ */
+void n2CardReaderUseEs1Terminal(void);
+
+/* Connect to the reader now rather than on the first open(). */
+void n2CardReaderStart(void);
+
 int n2CardReaderOpen(const char *path, int flags);
 int n2CardReaderIsConnected(void);
 const char *n2CardReaderConnectionText(void);

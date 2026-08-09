@@ -4,6 +4,7 @@
 #include "memoryManager.hpp"
 #include "symbolResolver.hpp"
 #include "linuxStack.hpp"
+#include "guestTls.hpp"
 #include "libcBridge.hpp"
 #include <elfio.hpp>
 #include <cstring>
@@ -181,6 +182,17 @@ bool ElfLoader::Load(const std::string &path, const std::function<bool()> &befor
     if (!LoadMapAndExport(path))
         return false;
 
+    /* Determine whether this WOW64 environment can retain a Linux GS
+     * selector before resolving relocations.  In the software-GS fallback,
+     * host calls need no selector transition and must keep their original
+     * return addresses (notably for C++ unwinding). */
+    if (!GuestTls::InstallForCurrentThread())
+    {
+        log_error("ES1 TLS: could not install guest GS before relocations");
+        return false;
+    }
+    GuestTls::EnterHostCall();
+
     log_info("ELF loader: processing shared-object relocations");
     if (!SymbolResolver::GetInstance().ProcessAllRelocations())
         return false;
@@ -344,6 +356,7 @@ bool ElfLoader::MapSegmentsToMemory()
             log_trace("Mapped PT_LOAD segment to %p, size %zu", dest, (size_t)memsz);
         }
     }
+
     {
         for (Elf_Half i = 0; i < m_Elfio->sections.size(); ++i)
         {
@@ -394,10 +407,11 @@ bool ElfLoader::LoadDependencies()
         SymbolResolver::GetInstance().RegisterLibrary("ld-linux.so.2", "INTERNAL");
         SymbolResolver::GetInstance().RegisterLibrary("libasound.so.2", "INTERNAL");
         SymbolResolver::GetInstance().RegisterLibrary("libXxf86vm.so.1", "INTERNAL");
-        SymbolResolver::GetInstance().RegisterLibrary("libX11.so.6", "INTERNAL");
-        SymbolResolver::GetInstance().RegisterLibrary("libXext.so.6", "INTERNAL");
-        SymbolResolver::GetInstance().RegisterLibrary("libXmu.so.6", "INTERNAL");
-        SymbolResolver::GetInstance().RegisterLibrary("libXi.so.6", "INTERNAL");
+    SymbolResolver::GetInstance().RegisterLibrary("libX11.so.6", "INTERNAL");
+    SymbolResolver::GetInstance().RegisterLibrary("libXext.so.6", "INTERNAL");
+    SymbolResolver::GetInstance().RegisterLibrary("libXmu.so.6", "INTERNAL");
+    SymbolResolver::GetInstance().RegisterLibrary("libXi.so.6", "INTERNAL");
+    SymbolResolver::GetInstance().RegisterLibrary("libcurl.so.4", "INTERNAL");
         SymbolResolver::GetInstance().RegisterLibrary("libGL.so.1", "INTERNAL");
         SymbolResolver::GetInstance().RegisterLibrary("libGLU.so.1", "INTERNAL");
         SymbolResolver::GetInstance().RegisterLibrary("libglut.so.3", "INTERNAL");
@@ -544,13 +558,13 @@ bool ElfLoader::ProcessRelocations()
                 {
                     std::string symbolName = "";
                     Elf_Xword symSize = 0;
+                    unsigned char symcat = STT_NOTYPE;
                     section *symSec = m_Elfio->sections[pSection->get_link()];
                     if (symSec)
                     {
                         symbol_section_accessor symbols(*m_Elfio, symSec);
                         Elf64_Addr value;
                         unsigned char bind;
-                        unsigned char symcat;
                         Elf_Half shndx;
                         unsigned char other;
                         symbols.get_symbol(symbolIdx, symbolName, value, symSize, bind, symcat, shndx, other);
@@ -574,6 +588,25 @@ bool ElfLoader::ProcessRelocations()
                     {
                         std::string moduleName;
                         void *resolvedFunc = SymbolResolver::GetInstance().ResolveSymbol(symbolName, &moduleName);
+
+                        /* The CRT byte-copy primitives are selector-neutral and
+                         * used constantly by guest C++, so the trampoline would
+                         * only add a transition.  Everything else keeps it. */
+                        const bool selectorNeutralMemoryFunction =
+                            symbolName == "memcpy" || symbolName == "memmove" ||
+                            symbolName == "memset" || symbolName == "memcmp" ||
+                            symbolName == "memchr" || symbolName == "wmemcpy" ||
+                            symbolName == "wmemmove" || symbolName == "wmemset" ||
+                            symbolName == "wmemcmp" || symbolName == "wmemchr";
+                        if (symcat == STT_FUNC && !selectorNeutralMemoryFunction &&
+                            moduleName != "Native Symbol" &&
+                            moduleName != "UNRESOLVED_STUB" && moduleName != "WEAK_SYMBOL" &&
+                            moduleName != "libgcc_s_dw2-1.dll")
+                        {
+                            log_debug("ES1 TLS: wrapping %s from %s at %p", symbolName.c_str(),
+                                      moduleName.c_str(), resolvedFunc);
+                            resolvedFunc = GuestTls::WrapHostFunction(resolvedFunc);
+                        }
 
                         if (resolvedFunc)
                         {
@@ -828,7 +861,9 @@ bool ElfLoader::RunInit()
                 log_debug("Calling DT_INIT at %p", actualInit);
                 typedef void (*InitFunc)(void);
                 InitFunc init = reinterpret_cast<InitFunc>(actualInit);
+                GuestTls::EnterGuestCode();
                 init();
+                GuestTls::EnterHostCall();
             }
 
             if (initArrayAddr != 0 && initArraySz > 0)
@@ -854,7 +889,9 @@ bool ElfLoader::RunInit()
                     log_debug("Calling DT_INIT_ARRAY function %zu at 0x%08X", k, funcPtrVal);
                     typedef void (*InitArrayFunc)(void);
                     InitArrayFunc func = reinterpret_cast<InitArrayFunc>(reinterpret_cast<uintptr_t>(funcPtrVal));
+                    GuestTls::EnterGuestCode();
                     func();
+                    GuestTls::EnterHostCall();
                 }
             }
         }
@@ -965,6 +1002,12 @@ bool ElfLoader::Execute(int argc, char **argv, char **envp)
     log_info("Stack ESP: 0x%08X", esp);
 
     Sleep(100);
+
+    if (!GuestTls::InstallForCurrentThread())
+    {
+        log_error("ES1 TLS: could not install guest GS for the main thread");
+        return false;
+    }
 
     __asm__ volatile("mov %0, %%esp\n\t"
                      "xor %%eax, %%eax\n\t"

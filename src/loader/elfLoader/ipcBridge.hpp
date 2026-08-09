@@ -24,9 +24,22 @@ struct SemInfo
     std::vector<int> values;
 };
 
-namespace IpcBridge 
+namespace IpcBridge
 {
     void initBridges();
+}
+
+/* A POSIX message queue whose reader is a cabinet daemon the loader does not
+ * run.  Undrained, it fills in seconds and mq_send() then answers EAGAIN, so
+ * registering a consumer makes the loader stand in for that reader. */
+extern "C"
+{
+    typedef void (*IpcQueueConsumer)(const char *name, const void *data, size_t length,
+                                     unsigned priority);
+
+    /* Pass NULL to remove. Consumers may be registered before the guest opens
+     * the queue; the name is matched when a message is sent. */
+    void ipcSetQueueConsumer(const char *name, IpcQueueConsumer consumer);
 }
 
 /*
@@ -41,6 +54,14 @@ struct LinuxSembuf
     short sem_flg;
 };
 
+struct LinuxMqAttr
+{
+    long flags;
+    long maxmsg;
+    long msgsize;
+    long curmsgs;
+};
+
 extern "C"
 {
     int bridgeShmget(int key, size_t size, int shmflg);
@@ -52,4 +73,12 @@ extern "C"
     int bridgeSemget(int key, int semaphoreCount, int flags);
     int bridgeSemop(int semaphoreId, struct LinuxSembuf *operations, unsigned int count);
     int bridgeSemctl(int semaphoreId, int semaphoreNumber, int command, ...);
+
+    int bridgeMqOpen(const char *name, int flags, ...);
+    int bridgeMqClose(int descriptor);
+    int bridgeMqUnlink(const char *name);
+    int bridgeMqSend(int descriptor, const char *message, size_t length, unsigned priority);
+    int bridgeMqReceive(int descriptor, char *buffer, size_t length, unsigned *priority);
+    int bridgeMqGetattr(int descriptor, struct LinuxMqAttr *attribute);
+    int bridgeMqNotify(int descriptor, const void *notification);
 };

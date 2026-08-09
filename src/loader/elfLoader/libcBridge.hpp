@@ -63,9 +63,37 @@ namespace LibcBridge
     int bridgeVfprintf(void *stream, const char *format, va_list args);
     int bridgeVsprintf(char *buffer, const char *format, va_list args);
     int bridgeVsnprintf(char *buffer, size_t count, const char *format, va_list args);
+
+    // _FORTIFY_SOURCE forms: the extra arguments are the fortification level
+    // and the destination size the compiler proved.
+    int bridgePrintfChk(int flag, const char *format, ...);
+    int bridgeFprintfChk(void *stream, int flag, const char *format, ...);
+    int bridgeSprintfChk(char *buffer, int flag, size_t destinationSize, const char *format, ...);
+    int bridgeSnprintfChk(char *buffer, size_t count, int flag, size_t destinationSize,
+                          const char *format, ...);
+    int bridgeVprintfChk(int flag, const char *format, va_list args);
+    int bridgeVfprintfChk(void *stream, int flag, const char *format, va_list args);
+    int bridgeVsprintfChk(char *buffer, int flag, size_t destinationSize, const char *format,
+                          va_list args);
+    int bridgeVsnprintfChk(char *buffer, size_t count, int flag, size_t destinationSize,
+                           const char *format, va_list args);
+    void *bridgeMemcpyChk(void *destination, const void *source, size_t count,
+                          size_t destinationSize);
+    void *bridgeMemmoveChk(void *destination, const void *source, size_t count,
+                           size_t destinationSize);
+    void *bridgeMemsetChk(void *destination, int value, size_t count, size_t destinationSize);
+    char *bridgeStrcpyChk(char *destination, const char *source, size_t destinationSize);
+    char *bridgeStrncpyChk(char *destination, const char *source, size_t count,
+                           size_t destinationSize);
+    char *bridgeStrcatChk(char *destination, const char *source, size_t destinationSize);
+    char *bridgeStrncatChk(char *destination, const char *source, size_t count,
+                           size_t destinationSize);
+
     int bridgeFscanf(FILE *stream, const char *format, ...);
     int bridgeSscanf(const char *str, const char *format, ...);
     char *bridgeIndex(const char *str, int c);
+    char *bridgeStrtok(char *str, const char *delim);
+    char *bridgeStrtokR(char *str, const char *delim, char **saveptr);
     char *bridgeRealpath(const char *path, char *resolved_path);
     FILE *bridgePopen(const char *command, const char *type);
     int bridgePclose(FILE *stream);
@@ -99,6 +127,23 @@ namespace LibcBridge
     int bridgeSetjmp(void *environment);
     int bridgeSigsetjmp(void *environment, int saveSignalMask);
     void bridgeLongjmp(void *environment, int value);
+
+    /* Symbols the guest imports that had no bridge, so calling one aborted the
+     * loader through the unresolved-symbol stub. */
+    void bridgeStackChkFail(void);
+    int bridgePutcUnlocked(int character, FILE *stream);
+    int bridgeNice(int increment);
+    int bridgeGetrlimit(int resource, void *limit);
+    int bridgeGetrusage(int who, void *usage);
+    int bridgeSchedGetscheduler(int pid);
+    int bridgeFtruncate64(int descriptor, int64_t length);
+    int bridgePosixFallocate64(int descriptor, int64_t offset, int64_t length);
+    int bridgeUtimes(const char *path, const struct timeval times[2]);
+    void bridgeSincosf(float angle, float *sine, float *cosine);
+    size_t bridgeStrnlen(const char *text, size_t limit);
+    long long bridgeStrtoll(const char *text, char **end, int base);
+    unsigned long bridgeStrtoul(const char *text, char **end, int base);
+    unsigned long long bridgeStrtoull(const char *text, char **end, int base);
     int bridgeIsalnum(int character);
     int bridgeIsalpha(int character);
     int bridgeIscntrl(int character);

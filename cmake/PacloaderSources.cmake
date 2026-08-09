@@ -17,6 +17,7 @@ set(PACLOADER_SOURCES
     src/loader/elfLoader/es1CompatBridge.cpp
     src/loader/elfLoader/filesystemBridge.cpp
     src/loader/elfLoader/gccBridge.cpp
+    src/loader/elfLoader/guestTls.cpp
     src/loader/elfLoader/glxBridge.cpp
     src/loader/elfLoader/glHooks.cpp
     src/loader/elfLoader/graphicsBridge.cpp
@@ -28,10 +29,12 @@ set(PACLOADER_SOURCES
     src/loader/elfLoader/networkBridge.cpp
     src/loader/elfLoader/posixCompatBridge.cpp
     src/loader/elfLoader/pthreadBridge.cpp
+    src/loader/elfLoader/randomDevice.cpp
     src/loader/elfLoader/regexBridge.cpp
     src/loader/elfLoader/sdl12Bridge.cpp
     src/loader/elfLoader/symbolResolver.cpp
     src/loader/elfLoader/termiosBridge.cpp
+    src/loader/elfLoader/threadWatchdog.cpp
     src/loader/elfLoader/virtualDeviceRegistry.cpp
     src/loader/elfLoader/x11Bridge.cpp
     src/loader/elfLoader/pthread/pthreadBarrier.cpp
@@ -60,14 +63,20 @@ set(PACLOADER_SOURCES
     src/loader/hardware/namco/n2/n2.cpp
     src/loader/hardware/namco/n2/n2Audio.cpp
     src/loader/hardware/namco/n2/n2CardReader.cpp
-    src/loader/hardware/namco/n2/n2CsNeo.cpp
-    src/loader/hardware/namco/n2/n2CsNeoPcb.cpp
+    src/loader/hardware/namco/n2/n2Graphics.cpp
+    src/loader/hardware/namco/n2/n2Hasp.cpp
     src/loader/hardware/namco/n2/n2Hook.cpp
     src/loader/hardware/namco/n2/n2Host.cpp
+    src/loader/hardware/namco/n2/n2Input.cpp
     src/loader/hardware/namco/n2/n2Jvio.cpp
     src/loader/hardware/namco/n2/n2Kickback.cpp
     src/loader/hardware/namco/n2/n2SteeringIo.cpp
+    src/loader/hardware/namco/n2/n2SystemCommand.cpp
+    src/loader/hardware/namco/n2/n2Titles.cpp
     src/loader/hardware/namco/n2/n2VirtualDevices.cpp
+    src/loader/hardware/namco/n2/csneo/n2CsNeo.cpp
+    src/loader/hardware/namco/n2/csneo/n2CsNeoPcb.cpp
+    src/loader/hardware/namco/n2/wmmt3/n2Wmmt3.cpp
     src/loader/hardware/namco/es1/es1.cpp
     src/loader/hardware/namco/es1/es1TestModeCompat.cpp
     src/loader/hardware/namco/es1/es1Jvs.cpp
@@ -75,6 +84,14 @@ set(PACLOADER_SOURCES
     src/loader/hardware/namco/es1/es1Network.cpp
     src/loader/hardware/namco/es1/es1VirtualDevices.cpp
     src/loader/hardware/namco/es1/es1AudioCompat.cpp
+    src/loader/hardware/namco/es1/es1AlinCompat.cpp
+    src/loader/hardware/namco/es1/es1CompatLayer.cpp
+    src/loader/hardware/namco/es1/es1Titles.cpp
+    src/loader/hardware/namco/es1/maximumHeat3d/es1MaximumHeat3D.cpp
+    src/loader/hardware/namco/es1/wmmt4/es1Wmmt4.cpp
+    src/loader/hardware/namco/es1/wmmt4/es1Wmmt4Card.cpp
+    src/loader/hardware/namco/es1/wmmt4/es1Wmmt4Network.cpp
+    src/loader/hardware/namco/es1/wmmt4/es1Wmmt4Terminal.cpp
 
     src/loader/input/controlIniGen.c
     src/loader/input/sdlInput.c

@@ -29,6 +29,9 @@ public:
     static int pthreadCreate(void* thread, const void* attr,
         void* (*start_routine)(void*), void* arg);
     static int pthreadJoin(uint32_t thread, void** retval);
+    static int pthreadTimedjoin(uint32_t thread, void** retval,
+        const struct timespec* abstime);
+    static int pthreadTryjoin(uint32_t thread, void** retval);
     static int pthreadDetach(uint32_t thread);
     static void pthreadExit(void* retval);
     static uint32_t pthreadSelf();

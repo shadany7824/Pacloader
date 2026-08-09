@@ -38,11 +38,8 @@ float gLastGunNormY[MAX_ENTITIES];
 int gLastGunXDir[MAX_ENTITIES];
 int gLastGunYDir[MAX_ENTITIES];
 float gShakeValue[MAX_ENTITIES];
-/*
- * How many gears the sequential GearUp/GearDown bindings walk through. The
- * WMMT3 cabinet's shifter is a six speed and only six positions have switch
- * patterns, so anything above that is capped where it is used.
- */
+/* Gears the sequential GearUp/GearDown bindings walk through.  Only six shifter
+ * positions have switch patterns, so this is capped where it is used. */
 int gShifterGears = 6;
 float gShakeIncreaseRate = 10.0f;
 float gShakeDecayRate = 0.95f;
@@ -227,13 +224,8 @@ extern const size_t gDefaultMahjongBindingsSize;
 // Forward declaration
 void saveGuidsToIni();
 
-/**
- * @brief Initializes the entire SDL input system.
- * This function initializes SDL subsystems, detects attached controllers,
- * loads control schemes from controls.ini, or applies hardcoded defaults.
- * It is the main entry point for setting up all input handling.
- * @return 0 on success, non-zero on failure.
- */
+/* Brings up SDL input: subsystems, controllers, and the bindings from
+ * controls.ini or the built-in defaults.  Returns 0 on success. */
 int initSdlInput(const char *controlsPath)
 {
     if (getConfig()->inputMode == 2)
@@ -301,7 +293,7 @@ int initSdlInput(const char *controlsPath)
         loadGlobalConfig(ini);
         loadProfileFromIni(iniGetSection(ini, "Common"));
         // Namco N2 reports itself as a driving game but has its own panel.
-        if (gGrp == GROUP_WMMT3)
+        if (gGrp == GROUP_WMMT3 || gGrp == GROUP_WMMT4_ES1)
             isProfileLoaded = loadProfileFromIni(iniGetSection(ini, "WMMT"));
         else if (gGrp == GROUP_MAXIMUM_HEAT_3D)
             isProfileLoaded = loadProfileFromIni(iniGetSection(ini, "MaximumHeat3D"));
@@ -447,13 +439,7 @@ int initSdlInput(const char *controlsPath)
     return 0;
 }
 
-/**
- * @brief Parses a logical action key from the INI file (e.g., "P1_Start").
- * @param key The string key from the INI file.
- * @param out_player Pointer to store the parsed JVSPlayer.
- * @param out_action Pointer to store the parsed LogicalAction.
- * @return True if parsing was successful, false otherwise.
- */
+/* Splits an INI key such as "P1_Start" into its player and action. */
 bool parseActionKey(const char *key, JVSPlayer *out_player, LogicalAction *out_action)
 {
     char genericKey[64];
@@ -483,11 +469,8 @@ bool parseActionKey(const char *key, JVSPlayer *out_player, LogicalAction *out_a
     return false;
 }
 
-/**
- * @brief Initializes the mapping from LogicalActions to JVS inputs.
- * This function sets up the default JVS configuration for all players and actions,
- * defining whether an action corresponds to a switch, an analog input, or a coin drop.
- */
+/* Default LogicalAction to JVS mapping: which actions are switches, which are
+ * analogue channels, and which are coin drops. */
 void initJvsMappings()
 {
     for (int p = 0; p < MAX_ENTITIES; p++)
@@ -607,25 +590,14 @@ void initJvsMappings()
     gJvsMap[PLAYER_2][LA_Card2Insert] = (JVSActionMapping){JVS_CALL_SWITCH, BUTTON_4};
 }
 
-/**
- * @brief Applies specific JVS mapping overrides for certain games.
- * After the default mappings are set up, this function can patch them with
- * game-specific exceptions (e.g., if a game uses an unusual button layout).
- */
+/* Patches the default mapping for titles whose panel differs from it. */
 void remapPerGame()
 {
     if (gGrp == GROUP_WMMT3)
     {
-        /*
-         * The switch positions the cabinet's JVIO board reports, so the JVS
-         * state is already wire-correct. The four shifter switches sit in the
-         * second switch byte rather than on the direction bits, with VIEW and
-         * BGM as its last two buttons.
-         *
-         * GearUp/GearDown stay on PLAYER_2 so existing Lindbergh controls.ini
-         * files keep working; they drive the sequential shifter, which is
-         * synthesised onto those same four switches.
-         */
+        /* The positions the cabinet's JVIO board reports, so the JVS state is
+         * wire-correct.  GearUp/GearDown stay on PLAYER_2 for compatibility with
+         * existing controls.ini files and drive the sequential shifter. */
         gJvsMap[PLAYER_1][LA_Up] = (JVSActionMapping){JVS_CALL_SWITCH, BUTTON_3};
         gJvsMap[PLAYER_1][LA_Down] = (JVSActionMapping){JVS_CALL_SWITCH, BUTTON_4};
         gJvsMap[PLAYER_1][LA_Left] = (JVSActionMapping){JVS_CALL_SWITCH, BUTTON_5};
@@ -637,32 +609,16 @@ void remapPerGame()
         // reads as start is wired to the service line.
         gJvsMap[PLAYER_1][LA_Start] = (JVSActionMapping){JVS_CALL_SWITCH, BUTTON_SERVICE};
 
-        /*
-         * The DRIVING default puts CardInsert on PLAYER_1 BUTTON_UP, which on
-         * N2 is the shifter, so the card key would shift gears. WMMT3 reads
-         * its card through /dev/ttyM2 and has no JVS card switch at all.
-        */
+        /* The DRIVING default puts CardInsert on the switch N2 uses for the
+         * shifter, and WMMT3 reads its card through /dev/ttyM2 anyway. */
         gJvsMap[PLAYER_1][LA_CardInsert] = (JVSActionMapping){JVS_CALL_NONE, NONE};
     }
     else if (gGrp == GROUP_MAXIMUM_HEAT_3D)
     {
-        /*
-         * Maximum Heat 3D's ES1 Jamma input is a distinct panel.
-         * clInputDeviceJamma::update() translates the player switch word into
-         * the button mask the game tests, and only these bits are translated:
-         *
-         *   SERVICE 0x4000 -> 0x020000   ENTER   0x0200 -> 0x010000
-         *   UP      0x2000 -> 0x040000   DOWN    0x1000 -> 0x080000
-         *   NITRO   0x0040 -> 0x400000   VIEW    0x0020 -> 0x200000
-         *   TEST is the system switch    -> 0x100000
-         *
-         * VIEW CHANGE is the cabinet's general "decide" button: besides the
-         * in-race camera it steps the test mode I/F INITIALIZE (STEERING &
-         * GAS) calibration, which is what writes testmode_if_initialize.bin.
-         * Without that file the game boots with a zeroed handle and accel
-         * calibration and divides by zero, pinning the wheel at full lock, so
-         * this mapping has to be right before anything else can be.
-         */
+        /* Maximum Heat 3D's ES1 Jamma panel: clInputDeviceJamma::update()
+         * translates only these switch bits.  VIEW CHANGE doubles as "decide"
+         * and steps the calibration that writes testmode_if_initialize.bin,
+         * without which the wheel boots pinned at full lock. */
         gJvsMap[PLAYER_1][LA_Service] = (JVSActionMapping){JVS_CALL_SWITCH, BUTTON_SERVICE};
         gJvsMap[PLAYER_1][LA_Enter] = (JVSActionMapping){JVS_CALL_SWITCH, BUTTON_1};
         gJvsMap[PLAYER_1][LA_TestUp] = (JVSActionMapping){JVS_CALL_SWITCH, BUTTON_UP};
@@ -670,25 +626,15 @@ void remapPerGame()
         gJvsMap[PLAYER_1][LA_ViewChange] = (JVSActionMapping){JVS_CALL_SWITCH, BUTTON_5};
         gJvsMap[PLAYER_1][LA_Nitro] = (JVSActionMapping){JVS_CALL_SWITCH, BUTTON_4};
 
-        /*
-         * The shipped ES1 cabinet has a brake switch rather than a third
-         * potentiometer, which the game selects with STR_BRAKE_DIGITAL in
-         * data/csv/config.csv.  With it set, clInputDeviceJamma::update()
-         * ignores analogue channel 3 entirely and takes the brake from switch
-         * bit 0x0080 of the player word, so the DRIVING default of ANALOGUE_3
-         * would never be read.  A pedal is bound through the axis' digital
-         * mode to close the switch.
-         */
+        /* With STR_BRAKE_DIGITAL set in data/csv/config.csv the cabinet takes the
+         * brake from switch bit 0x0080 and ignores analogue channel 3, so a pedal
+         * has to close that switch through the axis' digital mode. */
         gJvsMap[PLAYER_1][LA_Brake] = (JVSActionMapping){JVS_CALL_SWITCH, BUTTON_3};
         gJvsMap[PLAYER_1][LA_Brake_Digital] = (JVSActionMapping){JVS_CALL_SWITCH, BUTTON_3};
 
-        /*
-         * 2D/3D CHANGE has no switch yet. It used to sit on BUTTON_2, which
-         * update() does not translate at all, so the binding did nothing. The
-         * remaining translated bits are BUTTON_6..BUTTON_9, which the game only
-         * ever reads as the single group 0xF000, and BUTTON_10; the test mode
-         * SWITCH TEST screen is what settles which one the panel uses.
-         */
+        /* 2D/3D CHANGE has no switch yet: update() does not translate BUTTON_2,
+         * and the remaining candidates need the test mode SWITCH TEST screen to
+         * settle which one the panel uses. */
         gJvsMap[PLAYER_1][LA_3DChange] = (JVSActionMapping){JVS_CALL_NONE, NONE};
         gJvsMap[PLAYER_1][LA_Keypad1] = (JVSActionMapping){JVS_CALL_KEYPAD, KEYPAD_1};
         gJvsMap[PLAYER_1][LA_Keypad2] = (JVSActionMapping){JVS_CALL_KEYPAD, KEYPAD_2};
@@ -742,11 +688,8 @@ void remapPerGame()
     }
 }
 
-/**
- * @brief Initializes special properties for certain logical actions.
- * For example, it defines which analog actions should auto-center (like a joystick)
- * and which should not (like a gas pedal).
- */
+/* Per-action properties, such as which analogue actions auto-centre like a stick
+ * and which rest at zero like a pedal. */
 void initActionProperties()
 {
     for (int p = 0; p < MAX_ENTITIES; p++)
@@ -769,7 +712,7 @@ void initActionProperties()
         gActionProperties[p][LA_CardInsert].isToggle = true;
         gActionProperties[p][LA_Card1Insert].isToggle = true;
         gActionProperties[p][LA_Card2Insert].isToggle = true;
-        if (gGrp == GROUP_WMMT3)
+        if (gGrp == GROUP_WMMT3 || gGrp == GROUP_WMMT4_ES1)
         {
             // YaCardEmu controls are commands, not persistent JVS switches.
             gActionProperties[p][LA_CardInsert].isToggle = false;
@@ -780,13 +723,8 @@ void initActionProperties()
     gActionProperties[PLAYER_1][LA_Throttle].isCentering = true;
 }
 
-/**
- * @brief Adds a new control binding to the appropriate lookup table.
- * It also checks for and reports any conflicts where a single physical input
- * is mapped to two different logical actions. For axes, it allows up to two
- * bindings to support split-axis configurations.
- * @param binding The ControlBinding to add.
- */
+/* Adds a binding and reports conflicts.  Axes accept two bindings so a
+ * split-axis configuration can use both halves. */
 void addBinding(ControlBinding binding)
 {
     char name1[128], name2[128];
@@ -963,10 +901,7 @@ void addBinding(ControlBinding binding)
     }
 }
 
-/**
- * @brief Applies the default control mappings if controls.ini is not found.
- * Iterates through the default binding arrays and adds them to the system.
- */
+/* Applies the built-in bindings when controls.ini is absent. */
 void setDefaultMappings()
 {
     log_warn("Applying default mappings...\n");
@@ -981,7 +916,7 @@ void setDefaultMappings()
     const ControlBinding *game_bindings = NULL;
     size_t bindingsCount = 0;
 
-    if (gGrp == GROUP_WMMT3)
+    if (gGrp == GROUP_WMMT3 || gGrp == GROUP_WMMT4_ES1)
     {
         game_bindings = gDefaultWmmtBindings;
         bindingsCount = gDefaultWmmtBindingsSize;
@@ -1026,13 +961,8 @@ void setDefaultMappings()
     }
 }
 
-/**
- * @brief Parses a single input source string (e.g., "KEY_A", "JOY0_AXIS_0_NEGATIVE")
- * and creates a ControlBinding for it.
- * @param token The string token representing the physical input.
- * @param player The player this binding belongs to.
- * @param action The logical action this input should trigger.
- */
+/* Turns one input token - "KEY_A", "JOY0_AXIS_0_NEGATIVE" and so on - into a
+ * ControlBinding for this player and action. */
 void parseSdlSource(const char *token, JVSPlayer player, LogicalAction action, int comboGroupId, int comboInputIndex)
 {
     ControlBinding map;
@@ -1186,12 +1116,7 @@ void parseSdlSource(const char *token, JVSPlayer player, LogicalAction action, i
         addBinding(map);
 }
 
-/**
- * @brief Finds the internal player-centric index for a GameController from an SDL_JoystickID.
- * The internal index (0, 1, 2...) corresponds to the player number (P1, P2, P3...).
- * @param instance_id The SDL_JoystickID from an SDL_Event.
- * @return The internal player-centric index, or -1 if not found.
- */
+/* Player index for a GameController, or -1 when the id is not one of ours. */
 int getControllerID(SDL_JoystickID instance_id)
 {
     for (int i = 0; i < MAX_JOYSTICKS; i++)
@@ -1206,11 +1131,7 @@ int getControllerID(SDL_JoystickID instance_id)
     return -1;
 }
 
-/**
- * @brief Finds the internal player-centric index for a raw Joystick from an SDL_JoystickID.
- * @param instance_id The SDL_JoystickID from an SDL_Event.
- * @return The internal player-centric index, or -1 if not found.
- */
+/* Player index for a raw joystick, or -1 when the id is not one of ours. */
 int getJoystickID(SDL_JoystickID instance_id)
 {
     for (int i = 0; i < MAX_JOYSTICKS; i++)
@@ -1224,13 +1145,8 @@ int getJoystickID(SDL_JoystickID instance_id)
     return -1;
 }
 
-/**
- * @brief Applies game-specific logic to determine the correct player for an action.
- * Some actions are hardcoded to a specific player (e.g., P2_GearUp).
- * @param action The logical action being assigned.
- * @param player The player parsed from the INI file.
- * @return The corrected JVSPlayer.
- */
+/* Corrects the player for actions the cabinet wires to a fixed one, such as
+ * the shifter paddles. */
 JVSPlayer fixPlayerForAction(LogicalAction action, int player)
 {
     if (action == LA_Boost)
@@ -1242,11 +1158,7 @@ JVSPlayer fixPlayerForAction(LogicalAction action, int player)
     return (JVSPlayer)player;
 }
 
-/**
- * @brief Determines if a Mahjong action belongs to Player 2.
- * @param action The logical action to check.
- * @return True if it's a Player 2 mahjong action, false otherwise.
- */
+/* True for the mahjong actions that belong to player 2. */
 bool isMahjongP2(LogicalAction action)
 {
     switch (action)
@@ -1267,10 +1179,7 @@ bool isMahjongP2(LogicalAction action)
     }
 }
 
-/**
- * @brief Loads and applies all control bindings from a given INI section.
- * @param section Pointer to the IniSection to parse.
- */
+/* Loads every binding in one INI section. */
 static void parseAndApplyBindings(const char *value, JVSPlayer player, LogicalAction action)
 {
     char *value_copy = strdup(value);
@@ -1340,12 +1249,8 @@ int loadProfileFromIni(const IniSection *section)
 
     for (int i = 0; i < section->numPairs; i++)
     {
-        /*
-         * Maximum Heat 3D's cabinet TEST switch is a mode selector in the
-         * legacy ES1/N2 input path: once the test screen is entered, the
-         * switch must remain asserted until the next TEST press. Keep this
-         * setting profile-local so it cannot alter N2 or other games.
-         */
+        /* Maximum Heat 3D's TEST switch is a mode selector: it stays asserted
+         * until the next press.  Kept profile-local so no other title sees it. */
         if (strcmp(section->name, "MaximumHeat3D") == 0 &&
             strcmp(section->pairs[i].key, "TestToggle") == 0)
         {
@@ -1384,11 +1289,7 @@ int loadProfileFromIni(const IniSection *section)
     return 1;
 }
 
-/**
- * @brief Loads global configuration settings from the [Config] section of the INI.
- * This now includes loading saved controller GUIDs for player mapping.
- * @param ini Pointer to the loaded IniConfig.
- */
+/* Loads the [Config] section, including the saved controller GUIDs. */
 int getShifterGears(void)
 {
     return gShifterGears;
@@ -1559,13 +1460,8 @@ void loadGlobalConfig(const IniConfig *ini)
     }
 }
 
-/**
- * @brief Adds an action to a list of "dirty" actions that need processing.
- * This prevents redundant processing if an action's state changes multiple
- * times between frames.
- * @param player The player associated with the action.
- * @param action The action that has changed state.
- */
+/* Queues an action for the frame-end pass, so several changes between frames
+ * cost one update rather than several. */
 void addActionToDirtyList(JVSPlayer player, LogicalAction action)
 {
     for (int i = 0; i < gNumChangedActions; i++)
@@ -1592,6 +1488,8 @@ void updateBindingState(ControlBinding *binding, bool isActive, float analogValu
             {
                 state->isActive = !state->isActive;
                 state->analogValue = state->isActive ? 1.0f : 0.0f;
+                if (state->isActive)
+                    state->lastActivatedAt = SDL_GetTicks();
                 addActionToDirtyList(binding->player, binding->action);
             }
             state->isPhysicalActive = isActive;
@@ -1602,6 +1500,8 @@ void updateBindingState(ControlBinding *binding, bool isActive, float analogValu
             {
                 state->isActive = isActive;
                 state->analogValue = analogValue;
+                if (isActive)
+                    state->lastActivatedAt = SDL_GetTicks();
                 addActionToDirtyList(binding->player, binding->action);
             }
         }
@@ -1624,6 +1524,8 @@ void updateBindingState(ControlBinding *binding, bool isActive, float analogValu
                 {
                     state->isActive = !state->isActive;
                     state->analogValue = state->isActive ? 1.0f : 0.0f;
+                    if (state->isActive)
+                        state->lastActivatedAt = SDL_GetTicks();
                     addActionToDirtyList(combo->player, combo->action);
                 }
                 state->isPhysicalActive = actionActive;
@@ -1634,6 +1536,8 @@ void updateBindingState(ControlBinding *binding, bool isActive, float analogValu
                 {
                     state->isActive = actionActive;
                     state->analogValue = actionActive ? 1.0f : 0.0f;
+                    if (actionActive)
+                        state->lastActivatedAt = SDL_GetTicks();
                     addActionToDirtyList(combo->player, combo->action);
                 }
             }
@@ -1641,12 +1545,23 @@ void updateBindingState(ControlBinding *binding, bool isActive, float analogValu
     }
 }
 
-/**
- * @brief Processes an SDL event and updates internal action states.
- * This is the main event handling function. It checks the event type and
- * updates the internal state of the corresponding logical action.
- * @param e Pointer to the SDL_Event to process.
- */
+bool isActionActiveOrRecentlyPressed(JVSPlayer player, LogicalAction action,
+                                     Uint64 minimumPulseMs)
+{
+    if (player < SYSTEM || player >= MAX_ENTITIES ||
+        action < 0 || action >= NUM_LOGICAL_ACTIONS)
+        return false;
+
+    const ActionState *state = &gActionStates[player][action];
+    if (state->isActive)
+        return true;
+    if (state->lastActivatedAt == 0 || minimumPulseMs == 0)
+        return false;
+
+    return SDL_GetTicks() - state->lastActivatedAt < minimumPulseMs;
+}
+
+/* Main event handler: maps one SDL event onto the logical action it drives. */
 void processSdlEvent(const SDL_Event *e)
 {
 #ifdef __linux__
@@ -2113,25 +2028,14 @@ void processSdlEvent(const SDL_Event *e)
         break;
     }
 
-    /*
-     * Apply digital input transitions immediately. The normal frame-end
-     * flush can otherwise collapse a quick press and release into a single
-     * inactive state when both SDL events are queued in the same frame. This
-     * matters for cabinet switches such as ES1's TEST input, which the game
-     * samples through JVS rather than through SDL itself.
-     */
+    /* Apply digital transitions at once: the frame-end flush would collapse a
+     * press and release queued in the same frame into nothing, which cabinet
+     * switches such as ES1's TEST would then never see. */
     if (sdlInputInitialized && gNumChangedActions > 0)
         processChangedActions();
 }
 
-/**
- * @brief Helper function to scan a pair of axis bindings and update detection flags.
- * @param pair The BindingPair to scan.
- * @param has_full_axis Array to track actions with full axis bindings.
- * @param has_half_axis Array to track actions with half axis bindings.
- * @param has_positive Array to track actions with positive half bindings.
- * @param has_negative Array to track actions with negative half bindings.
- */
+/* Scans one axis binding pair and records which halves it covers. */
 static void scan_axis_bindings(BindingPair *pair, bool hasFullAxis[], bool hasHalfSxis[], bool hasPositive[][NUM_LOGICAL_ACTIONS],
                                bool hasNegative[][NUM_LOGICAL_ACTIONS])
 {
@@ -2158,12 +2062,8 @@ static void scan_axis_bindings(BindingPair *pair, bool hasFullAxis[], bool hasHa
     }
 }
 
-/**
- * @brief Scans all loaded bindings to detect combined axes and potential conflicts.
- * It checks if any logical action is bound to both a full axis (like a stick)
- * and a half-axis (like a trigger), which would cause a conflict. It then flags
- * actions that are correctly configured as combined axes.
- */
+/* Flags actions built from two half-axes, and reports the ones bound to both a
+ * full axis and a half-axis, which cannot work. */
 void detectCombinedAxes()
 {
     // --- Use local variables for detection ---
@@ -2217,11 +2117,7 @@ void detectCombinedAxes()
     }
 }
 
-/**
- * @brief Updates the analog value for any action flagged as a combined axis.
- * This is called every frame to calculate a single analog value from the
- * positive and negative contributions of two separate half-axes.
- */
+/* Combines the two half-axis contributions of a combined axis into one value. */
 void updateCombinedAxes()
 {
     for (int p = PLAYER_1; p <= MAX_PLAYERS; p++)
@@ -2247,11 +2143,7 @@ void updateCombinedAxes()
     }
 }
 
-/**
- * @brief Processes all actions that have changed state since the last frame.
- * It iterates through the "dirty list", reads the current state of each action,
- * and sends the appropriate update to the JVS IO board.
- */
+/* Sends every action queued since the last frame to the JVS I/O board. */
 void processChangedActions()
 {
     for (int i = 0; i < gNumChangedActions; i++)
@@ -2368,13 +2260,8 @@ void processChangedActions()
     gNumChangedActions = 0; // Clear the list for the next frame
 }
 
-/**
- * @brief Calculates and updates the gun shake effect for HOD4.
- * This function is called every frame for games that support it.
- * The direction threshold is based on the game's native resolution
- * (blitWidth/blitHeight) to ensure consistent sensitivity regardless
- * of window size, screen resolution, or letterboxing.
- */
+/* HOD4 gun shake.  The direction threshold is in the game's native resolution
+ * so sensitivity does not follow the window size or letterboxing. */
 void updateGunShake()
 {
     // Screen fraction threshold — a direct fraction of the game's native resolution.
@@ -2401,10 +2288,9 @@ void updateGunShake()
         int currentDirY = (deltaY > thresholdY) ? 1 :
                           ((deltaY < -thresholdY) ? -1 : 0);
 
-        // Accumulate shake on direction reversal.
-        // Multiply by jvsAnalogueMaxValue to maintain the existing scale
-        // for ShakeIncreaseRate (since deltas are now in 0-1 normalized space
-        // instead of 0-jvsAnalogueMaxValue JVS unit space).
+        // Accumulate shake on direction reversal.  Deltas are normalised now,
+        // so scale by jvsAnalogueMaxValue to keep ShakeIncreaseRate meaning
+        // what it did in JVS units.
         if (currentDirX != 0 && currentDirX == -gLastGunXDir[p])
             gShakeValue[p] += fabsf(deltaX) * gShakeIncreaseRate * jvsAnalogueMaxValue;
 
@@ -2445,10 +2331,7 @@ void updateGunShake()
     }
 }
 
-/**
- * @brief Saves the controller GUIDs back to controls.ini if they have changed.
- * This is called during initialization if a new controller was assigned to a player.
- */
+/* Writes the controller GUIDs back to controls.ini when a new pad was assigned. */
 void saveGuidsToIni()
 {
     if (!gPlayerGUIDsDirty)
@@ -2567,13 +2450,7 @@ bool needsPlayer(LogicalAction action, const char *name)
     }
 }
 
-/**
- * @brief Helper to get the full "P1_Action" string for a binding.
- * Used for creating user-friendly error messages.
- * @param binding Pointer to the ControlBinding.
- * @param out_str Buffer to store the resulting string.
- * @param str_size Size of the output buffer.
- */
+/* Renders a binding as "P1_Action" for error messages. */
 void getLogicalActionString(const ControlBinding *binding, char *outStr, size_t strSize, const char *name)
 {
     const char *actionName = "Unknown";

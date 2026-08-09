@@ -4,6 +4,8 @@
 
 #include "pthreadEmu.hpp"
 #include "pthreadInternal.hpp"
+#include "../guestTls.hpp"
+#include "../../log/log.h"
 #include <process.h>
 
 // ============================================================
@@ -58,6 +60,10 @@ static unsigned __stdcall ThreadEntryPoint(void* param) {
     PthreadThreadInternal* thread_info = ctx->thread_info;
     const uint32_t linux_tid = ctx->linux_tid;
 
+    log_debug("pthread thread start: linux_tid=%u win_tid=%lu routine=%p arg=%p",
+              linux_tid, static_cast<unsigned long>(GetCurrentThreadId()),
+              reinterpret_cast<void *>(start_routine), arg);
+
     /* Register before entering guest code.  Otherwise pthread_self() on a
      * newly-created thread allocates a second, detached mapper entry while
      * the creator still owns the original pthread object. */
@@ -67,6 +73,13 @@ static unsigned __stdcall ThreadEntryPoint(void* param) {
     
     // Setup cancel state for this thread
     SetupCancelState();
+
+    if (!GuestTls::InstallForCurrentThread())
+    {
+        if (thread_info)
+            thread_info->exited = 1;
+        return 0;
+    }
 
     // Call the actual thread function
     void* retval = start_routine(arg);
@@ -158,7 +171,7 @@ int PthreadEmu::pthreadAttrGetstacksize(const void* attr, size_t* stacksize) {
 // ============================================================
 
 int PthreadEmu::pthreadCreate(void* thread, const void* attr,
-                                void* (*start_routine)(void*), void* arg) {
+                                 void* (*start_routine)(void*), void* arg) {
     if (!thread || !start_routine) return LINUX_EINVAL;
     
     // Create thread info
@@ -175,6 +188,8 @@ int PthreadEmu::pthreadCreate(void* thread, const void* attr,
     
     thread_info->start_routine = start_routine;
     thread_info->arg = arg;
+
+    log_debug("pthread_create: routine=%p arg=%p", reinterpret_cast<void *>(start_routine), arg);
     
     // Get stack size from attributes
     size_t stack_size = 0;
@@ -252,6 +267,53 @@ int PthreadEmu::pthreadJoin(uint32_t thread, void** retval) {
     PthreadMapper::DestroyThread(thread);
     
     return 0;
+}
+
+/* Shared by the timed and non-blocking joins: everything about a join except
+ * how long it is prepared to wait. */
+static int joinWithTimeout(uint32_t thread, void** retval, DWORD timeout_ms) {
+    PthreadThreadInternal* thread_info = PthreadMapper::FindThread(thread);
+    if (!thread_info) {
+        return LINUX_ESRCH;
+    }
+
+    if (thread_info->detached) {
+        return LINUX_EINVAL;
+    }
+
+    if (GetCurrentThreadId() == thread_info->win_thread_id) {
+        return LINUX_EDEADLK;
+    }
+
+    DWORD result = WaitForSingleObject(thread_info->handle, timeout_ms);
+    if (result == WAIT_TIMEOUT) {
+        return LINUX_EBUSY;
+    }
+    if (result != WAIT_OBJECT_0) {
+        return LINUX_EINVAL;
+    }
+
+    if (retval) {
+        *retval = thread_info->retval;
+    }
+
+    PthreadMapper::DestroyThread(thread);
+    return 0;
+}
+
+int PthreadEmu::pthreadTimedjoin(uint32_t thread, void** retval,
+                                    const struct timespec* abstime) {
+    if (!abstime) {
+        return pthreadJoin(thread, retval);
+    }
+
+    const int result = joinWithTimeout(thread, retval, TimespecToMilliseconds(abstime));
+    /* POSIX spells a timed-out join ETIMEDOUT; only tryjoin reports EBUSY. */
+    return result == LINUX_EBUSY ? LINUX_ETIMEDOUT : result;
+}
+
+int PthreadEmu::pthreadTryjoin(uint32_t thread, void** retval) {
+    return joinWithTimeout(thread, retval, 0);
 }
 
 int PthreadEmu::pthreadDetach(uint32_t thread) {

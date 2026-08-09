@@ -296,6 +296,28 @@ extern "C"
         return needed;
     }
 
+    float bridgeStrtof_l(const char *text, char **end, void *)
+    {
+        return std::strtof(text, end);
+    }
+
+    double bridgeStrtod_l(const char *text, char **end, void *)
+    {
+        return std::strtod(text, end);
+    }
+
+    long double bridgeStrtold_l(const char *text, char **end, void *)
+    {
+        return std::strtold(text, end);
+    }
+
+    void *bridgeDuplocale(void *locale)
+    {
+        /* Locale objects are immutable C-locale placeholders in the bridge,
+         * so sharing one is equivalent to duplicating it. */
+        return locale ? locale : LibcBridge::bridgeNewlocale(0, "C", nullptr);
+    }
+
     /*
      * mmap64 differs from mmap only in taking a 64-bit offset, which arrives as
      * two stack words.  Nothing the guest maps is beyond 2 GB into a file, so
@@ -600,11 +622,20 @@ namespace PosixCompatBridge
         MAP("__strxfrm_l", bridgeStrxfrm_l);
         MAP("strcoll_l", bridgeStrcoll_l);
         MAP("strxfrm_l", bridgeStrxfrm_l);
+        MAP("strtof_l", bridgeStrtof_l);
+        MAP("__strtof_l", bridgeStrtof_l);
+        MAP("strtod_l", bridgeStrtod_l);
+        MAP("__strtod_l", bridgeStrtod_l);
+        MAP("strtold_l", bridgeStrtold_l);
+        MAP("__strtold_l", bridgeStrtold_l);
+        MAP("duplocale", bridgeDuplocale);
+        MAP("__duplocale", bridgeDuplocale);
         MAP("__wcscoll_l", LibcBridge::bridgeWcscoll_l);
         MAP("__wcsxfrm_l", LibcBridge::bridgeWcsxfrm_l);
         MAP("__towlower_l", LibcBridge::bridgeTowlower_l);
         MAP("__towupper_l", LibcBridge::bridgeTowupper_l);
         MAP("nl_langinfo_l", LibcBridge::bridgeNlLanginfo);
+        MAP("__nl_langinfo_l", LibcBridge::bridgeNlLanginfo);
 
         MAP("mmap64", bridgeMmap64);
         MAP("timegm", bridgeTimegm);

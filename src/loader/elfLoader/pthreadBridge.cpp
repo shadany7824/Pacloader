@@ -7,12 +7,18 @@
 
 #define MAP(name, func) SymbolResolver::GetInstance().RegisterVTable(name, reinterpret_cast<void *>(func))
 
+extern "C" int bridgePthreadAttrGetschedparam(const void *attr, void *param);
+extern "C" int bridgePthreadAttrSetstack(void *attr, void *stack, size_t stackSize);
+extern "C" void bridgePthreadRegisterCancel(void *unwindBuffer);
+extern "C" void bridgePthreadUnwindNext(void *unwindBuffer);
+
 namespace PthreadBridge
 {
 
     extern "C"
     {
         int emuSemInit(void *sem, int pshared, unsigned int value);
+        int emuSemTimedwait(void *sem, const struct timespec *abs_timeout);
         int emuSemDestroy(void *sem);
         int emuSemWait(void *sem);
         int emuSemTrywait(void *sem);
@@ -38,6 +44,10 @@ namespace PthreadBridge
         int bridge_sem_trywait(void *sem)
         {
             return emuSemTrywait(sem);
+        }
+        int bridge_sem_timedwait(void *sem, const struct timespec *abs_timeout)
+        {
+            return emuSemTimedwait(sem, abs_timeout);
         }
         int bridge_sem_post(void *sem)
         {
@@ -71,6 +81,13 @@ namespace PthreadBridge
         // Thread functions
         MAP("pthread_create", PthreadEmu::pthreadCreate);
         MAP("pthread_join", PthreadEmu::pthreadJoin);
+        MAP("pthread_timedjoin_np", PthreadEmu::pthreadTimedjoin);
+        MAP("pthread_tryjoin_np", PthreadEmu::pthreadTryjoin);
+        MAP("pthread_yield", PthreadEmu::schedYield);
+        /* CPU affinity is not emulated; accept and ignore, as reporting
+         * failure makes callers treat the thread as unusable. */
+        MAP("pthread_setaffinity_np", LibcBridge::bridgeStubSuccess);
+        MAP("pthread_attr_setaffinity_np", LibcBridge::bridgeStubSuccess);
         MAP("pthread_detach", PthreadEmu::pthreadDetach);
         MAP("pthread_exit", PthreadEmu::pthreadExit);
         MAP("pthread_self", PthreadEmu::pthreadSelf);
@@ -85,6 +102,15 @@ namespace PthreadBridge
         MAP("_pthread_cleanup_push_defer", LibcBridge::bridgeStubSuccess);
         MAP("_pthread_cleanup_pop_restore", LibcBridge::bridgeStubSuccess);
 
+        /* glibc emits these around cancellable calls to register the unwind
+         * buffer.  Cancellation is not emulated so they have nothing to do, but
+         * they must resolve or the unresolved-symbol stub aborts the title. */
+        MAP("__pthread_register_cancel", bridgePthreadRegisterCancel);
+        MAP("__pthread_unregister_cancel", bridgePthreadRegisterCancel);
+        MAP("__pthread_register_cancel_defer", bridgePthreadRegisterCancel);
+        MAP("__pthread_unregister_cancel_restore", bridgePthreadRegisterCancel);
+        MAP("__pthread_unwind_next", bridgePthreadUnwindNext);
+
         // The pre-POSIX name for pthread_mutexattr_settype.
         MAP("pthread_mutexattr_setkind_np", PthreadEmu::pthreadMutexattrSettype);
 
@@ -95,6 +121,8 @@ namespace PthreadBridge
         MAP("pthread_attr_getstacksize", PthreadEmu::pthreadAttrGetstacksize);
         MAP("pthread_attr_setdetachstate", PthreadEmu::pthreadAttrSetdetachstate);
         MAP("pthread_attr_getdetachstate", PthreadEmu::pthreadAttrGetdetachstate);
+        MAP("pthread_attr_getschedparam", bridgePthreadAttrGetschedparam);
+        MAP("pthread_attr_setstack", bridgePthreadAttrSetstack);
 
         // Scheduling
         MAP("pthread_setschedparam", PthreadEmu::pthreadSetSchedparam);
@@ -164,6 +192,7 @@ namespace PthreadBridge
         MAP("sem_destroy", bridge_sem_destroy);
         MAP("sem_wait", bridge_sem_wait);
         MAP("sem_trywait", bridge_sem_trywait);
+        MAP("sem_timedwait", bridge_sem_timedwait);
         MAP("sem_post", bridge_sem_post);
         MAP("sem_getvalue", bridge_sem_getvalue);
         MAP("sem_open", bridge_sem_open);
@@ -176,12 +205,43 @@ namespace PthreadBridge
     }
 } // namespace PthreadBridge
 
+extern "C" void bridgePthreadRegisterCancel(void *unwindBuffer)
+{
+    /* No cancellation support, so there is no unwind buffer stack to keep. */
+    (void)unwindBuffer;
+}
+
+extern "C" void bridgePthreadUnwindNext(void *unwindBuffer)
+{
+    /* In glibc this never returns: it resumes unwinding a cancelled thread.
+     * Reaching it here means a guest really did try to cancel, which the
+     * emulation cannot honour - say so rather than silently carry on. */
+    (void)unwindBuffer;
+    log_warn("pthread: __pthread_unwind_next called; thread cancellation is not emulated");
+}
+
 extern "C" int bridgeSchedGetPriorityMax(int policy)
 {
     return 99;
 }
 extern "C" int bridgeSchedGetPriorityMin(int policy)
 {
+    return 0;
+}
+
+extern "C" int bridgePthreadAttrGetschedparam(const void *attr, void *param)
+{
+    (void)attr;
+    if (param)
+        *static_cast<int *>(param) = 0;
+    return 0;
+}
+
+extern "C" int bridgePthreadAttrSetstack(void *attr, void *stack, size_t stackSize)
+{
+    (void)attr;
+    (void)stack;
+    (void)stackSize;
     return 0;
 }
 

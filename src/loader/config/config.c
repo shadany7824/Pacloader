@@ -10,7 +10,9 @@
 #include "../mainShared.h"
 #if defined(_WIN32) || defined(__MINGW32__)
 #include "../hardware/namco/es1/es1.h"
+#include "../hardware/namco/es1/es1Title.h"
 #include "../hardware/namco/n2/n2.h"
+#include "../hardware/namco/n2/n2Title.h"
 #endif
 
 EmulatorConfig config = {0};
@@ -42,13 +44,13 @@ static int detectGame(uint32_t elf_crc)
         config.gameID = (char *)es1GetGameId();
         config.gameStatus = NOT_WORKING;
         config.jvsIOType = NAMCO_ES1_TYPE;
-        config.region = US;
-        config.gameReleaseYear = (char *)"2009";
+        config.region = es1CurrentTitle()->region;
+        config.gameReleaseYear = (char *)es1CurrentTitle()->releaseYear;
         config.gameNativeResolutions = (char *)"1360x768";
         config.gameType = DRIVING;
         config.width = 1360;
         config.height = 768;
-        config.gameGroup = GROUP_MAXIMUM_HEAT_3D;
+        config.gameGroup = es1CurrentTitle()->group;
         log_warn("System ES1 support is experimental: cabinet I/O is emulated by Pacloader");
         return 0;
     }
@@ -63,26 +65,12 @@ static int detectGame(uint32_t elf_crc)
         config.gameStatus = WORKING;
         config.jvsIOType = NAMCO_N2_TYPE;
         config.region = JP;
-
-        if (n2GetGame() == N2_GAME_CSNEO)
-        {
-            // Counter-Strike Neo has no JVIO board of its own to answer to.
-            config.jvsIOType = NAMCO_N2_TYPE;
-            config.gameReleaseYear = (char *)"2005";
-            config.gameNativeResolutions = (char *)"1024x768";
-            config.gameType = SHOOTING;
-            config.width = 1024;
-            config.height = 768;
-            config.gameGroup = GROUP_UNKNOWN;
-            return 0;
-        }
-
-        config.gameReleaseYear = n2GetGame() == N2_GAME_WMMT3DX_PLUS ? (char *)"2010" : (char *)"";
-        config.gameNativeResolutions = (char *)"640x480";
-        config.gameType = DRIVING;
-        config.width = 640;
-        config.height = 480;
-        config.gameGroup = GROUP_WMMT3;
+        config.gameReleaseYear = (char *)n2CurrentTitle()->releaseYear;
+        config.gameNativeResolutions = (char *)n2CurrentTitle()->nativeResolutions;
+        config.gameType = n2CurrentTitle()->type;
+        config.width = n2CurrentTitle()->width;
+        config.height = n2CurrentTitle()->height;
+        config.gameGroup = n2CurrentTitle()->group;
         return 0;
     }
 #endif
@@ -142,6 +130,26 @@ void setDefaultValues(EmulatorConfig *cfg)
     cfg->namcoES1.dongleEnabled = 1;
     cfg->namcoES1.serialDiagnostics = 0;
     cfg->namcoES1.emulateJamma = 1;
+    cfg->namcoES1.cabinetMode = NAMCO_ES1_CABINET_DRIVE;
+    cfg->namcoES1.terminalEmulatorEnabled = 1;
+    strcpy(cfg->namcoES1.dnsNbgiLoc, "");
+    strcpy(cfg->namcoES1.dnsTenporouterLoc, "");
+    strcpy(cfg->namcoES1.dnsBbrouterLoc, "");
+    strcpy(cfg->namcoES1.dnsMuchaLocal, "");
+    strcpy(cfg->namcoES1.dnsNaominetJp, "");
+    /*
+     * Only the terminal cabinet has the magnetic card reader, and it reports
+     * E0611 when the reader does not answer, so try the YaCardEmu pipe by
+     * default just as N2 does.
+     */
+    cfg->namcoES1.card.enabled = 1;
+    cfg->namcoES1.card.autoStart = 0;
+    cfg->namcoES1.card.diagnostics = 0;
+    cfg->namcoES1.card.apiPort = 8080;
+    strcpy(cfg->namcoES1.card.executablePath, "");
+    strcpy(cfg->namcoES1.card.pipeName, "\\\\.\\pipe\\YACardEmu");
+    strcpy(cfg->namcoES1.card.apiHost, "127.0.0.1");
+    strcpy(cfg->namcoES1.card.cardName, "");
     strcpy(cfg->namcoN2.dongleId, "");
     strcpy(cfg->namcoN2.dongleId2, "");
     cfg->namcoN2.debugMode = 0;
@@ -201,6 +209,7 @@ void setDefaultValues(EmulatorConfig *cfg)
     strcpy(cfg->idCardFolder, "");
     cfg->emulateJVS = 1;
     cfg->fullscreen = 0;
+    cfg->alwaysOnTop = 0;
     strcpy(cfg->eepromPath, "eeprom.bin");
     strcpy(cfg->sramPath, "sram.bin");
     strcpy(cfg->libCgPath, "");
@@ -374,6 +383,49 @@ void applyIniConfig(EmulatorConfig *config, const IniConfig *ini)
         getInt(ini, "NamcoES1", "SERIAL_DIAGNOSTICS", config->namcoES1.serialDiagnostics);
     config->namcoES1.emulateJamma =
         getInt(ini, "NamcoES1", "EMULATE_JAMMA", config->namcoES1.emulateJamma);
+    config->namcoES1.terminalEmulatorEnabled =
+        getInt(ini, "NamcoES1", "TERMINAL_EMULATOR_ENABLED",
+               config->namcoES1.terminalEmulatorEnabled);
+    getString(ini, "NamcoES1", "DNS_NBGI_LOC", config->namcoES1.dnsNbgiLoc,
+              sizeof(config->namcoES1.dnsNbgiLoc));
+    getString(ini, "NamcoES1", "DNS_TENPOROUTER_LOC", config->namcoES1.dnsTenporouterLoc,
+              sizeof(config->namcoES1.dnsTenporouterLoc));
+    getString(ini, "NamcoES1", "DNS_BBROUTER_LOC", config->namcoES1.dnsBbrouterLoc,
+              sizeof(config->namcoES1.dnsBbrouterLoc));
+    getString(ini, "NamcoES1", "DNS_MUCHA_LOCAL", config->namcoES1.dnsMuchaLocal,
+              sizeof(config->namcoES1.dnsMuchaLocal));
+    getString(ini, "NamcoES1", "DNS_NAOMINET_JP", config->namcoES1.dnsNaominetJp,
+              sizeof(config->namcoES1.dnsNaominetJp));
+    {
+        char cabinetMode[32];
+        strcpy(cabinetMode, config->namcoES1.cabinetMode == NAMCO_ES1_CABINET_TERMINAL
+                                ? "terminal"
+                                : "drive");
+        getString(ini, "NamcoES1", "CABINET_MODE", cabinetMode, sizeof(cabinetMode));
+        toLowerCase(cabinetMode);
+        if (strcmp(cabinetMode, "terminal") == 0)
+            config->namcoES1.cabinetMode = NAMCO_ES1_CABINET_TERMINAL;
+        else if (strcmp(cabinetMode, "drive") == 0)
+            config->namcoES1.cabinetMode = NAMCO_ES1_CABINET_DRIVE;
+        else
+            log_warn("Unknown Namco ES1 CABINET_MODE '%s'; using DRIVE", cabinetMode);
+    }
+    config->namcoES1.card.enabled =
+        getInt(ini, "NamcoES1", "YACARDEMU_ENABLED", config->namcoES1.card.enabled);
+    config->namcoES1.card.autoStart =
+        getInt(ini, "NamcoES1", "YACARDEMU_AUTOSTART", config->namcoES1.card.autoStart);
+    getString(ini, "NamcoES1", "YACARDEMU_PATH", config->namcoES1.card.executablePath,
+              sizeof(config->namcoES1.card.executablePath));
+    getString(ini, "NamcoES1", "YACARDEMU_PIPE", config->namcoES1.card.pipeName,
+              sizeof(config->namcoES1.card.pipeName));
+    getString(ini, "NamcoES1", "YACARDEMU_API_HOST", config->namcoES1.card.apiHost,
+              sizeof(config->namcoES1.card.apiHost));
+    config->namcoES1.card.apiPort =
+        getInt(ini, "NamcoES1", "YACARDEMU_API_PORT", config->namcoES1.card.apiPort);
+    getString(ini, "NamcoES1", "YACARDEMU_CARD_NAME", config->namcoES1.card.cardName,
+              sizeof(config->namcoES1.card.cardName));
+    config->namcoES1.card.diagnostics =
+        getInt(ini, "NamcoES1", "YACARDEMU_DIAGNOSTICS", config->namcoES1.card.diagnostics);
 
     // [NamcoN2]
     getString(ini, "NamcoN2", "DONGLE_ID", config->namcoN2.dongleId,
@@ -470,6 +522,7 @@ void applyIniConfig(EmulatorConfig *config, const IniConfig *ini)
     config->height = getInt(ini, "Display", "HEIGHT", config->height);
     config->boostRenderRes = getInt(ini, "Display", "BOOST_RENDER_RES", config->boostRenderRes);
     config->fullscreen = getInt(ini, "Display", "FULLSCREEN", config->fullscreen);
+    config->alwaysOnTop = getInt(ini, "Display", "ALWAYS_ON_TOP", config->alwaysOnTop);
     config->borderEnabled = getInt(ini, "Display", "BORDER_ENABLED", config->borderEnabled);
 	config->whiteBorderPercentage = getFloat(ini, "Display", "WHITE_BORDER_PERCENTAGE", config->whiteBorderPercentage * 100.0f) / 100.0f;
 	config->blackBorderPercentage = getFloat(ini, "Display", "BLACK_BORDER_PERCENTAGE", config->blackBorderPercentage * 100.0f) / 100.0f;
@@ -638,6 +691,12 @@ int initConfig(const char *configFilePath)
         }
     }
     filePath[PATH_MAX - 1] = '\0';
+
+    /* No explicit file and no pacloader.ini in the working directory means
+     * "use defaults", not an attempt to open an empty filename. */
+    if (filePath[0] == '\0')
+        return 0;
+
     IniConfig *ini = iniLoad(filePath);
 
     if (ini == NULL)

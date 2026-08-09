@@ -1,5 +1,8 @@
 #pragma once
 
+/* Title id in the N2 title table. */
+#define N2_TITLE_ID_CSNEO "CSNEO"
+
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -9,6 +12,7 @@ extern "C" {
 // CS Neo uses a stripped launcher, so it is identified from its installation
 // layout before the ELF and engine module are loaded.
 int n2CsNeoLooksLikeGame(const char *elfPath);
+int n2CsNeoDetect(const char *elfPath);
 int n2CsNeoPrepareLoad(const char *elfPath);
 
 // Installs the title-specific compatibility layer after game detection.

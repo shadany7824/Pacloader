@@ -29,12 +29,8 @@ int createDefaultIni(const char *filePath)
     fprintf(file, "FFB_DIAGNOSTICS = %s\n\n",
             defaults.namcoN2.forceFeedbackDiagnostics ? "true" : "false");
 
-    fprintf(file, "[NamcoES1]\n");
-    fprintf(file, "CAMERA_ENABLED = %s\n", defaults.namcoES1.cameraEnabled ? "true" : "false");
-    fprintf(file, "DONGLE_ENABLED = %s\n", defaults.namcoES1.dongleEnabled ? "true" : "false");
-    fprintf(file, "SERIAL_DIAGNOSTICS = %s\n", defaults.namcoES1.serialDiagnostics ? "true" : "false");
-    fprintf(file, "EMULATE_JAMMA = %s\n\n", defaults.namcoES1.emulateJamma ? "true" : "false");
-
+    /* These are read from [NamcoN2] and so have to be written here; they used
+     * to sit under [NamcoES1], where nothing ever parsed them. */
     fprintf(file, "# YaCardEmu remains an external process.\n");
     fprintf(file, "YACARDEMU_ENABLED = %s\n", defaults.namcoN2.card.enabled ? "true" : "false");
     fprintf(file, "YACARDEMU_AUTOSTART = %s\n", defaults.namcoN2.card.autoStart ? "true" : "false");
@@ -64,8 +60,39 @@ int createDefaultIni(const char *filePath)
     fprintf(file, "BRAKE_RAW_MIN = %d\nBRAKE_RAW_MAX = %d\n\n",
             defaults.namcoN2.brake.minimum, defaults.namcoN2.brake.maximum);
 
+    fprintf(file, "[NamcoES1]\n");
+    fprintf(file, "CAMERA_ENABLED = %s\n", defaults.namcoES1.cameraEnabled ? "true" : "false");
+    fprintf(file, "DONGLE_ENABLED = %s\n", defaults.namcoES1.dongleEnabled ? "true" : "false");
+    fprintf(file, "SERIAL_DIAGNOSTICS = %s\n", defaults.namcoES1.serialDiagnostics ? "true" : "false");
+    fprintf(file, "EMULATE_JAMMA = %s\n", defaults.namcoES1.emulateJamma ? "true" : "false");
+    fprintf(file, "# DRIVE uses WMMT4 S/N 267610069420; TERMINAL uses 267611069420.\n");
+    fprintf(file, "CABINET_MODE = DRIVE\n");
+    fprintf(file, "# WMMT4 DRIVE only: supplies terminal settings and clock locally.\n");
+    fprintf(file, "TERMINAL_EMULATOR_ENABLED = %s\n\n",
+            defaults.namcoES1.terminalEmulatorEnabled ? "true" : "false");
+
+    fprintf(file, "# Optional WMMT4 hostname redirects; blank uses normal DNS.\n");
+    fprintf(file, "DNS_NBGI_LOC = \"%s\"\n", defaults.namcoES1.dnsNbgiLoc);
+    fprintf(file, "DNS_TENPOROUTER_LOC = \"%s\"\n", defaults.namcoES1.dnsTenporouterLoc);
+    fprintf(file, "DNS_BBROUTER_LOC = \"%s\"\n", defaults.namcoES1.dnsBbrouterLoc);
+    fprintf(file, "DNS_MUCHA_LOCAL = \"%s\"\n", defaults.namcoES1.dnsMuchaLocal);
+    fprintf(file, "DNS_NAOMINET_JP = \"%s\"\n\n", defaults.namcoES1.dnsNaominetJp);
+
+    fprintf(file, "# Magnetic card reader, for transferring WMMT3DX+ cards.\n");
+    fprintf(file, "# TERMINAL cabinets only; the drive cabinet has no reader.\n");
+    fprintf(file, "YACARDEMU_ENABLED = %s\n", defaults.namcoES1.card.enabled ? "true" : "false");
+    fprintf(file, "YACARDEMU_AUTOSTART = %s\n", defaults.namcoES1.card.autoStart ? "true" : "false");
+    fprintf(file, "YACARDEMU_PATH = \"%s\"\n", defaults.namcoES1.card.executablePath);
+    fprintf(file, "YACARDEMU_PIPE = \"%s\"\n", defaults.namcoES1.card.pipeName);
+    fprintf(file, "YACARDEMU_API_HOST = \"%s\"\n", defaults.namcoES1.card.apiHost);
+    fprintf(file, "YACARDEMU_API_PORT = %d\n", defaults.namcoES1.card.apiPort);
+    fprintf(file, "YACARDEMU_CARD_NAME = \"%s\"\n", defaults.namcoES1.card.cardName);
+    fprintf(file, "YACARDEMU_DIAGNOSTICS = %s\n\n",
+            defaults.namcoES1.card.diagnostics ? "true" : "false");
+
     fprintf(file, "[Display]\nWIDTH = AUTO\nHEIGHT = AUTO\n");
     fprintf(file, "FULLSCREEN = %s\n", defaults.fullscreen ? "true" : "false");
+    fprintf(file, "ALWAYS_ON_TOP = %s\n", defaults.alwaysOnTop ? "true" : "false");
     fprintf(file, "KEEP_ASPECT_RATIO = %s\n", defaults.keepAspectRatio ? "true" : "false");
     fprintf(file, "HIDE_CURSOR = %s\n\n", defaults.hideCursor ? "true" : "false");
 
