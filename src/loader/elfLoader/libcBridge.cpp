@@ -1347,6 +1347,13 @@ namespace LibcBridge
         long long start, current;
         QueryPerformanceCounter((LARGE_INTEGER *)&start);
 
+        /* Use a high-resolution timer for sub-millisecond guest sleeps. */
+        static thread_local HANDLE timer = CreateWaitableTimerExW(
+            nullptr, nullptr,
+            CREATE_WAITABLE_TIMER_MANUAL_RESET | CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+            TIMER_MODIFY_STATE | SYNCHRONIZE);
+        constexpr long long spinMarginUs = 300;
+
         while (true)
         {
             QueryPerformanceCounter((LARGE_INTEGER *)&current);
@@ -1356,14 +1363,26 @@ namespace LibcBridge
 
             long long remaining_us = ((wait_ticks - elapsed) * 1000000LL) / freq;
 
-            if (remaining_us > 2000)
+            if (remaining_us <= spinMarginUs)
             {
-                Sleep(1);
+                YieldProcessor();
+                continue;
             }
-            else if (remaining_us > 100)
+
+            if (timer)
             {
-                Sleep(0);
+                LARGE_INTEGER due;
+                due.QuadPart = -((remaining_us - spinMarginUs) * 10LL); /* 100 ns units. */
+                if (due.QuadPart >= 0)
+                    due.QuadPart = -1;
+                if (SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE))
+                {
+                    WaitForSingleObject(timer, INFINITE);
+                    continue;
+                }
             }
+
+            Sleep((DWORD)((remaining_us - spinMarginUs) / 1000));
         }
 
         return 0;

@@ -23,6 +23,7 @@ const char *platformName(void);
 void platformRegisterVirtualDevices(void);
 void platformRegisterCardControl(void);
 int platformRaiseNativeWindow(void *nativeWindow);
+void platformRememberWindowPosition(void *nativeWindow);
 
 #ifdef __cplusplus
 }

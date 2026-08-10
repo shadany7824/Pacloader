@@ -437,6 +437,10 @@ static FfbSteeringState pendingSteering;
 static int pendingValid;
 static int workerRunning;
 static void (*steeringPoll)(void);
+static Uint64 lastSteeringApplyTicks;
+
+/* Coalesce steering updates to one driver write per display frame. */
+static const Uint64 SteeringUpdateIntervalMs = 16;
 
 void sdlFfbSetSteeringPoll(void (*poll)(void))
 {
@@ -479,7 +483,24 @@ static int SDLCALL steeringWorkerMain(void *unused)
         SDL_UnlockMutex(steeringLock);
 
         if (havePending)
+        {
+            const Uint64 now = SDL_GetTicks();
+            const Uint64 elapsed = now - lastSteeringApplyTicks;
+            if (lastSteeringApplyTicks != 0 && elapsed < SteeringUpdateIntervalMs)
+                SDL_Delay((Uint32)(SteeringUpdateIntervalMs - elapsed));
+
+            /* Apply the newest state after the rate-limit delay. */
+            SDL_LockMutex(steeringLock);
+            if (pendingValid)
+            {
+                state = pendingSteering;
+                pendingValid = 0;
+            }
+            SDL_UnlockMutex(steeringLock);
+
             applySteeringNow(&state);
+            lastSteeringApplyTicks = SDL_GetTicks();
+        }
         else if (steeringPoll)
             steeringPoll();
     }
@@ -501,6 +522,7 @@ static void startSteeringWorker(void)
     }
 
     workerRunning = 1;
+    lastSteeringApplyTicks = 0;
     steeringWorker = SDL_CreateThread(steeringWorkerMain, "pacloader-ffb", NULL);
     if (!steeringWorker)
     {
@@ -521,6 +543,7 @@ static void stopSteeringWorker(void)
 
     SDL_WaitThread(steeringWorker, NULL);
     steeringWorker = NULL;
+    lastSteeringApplyTicks = 0;
 
     SDL_DestroyCondition(steeringSignal);
     SDL_DestroyMutex(steeringLock);

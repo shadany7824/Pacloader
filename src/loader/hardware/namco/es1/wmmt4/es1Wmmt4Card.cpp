@@ -1,11 +1,16 @@
 #include "es1Wmmt4Card.hpp"
 #include "../es1CompatLayer.h"
 #include "../../../../elfLoader/guestTls.hpp"
+#include "../../../../config/config.h"
 #include "../../../../log/log.h"
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <string>
+#include <windows.h>
 
 namespace
 {
@@ -26,6 +31,30 @@ constexpr int BanaMaximumDevices = 2;
 constexpr int BanaResultOk = 1;
 constexpr int BanaResultBadDevice = -100;
 constexpr int BanaStatusOk = 0;
+constexpr size_t BanaCardRecordSize = 168;
+constexpr size_t BanaChipIdOffset = 0x2c;
+constexpr size_t BanaAccessCodeOffset = 0x50;
+constexpr size_t BanaCardStringSize = 32;
+
+const std::array<uint8_t, BanaCardRecordSize> DefaultCardRecord = {
+    0x01, 0x01, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x92, 0x2e, 0x58, 0x32, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x7f, 0x5c, 0x97, 0x44, 0xf0, 0x88, 0x04, 0x00,
+    0x43, 0x26, 0x2c, 0x33, 0x00, 0x04, 0x06, 0x10, 0x30, 0x30, 0x30, 0x30,
+    0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30,
+    0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30,
+    0x30, 0x30, 0x30, 0x30, 0x00, 0x00, 0x00, 0x00, 0x30, 0x30, 0x30, 0x30,
+    0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30,
+    0x30, 0x30, 0x30, 0x30, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
+    0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x4e, 0x42, 0x47, 0x49, 0x43, 0x36, 0x00, 0x00, 0xfa, 0xe9, 0x69, 0x00,
+    0xf6, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+};
+
+std::array<uint8_t, BanaCardRecordSize> g_cardRecord = DefaultCardRecord;
+std::atomic<bool> g_cardLoaded{false};
 
 std::atomic<unsigned int> g_hookTraceMask{0};
 
@@ -37,6 +66,35 @@ void traceHook(unsigned int bit, const char *name)
         log_info("System ES1 WMMT4: %s hook invoked", name);
         std::fflush(stdout);
     }
+}
+
+std::string readCardValue(const char *key, const char *fallback)
+{
+    const char *file = getConfig()->namcoES1.icCard.cardFile;
+    char value[BanaCardStringSize] = {};
+    GetPrivateProfileStringA("Card", key, fallback, value, sizeof(value), file);
+    return value;
+}
+
+void loadCardRecord()
+{
+    if (g_cardLoaded.exchange(true, std::memory_order_acq_rel))
+        return;
+
+    g_cardRecord = DefaultCardRecord;
+    const std::string chipId = readCardValue(
+        "ChipId", "7F5C9744F111111143262C3300040610");
+    const std::string accessCode = readCardValue(
+        "AccessCode", "30764352518498791337");
+    std::memset(g_cardRecord.data() + BanaChipIdOffset, 0, BanaCardStringSize);
+    std::memset(g_cardRecord.data() + BanaAccessCodeOffset, 0, BanaCardStringSize);
+    std::memcpy(g_cardRecord.data() + BanaChipIdOffset, chipId.c_str(),
+                chipId.size() < BanaCardStringSize - 1 ? chipId.size() : BanaCardStringSize - 1);
+    std::memcpy(g_cardRecord.data() + BanaAccessCodeOffset, accessCode.c_str(),
+                accessCode.size() < BanaCardStringSize - 1 ? accessCode.size() : BanaCardStringSize - 1);
+    if (getConfig()->namcoES1.icCard.diagnostics)
+        log_info("System ES1 WMMT4 IC card: chip=%s access=%s file=%s", chipId.c_str(),
+                 accessCode.c_str(), getConfig()->namcoES1.icCard.cardFile);
 }
 
 bool badDevice(int deviceId)
@@ -121,15 +179,20 @@ extern "C" int wmmt4BanaReqAuth(int deviceId, int, int, int, void *)
     return badDevice(deviceId) ? BanaResultBadDevice : BanaResultOk;
 }
 
-extern "C" int wmmt4BanaWaitTouch(int deviceId, int, int, BanaTouchCallback, void *)
+extern "C" int wmmt4BanaWaitTouch(int deviceId, int, int, BanaTouchCallback callback,
+                                   void *userData)
 {
     GuestTls::HostCallScope hostCall;
     traceHook(7, "IC card reader wait-touch request");
     if (badDevice(deviceId))
         return BanaResultBadDevice;
-    /* Accept the request but leave it pending: no card is on the reader.  The
-     * boot check only needs the request to be accepted; completing it means
-     * handing over a 168-byte card record, which is the next piece of work. */
+    if (!getConfig()->namcoES1.icCard.enabled ||
+        !getConfig()->namcoES1.icCard.autoInsert || !callback)
+        return BanaResultOk;
+    loadCardRecord();
+    GuestTls::EnterGuestCode();
+    callback(deviceId, BanaStatusOk, g_cardRecord.data(), userData);
+    GuestTls::EnterHostCall();
     return BanaResultOk;
 }
 } // namespace

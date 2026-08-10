@@ -22,6 +22,7 @@ constexpr size_t CommandLength = 10;
 constexpr size_t MaximumQueuedBytes = 1024;
 constexpr uint8_t FrameHeader = 0xff;
 constexpr uint8_t HealthyResult[3] = {'E', '0', '0'};
+constexpr uint8_t WheelCentre[3] = {'H', 0x01, 0xff};
 
 /* WMMT4's steering PCB is framed instead: 02, command, lengthHigh, lengthLow,
  * payload, checksum, 03, the checksum a plain sum from the command byte on. The
@@ -46,6 +47,46 @@ std::deque<uint8_t> commandBytes;
 std::deque<uint8_t> replyBytes;
 bool opened = false;
 unsigned long framesSeen = 0;
+unsigned int unpromptedStateReports = 0;
+
+/* WMMT4 reads board state; report motor and self-check replies proactively. */
+constexpr uint8_t MotorRunning[3] = {'C', '0', '1'};
+constexpr uint8_t SelfCheckComplete[3] = {'C', '0', '6'};
+constexpr unsigned int RunningReports = 1;
+
+bool boardReportsUnprompted(void)
+{
+    return es1TitleIs("WMMT4");
+}
+
+/* Advance the steering-board state machine; caller holds boardMutex. */
+void offerState(void)
+{
+    if (!replyBytes.empty() || !boardReportsUnprompted())
+        return;
+
+    /* Report the centre position immediately after the initial power reply. */
+    const uint8_t *state = MotorRunning;
+    if (unpromptedStateReports == RunningReports)
+        state = WheelCentre;
+    else if (unpromptedStateReports == RunningReports + 1)
+        state = HealthyResult;
+    else if (unpromptedStateReports > RunningReports + 1)
+        state = SelfCheckComplete;
+    replyBytes.insert(replyBytes.end(), state, state + 3);
+    ++unpromptedStateReports;
+}
+
+void queueReports(const uint8_t *reports, size_t reportSize, unsigned int nextReport)
+{
+    std::lock_guard<std::mutex> lock(boardMutex);
+    if (!opened)
+        return;
+
+    replyBytes.clear();
+    replyBytes.insert(replyBytes.end(), reports, reports + reportSize);
+    unpromptedStateReports = nextReport;
+}
 
 void describeFrame(const uint8_t *frame, char *text, size_t size)
 {
@@ -154,6 +195,7 @@ extern "C" int es1KickbackOpen(const char *path, int)
     commandBytes.clear();
     replyBytes.clear();
     framesSeen = 0;
+    unpromptedStateReports = 0;
     if (!opened)
     {
         opened = true;
@@ -172,6 +214,7 @@ extern "C" int es1KickbackBytesAvailable(int fd)
     if (!es1KickbackOwnsDescriptor(fd))
         return 0;
     std::lock_guard<std::mutex> lock(boardMutex);
+    offerState();
     return static_cast<int>(replyBytes.size());
 }
 
@@ -184,6 +227,7 @@ extern "C" int es1KickbackRead(int fd, void *buffer, size_t count)
     }
 
     std::lock_guard<std::mutex> lock(boardMutex);
+    offerState();
     if (replyBytes.empty())
     {
         errno = EAGAIN;
@@ -224,6 +268,7 @@ extern "C" int es1KickbackClose(int fd)
     std::lock_guard<std::mutex> lock(boardMutex);
     commandBytes.clear();
     replyBytes.clear();
+    unpromptedStateReports = 0;
     return 0;
 }
 
@@ -239,6 +284,20 @@ extern "C" int es1KickbackIoctl(int fd, unsigned long request, void *argument)
         return 0;
     }
     return 0;
+}
+
+extern "C" void es1KickbackReportSelfCheck(void)
+{
+    /* Preserve the H01, E00, C06 order across separate three-byte reads. */
+    constexpr uint8_t selfCheckReports[] = {
+        'H', 0x01, 0xff, 'E', '0', '0', 'C', '0', '6'};
+    queueReports(selfCheckReports, sizeof(selfCheckReports), RunningReports);
+}
+
+extern "C" void es1KickbackReportMotorPower(int running)
+{
+    const uint8_t *state = running ? MotorRunning : SelfCheckComplete;
+    queueReports(state, 3, running ? 0 : RunningReports);
 }
 
 #endif

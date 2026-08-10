@@ -137,11 +137,21 @@ void setDefaultValues(EmulatorConfig *cfg)
     strcpy(cfg->namcoES1.dnsBbrouterLoc, "");
     strcpy(cfg->namcoES1.dnsMuchaLocal, "");
     strcpy(cfg->namcoES1.dnsNaominetJp, "");
-    /*
-     * Only the terminal cabinet has the magnetic card reader, and it reports
-     * E0611 when the reader does not answer, so try the YaCardEmu pipe by
-     * default just as N2 does.
-     */
+    cfg->namcoES1.icCard.enabled = 1;
+    cfg->namcoES1.icCard.autoInsert = 1;
+    cfg->namcoES1.icCard.diagnostics = 0;
+    strcpy(cfg->namcoES1.icCard.cardFile, "wmmt4-card.ini");
+    cfg->namcoES1.forceFeedbackEnabled = 1;
+    cfg->namcoES1.forceFeedbackDiagnostics = 0;
+    cfg->namcoES1.ffbGain = 100;
+    cfg->namcoES1.ffbWeight = 100;
+    cfg->namcoES1.ffbSpringGain = 100;
+    cfg->namcoES1.ffbDamperGain = 100;
+    cfg->namcoES1.ffbVibrationGain = 100;
+    cfg->namcoES1.ffbBaseDamper = 0;
+    cfg->namcoES1.ffbDeadband = 0;
+    cfg->namcoES1.ffbRumbleDuration = 100;
+    cfg->namcoES1.ffbInvert = 0;
     cfg->namcoES1.card.enabled = 1;
     cfg->namcoES1.card.autoStart = 0;
     cfg->namcoES1.card.diagnostics = 0;
@@ -209,7 +219,6 @@ void setDefaultValues(EmulatorConfig *cfg)
     strcpy(cfg->idCardFolder, "");
     cfg->emulateJVS = 1;
     cfg->fullscreen = 0;
-    cfg->alwaysOnTop = 0;
     strcpy(cfg->eepromPath, "eeprom.bin");
     strcpy(cfg->sramPath, "sram.bin");
     strcpy(cfg->libCgPath, "");
@@ -410,6 +419,29 @@ void applyIniConfig(EmulatorConfig *config, const IniConfig *ini)
         else
             log_warn("Unknown Namco ES1 CABINET_MODE '%s'; using DRIVE", cabinetMode);
     }
+    config->namcoES1.forceFeedbackEnabled = getInt(
+        ini, "NamcoES1", "FORCE_FEEDBACK_ENABLED", config->namcoES1.forceFeedbackEnabled);
+    config->namcoES1.forceFeedbackDiagnostics =
+        getInt(ini, "NamcoES1", "FORCE_FEEDBACK_DIAGNOSTICS",
+               config->namcoES1.forceFeedbackDiagnostics);
+    config->namcoES1.ffbGain =
+        getInt(ini, "NamcoES1", "FFB_GAIN", config->namcoES1.ffbGain);
+    config->namcoES1.ffbWeight =
+        getInt(ini, "NamcoES1", "FFB_WEIGHT", config->namcoES1.ffbWeight);
+    config->namcoES1.ffbSpringGain =
+        getInt(ini, "NamcoES1", "FFB_SPRING", config->namcoES1.ffbSpringGain);
+    config->namcoES1.ffbDamperGain =
+        getInt(ini, "NamcoES1", "FFB_DAMPER", config->namcoES1.ffbDamperGain);
+    config->namcoES1.ffbVibrationGain =
+        getInt(ini, "NamcoES1", "FFB_VIBRATION", config->namcoES1.ffbVibrationGain);
+    config->namcoES1.ffbBaseDamper =
+        getInt(ini, "NamcoES1", "FFB_BASE_DAMPER", config->namcoES1.ffbBaseDamper);
+    config->namcoES1.ffbDeadband =
+        getInt(ini, "NamcoES1", "FFB_DEADBAND", config->namcoES1.ffbDeadband);
+    config->namcoES1.ffbRumbleDuration = getInt(
+        ini, "NamcoES1", "FFB_RUMBLE_DURATION", config->namcoES1.ffbRumbleDuration);
+    config->namcoES1.ffbInvert =
+        getInt(ini, "NamcoES1", "FFB_INVERT", config->namcoES1.ffbInvert);
     config->namcoES1.card.enabled =
         getInt(ini, "NamcoES1", "YACARDEMU_ENABLED", config->namcoES1.card.enabled);
     config->namcoES1.card.autoStart =
@@ -426,6 +458,14 @@ void applyIniConfig(EmulatorConfig *config, const IniConfig *ini)
               sizeof(config->namcoES1.card.cardName));
     config->namcoES1.card.diagnostics =
         getInt(ini, "NamcoES1", "YACARDEMU_DIAGNOSTICS", config->namcoES1.card.diagnostics);
+    config->namcoES1.icCard.enabled =
+        getInt(ini, "NamcoES1", "IC_CARD_ENABLED", config->namcoES1.icCard.enabled);
+    config->namcoES1.icCard.autoInsert =
+        getInt(ini, "NamcoES1", "IC_CARD_AUTO_INSERT", config->namcoES1.icCard.autoInsert);
+    config->namcoES1.icCard.diagnostics =
+        getInt(ini, "NamcoES1", "IC_CARD_DIAGNOSTICS", config->namcoES1.icCard.diagnostics);
+    getString(ini, "NamcoES1", "IC_CARD_FILE", config->namcoES1.icCard.cardFile,
+              sizeof(config->namcoES1.icCard.cardFile));
 
     // [NamcoN2]
     getString(ini, "NamcoN2", "DONGLE_ID", config->namcoN2.dongleId,
@@ -522,7 +562,6 @@ void applyIniConfig(EmulatorConfig *config, const IniConfig *ini)
     config->height = getInt(ini, "Display", "HEIGHT", config->height);
     config->boostRenderRes = getInt(ini, "Display", "BOOST_RENDER_RES", config->boostRenderRes);
     config->fullscreen = getInt(ini, "Display", "FULLSCREEN", config->fullscreen);
-    config->alwaysOnTop = getInt(ini, "Display", "ALWAYS_ON_TOP", config->alwaysOnTop);
     config->borderEnabled = getInt(ini, "Display", "BORDER_ENABLED", config->borderEnabled);
 	config->whiteBorderPercentage = getFloat(ini, "Display", "WHITE_BORDER_PERCENTAGE", config->whiteBorderPercentage * 100.0f) / 100.0f;
 	config->blackBorderPercentage = getFloat(ini, "Display", "BLACK_BORDER_PERCENTAGE", config->blackBorderPercentage * 100.0f) / 100.0f;

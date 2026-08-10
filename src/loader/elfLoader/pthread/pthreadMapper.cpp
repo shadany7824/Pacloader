@@ -12,12 +12,165 @@
 SRWLOCK PthreadMapper::s_lock = SRWLOCK_INIT;
 volatile bool PthreadMapper::s_initialized = false;
 
+namespace {
+
+/* Shard pthread object tables by guest pointer to reduce lookup contention. */
+constexpr size_t kShardCount = 64;
+
+/* Cache repeated pthread object lookups per thread. */
+constexpr size_t kCacheEntries = 4;
+volatile LONG g_tableGeneration = 1;
+
+template <typename T>
+struct ShardedTable {
+    struct Shard {
+        SRWLOCK lock = SRWLOCK_INIT;
+        std::unordered_map<void*, T*> map;
+    };
+
+    Shard shards[kShardCount];
+
+    struct Cache {
+        LONG generation;
+        void* keys[kCacheEntries];
+        T* values[kCacheEntries];
+    };
+
+    static Cache& threadCache() {
+        static thread_local Cache cache{};
+        return cache;
+    }
+
+    static size_t cacheSlot(void* key) {
+        return (reinterpret_cast<uintptr_t>(key) >> 4) % kCacheEntries;
+    }
+
+    T* cached(void* key) {
+        Cache& cache = threadCache();
+        const LONG generation = g_tableGeneration;
+        if (cache.generation != generation) {
+            cache = Cache{};
+            cache.generation = generation;
+            return nullptr;
+        }
+        const size_t slot = cacheSlot(key);
+        return cache.keys[slot] == key ? cache.values[slot] : nullptr;
+    }
+
+    void remember(void* key, T* value) {
+        Cache& cache = threadCache();
+        const size_t slot = cacheSlot(key);
+        cache.keys[slot] = key;
+        cache.values[slot] = value;
+    }
+
+    Shard& shardFor(void* key) {
+        /* Ignore pointer alignment bits when selecting a shard. */
+        const uintptr_t value = reinterpret_cast<uintptr_t>(key);
+        return shards[(value >> 4) % kShardCount];
+    }
+
+    template <typename Factory>
+    T* GetOrCreate(void* key, int magic, Factory make) {
+        if (T* hit = cached(key)) {
+            return hit;
+        }
+
+        Shard& shard = shardFor(key);
+
+        AcquireSRWLockShared(&shard.lock);
+        auto it = shard.map.find(key);
+        if (it != shard.map.end() && it->second->initialized == magic) {
+            T* existing = it->second;
+            ReleaseSRWLockShared(&shard.lock);
+            remember(key, existing);
+            return existing;
+        }
+        ReleaseSRWLockShared(&shard.lock);
+
+        AcquireSRWLockExclusive(&shard.lock);
+        // Recheck after acquiring the shard lock.
+        it = shard.map.find(key);
+        if (it != shard.map.end() && it->second->initialized == magic) {
+            T* existing = it->second;
+            ReleaseSRWLockExclusive(&shard.lock);
+            return existing;
+        }
+
+        T* created = make();
+        shard.map[key] = created;
+        ReleaseSRWLockExclusive(&shard.lock);
+        remember(key, created);
+        return created;
+    }
+
+    T* Find(void* key, int magic) {
+        if (T* hit = cached(key)) {
+            return hit;
+        }
+
+        Shard& shard = shardFor(key);
+
+        AcquireSRWLockShared(&shard.lock);
+        auto it = shard.map.find(key);
+        T* result = nullptr;
+        if (it != shard.map.end() && it->second->initialized == magic) {
+            result = it->second;
+        }
+        ReleaseSRWLockShared(&shard.lock);
+        if (result) {
+            remember(key, result);
+        }
+        return result;
+    }
+
+    template <typename Release>
+    void Destroy(void* key, Release release) {
+        InterlockedIncrement(&g_tableGeneration);
+
+        Shard& shard = shardFor(key);
+
+        AcquireSRWLockExclusive(&shard.lock);
+        auto it = shard.map.find(key);
+        if (it != shard.map.end()) {
+            if (it->second) {
+                release(it->second);
+                it->second->initialized = 0;
+                delete it->second;
+            }
+            shard.map.erase(it);
+        }
+        ReleaseSRWLockExclusive(&shard.lock);
+    }
+
+    template <typename Release>
+    void Clear(Release release) {
+        InterlockedIncrement(&g_tableGeneration);
+
+        for (Shard& shard : shards) {
+            AcquireSRWLockExclusive(&shard.lock);
+            for (auto& pair : shard.map) {
+                if (pair.second) {
+                    release(pair.second);
+                    delete pair.second;
+                }
+            }
+            shard.map.clear();
+            ReleaseSRWLockExclusive(&shard.lock);
+        }
+    }
+};
+
+} // namespace
+
 // Mapping tables
-static std::unordered_map<void*, PthreadMutexInternal*>     s_mutex_map;
-static std::unordered_map<void*, PthreadCondInternal*>      s_cond_map;
-static std::unordered_map<void*, PthreadRwlockInternal*>    s_rwlock_map;
-static std::unordered_map<void*, PthreadBarrierInternal*>   s_barrier_map;
-static std::unordered_map<void*, PthreadSpinInternal*>      s_spin_map;
+static ShardedTable<PthreadMutexInternal>   s_mutex_table;
+static ShardedTable<PthreadCondInternal>    s_cond_table;
+static ShardedTable<PthreadRwlockInternal>  s_rwlock_table;
+static ShardedTable<PthreadBarrierInternal> s_barrier_table;
+static ShardedTable<PthreadSpinInternal>    s_spin_table;
+
+/* Thread tables are only synchronized during create and join. */
 static std::unordered_map<uint32_t, PthreadThreadInternal*> s_thread_map;
 static std::unordered_map<DWORD, uint32_t>                  s_wintid_to_linuxtid;
 
@@ -51,50 +204,14 @@ void PthreadMapper::Initialize() {
 void PthreadMapper::Shutdown() {
     if (!s_initialized) return;
     
+    s_mutex_table.Clear([](PthreadMutexInternal* mutex) { DeleteCriticalSection(&mutex->cs); });
+    s_cond_table.Clear([](PthreadCondInternal*) {});
+    s_rwlock_table.Clear([](PthreadRwlockInternal*) {});
+    s_barrier_table.Clear([](PthreadBarrierInternal* barrier) { DeleteCriticalSection(&barrier->cs); });
+    s_spin_table.Clear([](PthreadSpinInternal*) {});
+
     AcquireSRWLockExclusive(&s_lock);
-    
-    // Cleanup mutexes
-    for (auto& pair : s_mutex_map) {
-        if (pair.second) {
-            DeleteCriticalSection(&pair.second->cs);
-            delete pair.second;
-        }
-    }
-    s_mutex_map.clear();
-    
-    // Cleanup conds
-    for (auto& pair : s_cond_map) {
-        if (pair.second) {
-            delete pair.second;
-        }
-    }
-    s_cond_map.clear();
-    
-    // Cleanup rwlocks
-    for (auto& pair : s_rwlock_map) {
-        if (pair.second) {
-            delete pair.second;
-        }
-    }
-    s_rwlock_map.clear();
-    
-    // Cleanup barriers
-    for (auto& pair : s_barrier_map) {
-        if (pair.second) {
-            DeleteCriticalSection(&pair.second->cs);
-            delete pair.second;
-        }
-    }
-    s_barrier_map.clear();
-    
-    // Cleanup spins
-    for (auto& pair : s_spin_map) {
-        if (pair.second) {
-            delete pair.second;
-        }
-    }
-    s_spin_map.clear();
-    
+
     // Cleanup threads
     for (auto& pair : s_thread_map) {
         if (pair.second) {
@@ -119,64 +236,24 @@ void PthreadMapper::Shutdown() {
 // ============================================================
 
 PthreadMutexInternal* PthreadMapper::GetOrCreateMutex(void* linux_mutex) {
-    AcquireSRWLockShared(&s_lock);
-    auto it = s_mutex_map.find(linux_mutex);
-    if (it != s_mutex_map.end() && it->second->initialized == MUTEX_INIT_MAGIC) {
-        PthreadMutexInternal* existing = it->second;
-        ReleaseSRWLockShared(&s_lock);
-        return existing;
-    }
-    ReleaseSRWLockShared(&s_lock);
-
-    AcquireSRWLockExclusive(&s_lock);
-    // Another thread can create the same object between the two acquisitions.
-    it = s_mutex_map.find(linux_mutex);
-    if (it != s_mutex_map.end() && it->second->initialized == MUTEX_INIT_MAGIC) {
-        ReleaseSRWLockExclusive(&s_lock);
-        return it->second;
-    }
-    
-    // Create new mutex
-    PthreadMutexInternal* mutex = new PthreadMutexInternal;
-    InitializeCriticalSection(&mutex->cs);
-    mutex->type = LINUX_PTHREAD_MUTEX_DEFAULT;
-    mutex->owner_thread = 0;
-    mutex->lock_count = 0;
-    mutex->initialized = MUTEX_INIT_MAGIC;
-    
-    s_mutex_map[linux_mutex] = mutex;
-    
-    ReleaseSRWLockExclusive(&s_lock);
-    return mutex;
+    return s_mutex_table.GetOrCreate(linux_mutex, MUTEX_INIT_MAGIC, [] {
+        PthreadMutexInternal* mutex = new PthreadMutexInternal;
+        InitializeCriticalSection(&mutex->cs);
+        mutex->type = LINUX_PTHREAD_MUTEX_DEFAULT;
+        mutex->owner_thread = 0;
+        mutex->lock_count = 0;
+        mutex->initialized = MUTEX_INIT_MAGIC;
+        return mutex;
+    });
 }
 
 PthreadMutexInternal* PthreadMapper::FindMutex(void* linux_mutex) {
-    AcquireSRWLockShared(&s_lock);
-    
-    auto it = s_mutex_map.find(linux_mutex);
-    PthreadMutexInternal* result = nullptr;
-    if (it != s_mutex_map.end() && it->second->initialized == MUTEX_INIT_MAGIC) {
-        result = it->second;
-    }
-    
-    ReleaseSRWLockShared(&s_lock);
-    return result;
+    return s_mutex_table.Find(linux_mutex, MUTEX_INIT_MAGIC);
 }
 
 void PthreadMapper::DestroyMutex(void* linux_mutex) {
-    AcquireSRWLockExclusive(&s_lock);
-    
-    auto it = s_mutex_map.find(linux_mutex);
-    if (it != s_mutex_map.end()) {
-        if (it->second) {
-            DeleteCriticalSection(&it->second->cs);
-            it->second->initialized = 0;
-            delete it->second;
-        }
-        s_mutex_map.erase(it);
-    }
-    
-    ReleaseSRWLockExclusive(&s_lock);
+    s_mutex_table.Destroy(linux_mutex,
+                          [](PthreadMutexInternal* mutex) { DeleteCriticalSection(&mutex->cs); });
 }
 
 // ============================================================
@@ -184,60 +261,21 @@ void PthreadMapper::DestroyMutex(void* linux_mutex) {
 // ============================================================
 
 PthreadCondInternal* PthreadMapper::GetOrCreateCond(void* linux_cond) {
-    AcquireSRWLockShared(&s_lock);
-    auto it = s_cond_map.find(linux_cond);
-    if (it != s_cond_map.end() && it->second->initialized == COND_INIT_MAGIC) {
-        PthreadCondInternal* existing = it->second;
-        ReleaseSRWLockShared(&s_lock);
-        return existing;
-    }
-    ReleaseSRWLockShared(&s_lock);
-
-    AcquireSRWLockExclusive(&s_lock);
-    // Another thread can create the same object between the two acquisitions.
-    it = s_cond_map.find(linux_cond);
-    if (it != s_cond_map.end() && it->second->initialized == COND_INIT_MAGIC) {
-        ReleaseSRWLockExclusive(&s_lock);
-        return it->second;
-    }
-    
-    PthreadCondInternal* cond = new PthreadCondInternal;
-    InitializeConditionVariable(&cond->cv);
-    cond->clock_id = 0;  // CLOCK_REALTIME
-    cond->initialized = COND_INIT_MAGIC;
-    
-    s_cond_map[linux_cond] = cond;
-    
-    ReleaseSRWLockExclusive(&s_lock);
-    return cond;
+    return s_cond_table.GetOrCreate(linux_cond, COND_INIT_MAGIC, [] {
+        PthreadCondInternal* cond = new PthreadCondInternal;
+        InitializeConditionVariable(&cond->cv);
+        cond->clock_id = 0;  // CLOCK_REALTIME
+        cond->initialized = COND_INIT_MAGIC;
+        return cond;
+    });
 }
 
 PthreadCondInternal* PthreadMapper::FindCond(void* linux_cond) {
-    AcquireSRWLockShared(&s_lock);
-    
-    auto it = s_cond_map.find(linux_cond);
-    PthreadCondInternal* result = nullptr;
-    if (it != s_cond_map.end() && it->second->initialized == COND_INIT_MAGIC) {
-        result = it->second;
-    }
-    
-    ReleaseSRWLockShared(&s_lock);
-    return result;
+    return s_cond_table.Find(linux_cond, COND_INIT_MAGIC);
 }
 
 void PthreadMapper::DestroyCond(void* linux_cond) {
-    AcquireSRWLockExclusive(&s_lock);
-    
-    auto it = s_cond_map.find(linux_cond);
-    if (it != s_cond_map.end()) {
-        if (it->second) {
-            it->second->initialized = 0;
-            delete it->second;
-        }
-        s_cond_map.erase(it);
-    }
-    
-    ReleaseSRWLockExclusive(&s_lock);
+    s_cond_table.Destroy(linux_cond, [](PthreadCondInternal*) {});
 }
 
 // ============================================================
@@ -245,59 +283,20 @@ void PthreadMapper::DestroyCond(void* linux_cond) {
 // ============================================================
 
 PthreadRwlockInternal* PthreadMapper::GetOrCreateRwlock(void* linux_rwlock) {
-    AcquireSRWLockShared(&s_lock);
-    auto it = s_rwlock_map.find(linux_rwlock);
-    if (it != s_rwlock_map.end() && it->second->initialized == RWLOCK_INIT_MAGIC) {
-        PthreadRwlockInternal* existing = it->second;
-        ReleaseSRWLockShared(&s_lock);
-        return existing;
-    }
-    ReleaseSRWLockShared(&s_lock);
-
-    AcquireSRWLockExclusive(&s_lock);
-    // Another thread can create the same object between the two acquisitions.
-    it = s_rwlock_map.find(linux_rwlock);
-    if (it != s_rwlock_map.end() && it->second->initialized == RWLOCK_INIT_MAGIC) {
-        ReleaseSRWLockExclusive(&s_lock);
-        return it->second;
-    }
-    
-    PthreadRwlockInternal* rwlock = new PthreadRwlockInternal;
-    InitializeSRWLock(&rwlock->srw);
-    rwlock->initialized = RWLOCK_INIT_MAGIC;
-    
-    s_rwlock_map[linux_rwlock] = rwlock;
-    
-    ReleaseSRWLockExclusive(&s_lock);
-    return rwlock;
+    return s_rwlock_table.GetOrCreate(linux_rwlock, RWLOCK_INIT_MAGIC, [] {
+        PthreadRwlockInternal* rwlock = new PthreadRwlockInternal;
+        InitializeSRWLock(&rwlock->srw);
+        rwlock->initialized = RWLOCK_INIT_MAGIC;
+        return rwlock;
+    });
 }
 
 PthreadRwlockInternal* PthreadMapper::FindRwlock(void* linux_rwlock) {
-    AcquireSRWLockShared(&s_lock);
-    
-    auto it = s_rwlock_map.find(linux_rwlock);
-    PthreadRwlockInternal* result = nullptr;
-    if (it != s_rwlock_map.end() && it->second->initialized == RWLOCK_INIT_MAGIC) {
-        result = it->second;
-    }
-    
-    ReleaseSRWLockShared(&s_lock);
-    return result;
+    return s_rwlock_table.Find(linux_rwlock, RWLOCK_INIT_MAGIC);
 }
 
 void PthreadMapper::DestroyRwlock(void* linux_rwlock) {
-    AcquireSRWLockExclusive(&s_lock);
-    
-    auto it = s_rwlock_map.find(linux_rwlock);
-    if (it != s_rwlock_map.end()) {
-        if (it->second) {
-            it->second->initialized = 0;
-            delete it->second;
-        }
-        s_rwlock_map.erase(it);
-    }
-    
-    ReleaseSRWLockExclusive(&s_lock);
+    s_rwlock_table.Destroy(linux_rwlock, [](PthreadRwlockInternal*) {});
 }
 
 // ============================================================
@@ -305,64 +304,25 @@ void PthreadMapper::DestroyRwlock(void* linux_rwlock) {
 // ============================================================
 
 PthreadBarrierInternal* PthreadMapper::GetOrCreateBarrier(void* linux_barrier, unsigned int count) {
-    AcquireSRWLockShared(&s_lock);
-    auto it = s_barrier_map.find(linux_barrier);
-    if (it != s_barrier_map.end() && it->second->initialized == BARRIER_INIT_MAGIC) {
-        PthreadBarrierInternal* existing = it->second;
-        ReleaseSRWLockShared(&s_lock);
-        return existing;
-    }
-    ReleaseSRWLockShared(&s_lock);
-
-    AcquireSRWLockExclusive(&s_lock);
-    // Another thread can create the same object between the two acquisitions.
-    it = s_barrier_map.find(linux_barrier);
-    if (it != s_barrier_map.end() && it->second->initialized == BARRIER_INIT_MAGIC) {
-        ReleaseSRWLockExclusive(&s_lock);
-        return it->second;
-    }
-    
-    PthreadBarrierInternal* barrier = new PthreadBarrierInternal;
-    InitializeCriticalSection(&barrier->cs);
-    InitializeConditionVariable(&barrier->cv);
-    barrier->threshold = count;
-    barrier->count = 0;
-    barrier->generation = 0;
-    barrier->initialized = BARRIER_INIT_MAGIC;
-    
-    s_barrier_map[linux_barrier] = barrier;
-    
-    ReleaseSRWLockExclusive(&s_lock);
-    return barrier;
+    return s_barrier_table.GetOrCreate(linux_barrier, BARRIER_INIT_MAGIC, [count] {
+        PthreadBarrierInternal* barrier = new PthreadBarrierInternal;
+        InitializeCriticalSection(&barrier->cs);
+        InitializeConditionVariable(&barrier->cv);
+        barrier->threshold = count;
+        barrier->count = 0;
+        barrier->generation = 0;
+        barrier->initialized = BARRIER_INIT_MAGIC;
+        return barrier;
+    });
 }
 
 PthreadBarrierInternal* PthreadMapper::FindBarrier(void* linux_barrier) {
-    AcquireSRWLockShared(&s_lock);
-    
-    auto it = s_barrier_map.find(linux_barrier);
-    PthreadBarrierInternal* result = nullptr;
-    if (it != s_barrier_map.end() && it->second->initialized == BARRIER_INIT_MAGIC) {
-        result = it->second;
-    }
-    
-    ReleaseSRWLockShared(&s_lock);
-    return result;
+    return s_barrier_table.Find(linux_barrier, BARRIER_INIT_MAGIC);
 }
 
 void PthreadMapper::DestroyBarrier(void* linux_barrier) {
-    AcquireSRWLockExclusive(&s_lock);
-    
-    auto it = s_barrier_map.find(linux_barrier);
-    if (it != s_barrier_map.end()) {
-        if (it->second) {
-            DeleteCriticalSection(&it->second->cs);
-            it->second->initialized = 0;
-            delete it->second;
-        }
-        s_barrier_map.erase(it);
-    }
-    
-    ReleaseSRWLockExclusive(&s_lock);
+    s_barrier_table.Destroy(linux_barrier,
+                            [](PthreadBarrierInternal* barrier) { DeleteCriticalSection(&barrier->cs); });
 }
 
 // ============================================================
@@ -370,59 +330,20 @@ void PthreadMapper::DestroyBarrier(void* linux_barrier) {
 // ============================================================
 
 PthreadSpinInternal* PthreadMapper::GetOrCreateSpin(void* linux_spin) {
-    AcquireSRWLockShared(&s_lock);
-    auto it = s_spin_map.find(linux_spin);
-    if (it != s_spin_map.end() && it->second->initialized == SPIN_INIT_MAGIC) {
-        PthreadSpinInternal* existing = it->second;
-        ReleaseSRWLockShared(&s_lock);
-        return existing;
-    }
-    ReleaseSRWLockShared(&s_lock);
-
-    AcquireSRWLockExclusive(&s_lock);
-    // Another thread can create the same object between the two acquisitions.
-    it = s_spin_map.find(linux_spin);
-    if (it != s_spin_map.end() && it->second->initialized == SPIN_INIT_MAGIC) {
-        ReleaseSRWLockExclusive(&s_lock);
-        return it->second;
-    }
-    
-    PthreadSpinInternal* spin = new PthreadSpinInternal;
-    spin->lock = 0;
-    spin->initialized = SPIN_INIT_MAGIC;
-    
-    s_spin_map[linux_spin] = spin;
-    
-    ReleaseSRWLockExclusive(&s_lock);
-    return spin;
+    return s_spin_table.GetOrCreate(linux_spin, SPIN_INIT_MAGIC, [] {
+        PthreadSpinInternal* spin = new PthreadSpinInternal;
+        spin->lock = 0;
+        spin->initialized = SPIN_INIT_MAGIC;
+        return spin;
+    });
 }
 
 PthreadSpinInternal* PthreadMapper::FindSpin(void* linux_spin) {
-    AcquireSRWLockShared(&s_lock);
-    
-    auto it = s_spin_map.find(linux_spin);
-    PthreadSpinInternal* result = nullptr;
-    if (it != s_spin_map.end() && it->second->initialized == SPIN_INIT_MAGIC) {
-        result = it->second;
-    }
-    
-    ReleaseSRWLockShared(&s_lock);
-    return result;
+    return s_spin_table.Find(linux_spin, SPIN_INIT_MAGIC);
 }
 
 void PthreadMapper::DestroySpin(void* linux_spin) {
-    AcquireSRWLockExclusive(&s_lock);
-    
-    auto it = s_spin_map.find(linux_spin);
-    if (it != s_spin_map.end()) {
-        if (it->second) {
-            it->second->initialized = 0;
-            delete it->second;
-        }
-        s_spin_map.erase(it);
-    }
-    
-    ReleaseSRWLockExclusive(&s_lock);
+    s_spin_table.Destroy(linux_spin, [](PthreadSpinInternal*) {});
 }
 
 // ============================================================

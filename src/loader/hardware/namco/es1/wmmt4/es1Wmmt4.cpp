@@ -2,6 +2,7 @@
 #include "../es1CompatLayer.h"
 #include "../es1Network.h"
 #include "es1Wmmt4Card.hpp"
+#include "es1Wmmt4Ffb.hpp"
 #include "es1Wmmt4Network.hpp"
 #include "es1Wmmt4Terminal.hpp"
 #include "../../../../elfLoader/guestTls.hpp"
@@ -726,7 +727,7 @@ extern "C" int es1Wmmt4InstallHooks(void)
          "directory_filename_match", reinterpret_cast<void **>(&g_originalFilenameMatch)},
     };
     int installed = es1InstallHookTable(hooks, sizeof(hooks) / sizeof(hooks[0]), "WMMT4");
-    installed += wmmt4InstallCardHooks();
+    installed += wmmt4InstallCardHooks() + wmmt4InstallFfbHooks();
     wmmt4InstallNetworkDiagnostics();
 
     log_info("System ES1 WMMT4: installed %d version-specific compatibility hooks", installed);

@@ -1,4 +1,5 @@
 #include <stdint.h>
+#include <stdlib.h>
 
 #if defined(_WIN32) || defined(__MINGW32__)
 #include <windows.h>
@@ -23,7 +24,9 @@ static double g_targetFps = 60.0;
 #if defined(_WIN32) || defined(__MINGW32__)
 static LARGE_INTEGER g_qpcFrequency;
 static LONGLONG g_qpcStart = 0;
-static uint64_t g_frameIndex = 0;
+
+/* Keep the video-sync result per thread; WMMT4 waits and presents on different threads. */
+static __thread int g_videoSyncWaited = 0;
 
 static LONGLONG qpcNow(void)
 {
@@ -42,10 +45,57 @@ static LONGLONG qpcDeadline(uint64_t frameIndex)
     return (LONGLONG)ticks;
 }
 
+/* Sleep through the frame and spin only during the final timing window. */
+#define SpinMarginMicroseconds 500
+
+/* Optional late-present window; disabled unless LL_PACE_GRACE_MS is set. */
+static LONGLONG paceGraceTicks(void)
+{
+    static int resolved = 0;
+    static LONGLONG ticks = 0;
+
+    if (!resolved)
+    {
+        resolved = 1;
+        long milliseconds = 0;
+        const char *setting = getenv("LL_PACE_GRACE_MS");
+        if (setting && *setting)
+        {
+            const long value = strtol(setting, NULL, 10);
+            if (value >= 0)
+                milliseconds = value;
+        }
+        ticks = (LONGLONG)(((long double)g_qpcFrequency.QuadPart * milliseconds) / 1000.0L);
+    }
+    return ticks;
+}
+
+static int g_coarseSleepIsTimer = 0;
+
+/* Created per waiting thread: a timer object cannot be shared by two waiters. */
+static HANDLE waitTimer(void)
+{
+    static __thread HANDLE timer = NULL;
+    static __thread int created = 0;
+
+    if (!created)
+    {
+        created = 1;
+        if (g_coarseSleepIsTimer)
+            timer = CreateWaitableTimerExW(NULL, NULL,
+                                           CREATE_WAITABLE_TIMER_MANUAL_RESET |
+                                               CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                           TIMER_MODIFY_STATE | SYNCHRONIZE);
+    }
+    return timer;
+}
+
 static void waitUntilQpc(LONGLONG deadline)
 {
-    const LONGLONG oneMillisecond = g_qpcFrequency.QuadPart / 1000;
-    const LONGLONG twoMilliseconds = oneMillisecond * 2;
+    const LONGLONG spinMargin =
+        (LONGLONG)(((long double)g_qpcFrequency.QuadPart * SpinMarginMicroseconds) /
+                   1000000.0L);
+    HANDLE timer = waitTimer();
 
     for (;;)
     {
@@ -53,15 +103,30 @@ static void waitUntilQpc(LONGLONG deadline)
         if (remaining <= 0)
             return;
 
-        /* Sleep while there is enough time left, yield near the deadline,
-         * then use a short pause for the final sub-millisecond window.  This
-         * retains QPC precision without burning a CPU for the whole frame. */
-        if (remaining > twoMilliseconds)
-            Sleep(1);
-        else if (remaining > oneMillisecond / 10)
-            Sleep(0);
-        else
+        /* Sleep through the bulk of the frame and spin only the final fraction. */
+        if (remaining <= spinMargin)
+        {
             _mm_pause();
+            continue;
+        }
+
+        if (timer)
+        {
+            const LONGLONG sleepTicks = remaining - spinMargin;
+            LARGE_INTEGER due;
+            due.QuadPart = -(LONGLONG)(((long double)sleepTicks * 10000000.0L) /
+                                       (long double)g_qpcFrequency.QuadPart);
+            if (due.QuadPart >= 0)
+                due.QuadPart = -1;
+            if (SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE))
+            {
+                WaitForSingleObject(timer, INFINITE);
+                continue;
+            }
+        }
+
+        /* timeBeginPeriod(1) keeps Sleep(1) within the spin margin. */
+        Sleep(1);
     }
 }
 #endif
@@ -73,6 +138,7 @@ void initFpsLimiter(void)
     lastTime = 0.0;
     frameCount = 0;
     fps = 0.0;
+    g_videoSyncWaited = 0;
 
     if (!g_fpsLimiterEnabled)
         return;
@@ -80,10 +146,24 @@ void initFpsLimiter(void)
 #if defined(_WIN32) || defined(__MINGW32__)
     QueryPerformanceFrequency(&g_qpcFrequency);
     g_qpcStart = qpcNow();
-    g_frameIndex = 0;
 
-    /* Sleep(1) is used as the coarse part of the hybrid wait above. */
-    timeBeginPeriod(1);
+    /* Use the high-resolution wait when the host provides it. */
+    if (!g_coarseSleepIsTimer)
+    {
+        HANDLE probe = CreateWaitableTimerExW(NULL, NULL,
+                                              CREATE_WAITABLE_TIMER_MANUAL_RESET |
+                                                  CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                              TIMER_MODIFY_STATE | SYNCHRONIZE);
+        if (probe)
+        {
+            g_coarseSleepIsTimer = 1;
+            CloseHandle(probe);
+        }
+        else
+        {
+            timeBeginPeriod(1);
+        }
+    }
 #endif
 }
 
@@ -160,9 +240,18 @@ void waitVideoSync(uint64_t index)
     if (g_qpcFrequency.QuadPart == 0)
         return;
     waitUntilQpc(qpcDeadline(index));
+    g_videoSyncWaited = 1;
 #else
     (void)index;
+    g_videoSyncWaited = 1;
 #endif
+}
+
+int consumeVideoSyncWait(void)
+{
+    const int waited = g_videoSyncWaited;
+    g_videoSyncWaited = 0;
+    return waited;
 }
 
 void frameTiming(void)
@@ -171,23 +260,20 @@ void frameTiming(void)
         return;
 
 #if defined(_WIN32) || defined(__MINGW32__)
-    const LONGLONG deadline = qpcDeadline(g_frameIndex);
-    waitUntilQpc(deadline);
+    /* A thread that already waited for its slot can present immediately. */
+    if (consumeVideoSyncWait())
+        return;
 
-    const LONGLONG now = qpcNow();
-    const LONGLONG period =
-        (LONGLONG)((long double)g_qpcFrequency.QuadPart / g_targetFps);
+    /* Pace against the same absolute grid reported by videoSyncCount(). */
+    const uint64_t passed = videoSyncCount();
+    if (qpcNow() - qpcDeadline(passed) <= paceGraceTicks())
+        return;
 
-    /* If rendering missed a full frame, skip stale deadlines instead of
-     * issuing a burst of frames while trying to catch up. */
-    if (now > deadline + period)
-    {
-        const long double elapsed = (long double)(now - g_qpcStart);
-        g_frameIndex = (uint64_t)(elapsed * g_targetFps /
-                                   (long double)g_qpcFrequency.QuadPart);
-    }
-    g_frameIndex++;
+    waitUntilQpc(qpcDeadline(passed + 1));
 #else
+    if (consumeVideoSyncWait())
+        return;
+
     const int64_t targetMicroseconds = (int64_t)(1000000.0 / g_targetFps);
     static int64_t nextDeadline = 0;
     const int64_t now = clockNow();

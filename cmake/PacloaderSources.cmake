@@ -90,6 +90,7 @@ set(PACLOADER_SOURCES
     src/loader/hardware/namco/es1/maximumHeat3d/es1MaximumHeat3D.cpp
     src/loader/hardware/namco/es1/wmmt4/es1Wmmt4.cpp
     src/loader/hardware/namco/es1/wmmt4/es1Wmmt4Card.cpp
+    src/loader/hardware/namco/es1/wmmt4/es1Wmmt4Ffb.cpp
     src/loader/hardware/namco/es1/wmmt4/es1Wmmt4Network.cpp
     src/loader/hardware/namco/es1/wmmt4/es1Wmmt4Terminal.cpp
 

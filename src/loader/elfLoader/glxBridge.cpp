@@ -185,6 +185,7 @@ extern "C" void bridgeGlxDestroyContext(void *display, void *context)
 
     if (ours && SDL_GL_GetCurrentContext() == released)
         makeSDLCurrent(nullptr, nullptr);
+
 }
 
 extern "C" int bridgeGlxMakeCurrent(void *display, unsigned long drawable,

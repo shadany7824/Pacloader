@@ -191,11 +191,9 @@ const ControlBinding gDefaultWmmt4Bindings[] = {
     {INPUT_TYPE_KEY, 0, SDL_SCANCODE_RIGHT, AXIS_MODE_DIGITAL, 0, false, PLAYER_1, LA_Steer_Right, -1, 0},
     {INPUT_TYPE_KEY, 0, SDL_SCANCODE_UP, AXIS_MODE_DIGITAL, 0, false, PLAYER_1, LA_Gas_Digital, -1, 0},
     {INPUT_TYPE_KEY, 0, SDL_SCANCODE_DOWN, AXIS_MODE_DIGITAL, 0, false, PLAYER_1, LA_Brake_Digital, -1, 0},
-    {INPUT_TYPE_GAMEPAD_AXIS, 0, SDL_GAMEPAD_AXIS_LEFTX, AXIS_MODE_FULL, 0, false, PLAYER_1, LA_Steer, -1, 0},
+    /* Use the wheel axis only during the WMMT4 steering self-check. */
     {INPUT_TYPE_JOY_AXIS, 0, 0, AXIS_MODE_FULL, 0, false, PLAYER_1, LA_Steer, -1, 0},
-    {INPUT_TYPE_GAMEPAD_AXIS, 0, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER, AXIS_MODE_FULL, 0, false, PLAYER_1, LA_Gas, -1, 0},
     {INPUT_TYPE_JOY_AXIS, 0, 2, AXIS_MODE_FULL, 0, false, PLAYER_1, LA_Gas, -1, 0},
-    {INPUT_TYPE_GAMEPAD_AXIS, 0, SDL_GAMEPAD_AXIS_LEFT_TRIGGER, AXIS_MODE_FULL, 0, false, PLAYER_1, LA_Brake, -1, 0},
     {INPUT_TYPE_JOY_AXIS, 0, 5, AXIS_MODE_FULL, 0, false, PLAYER_1, LA_Brake, -1, 0},
 
     // Sequential shifter

@@ -16,6 +16,46 @@
 namespace
 {
 bool g_detected = false;
+#if defined(_WIN32) || defined(__MINGW32__)
+HWND g_lockedWindow = nullptr;
+LONG g_lockedWindowX = 0;
+LONG g_lockedWindowY = 0;
+bool g_lockedWindowPosition = false;
+bool g_userMovingWindow = false;
+WNDPROC g_previousWindowProc = nullptr;
+
+LRESULT CALLBACK lockedWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    if (message == WM_ENTERSIZEMOVE)
+        g_userMovingWindow = true;
+
+    if (message == WM_WINDOWPOSCHANGING && g_lockedWindowPosition &&
+        window == g_lockedWindow && !g_userMovingWindow)
+    {
+        WINDOWPOS *position = reinterpret_cast<WINDOWPOS *>(lParam);
+        if (position && !(position->flags & SWP_NOMOVE))
+        {
+            position->x = g_lockedWindowX;
+            position->y = g_lockedWindowY;
+        }
+    }
+
+    if (message == WM_EXITSIZEMOVE)
+    {
+        g_userMovingWindow = false;
+        RECT rect{};
+        if (window == g_lockedWindow && GetWindowRect(window, &rect))
+        {
+            g_lockedWindowX = rect.left;
+            g_lockedWindowY = rect.top;
+        }
+    }
+
+    if (g_previousWindowProc)
+        return CallWindowProcW(g_previousWindowProc, window, message, wParam, lParam);
+    return DefWindowProcW(window, message, wParam, lParam);
+}
+#endif
 }
 
 extern "C" int platformPrepareLoad(const char *elfPath)
@@ -150,8 +190,6 @@ extern "C" int platformRaiseNativeWindow(void *nativeWindow)
     HWND window = static_cast<HWND>(nativeWindow);
     if (!window || !IsWindow(window))
         return 0;
-    const bool keepTopmost = getConfig()->alwaysOnTop != 0;
-
     if (IsIconic(window))
         ShowWindow(window, SW_RESTORE);
     else
@@ -181,23 +219,6 @@ extern "C" int platformRaiseNativeWindow(void *nativeWindow)
     SetActiveWindow(window);
     SetFocus(window);
 
-    /* A topmost round-trip is a visual fallback for foreground-lock policies.
-     * HWND_NOTOPMOST immediately restores the normal Z-order class, so this
-     * does not turn the game into a permanent always-on-top window. */
-    if (GetForegroundWindow() != window)
-    {
-        SetWindowPos(window, HWND_TOPMOST, 0, 0, 0, 0,
-                     SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
-        if (!keepTopmost)
-            SetWindowPos(window, HWND_NOTOPMOST, 0, 0, 0, 0,
-                         SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
-        SetForegroundWindow(window);
-    }
-
-    if (keepTopmost)
-        SetWindowPos(window, HWND_TOPMOST, 0, 0, 0, 0,
-                     SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
-
     if (attachedForeground)
         AttachThreadInput(currentThread, foregroundThread, FALSE);
     if (attachedWindow)
@@ -207,5 +228,28 @@ extern "C" int platformRaiseNativeWindow(void *nativeWindow)
 #else
     (void)nativeWindow;
     return 0;
+#endif
+}
+
+extern "C" void platformRememberWindowPosition(void *nativeWindow)
+{
+#if defined(_WIN32) || defined(__MINGW32__)
+    HWND window = static_cast<HWND>(nativeWindow);
+    RECT rect{};
+    if (!window || !IsWindow(window) || !GetWindowRect(window, &rect))
+        return;
+
+    g_lockedWindow = window;
+    g_lockedWindowX = rect.left;
+    g_lockedWindowY = rect.top;
+    g_lockedWindowPosition = true;
+
+    if (!g_previousWindowProc)
+    {
+        g_previousWindowProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(
+            window, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(lockedWindowProc)));
+    }
+#else
+    (void)nativeWindow;
 #endif
 }

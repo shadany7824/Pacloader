@@ -283,6 +283,14 @@ typedef struct
     char cardName[MAX_PATH_LENGTH];
 } YaCardEmuConfig;
 
+typedef struct
+{
+    int enabled;
+    int autoInsert;
+    int diagnostics;
+    char cardFile[MAX_PATH_LENGTH];
+} NamcoES1IcCardConfig;
+
 typedef YaCardEmuConfig NamcoN2CardConfig;
 
 typedef struct
@@ -346,6 +354,19 @@ typedef struct
     int dongleEnabled;
     int serialDiagnostics;
     int emulateJamma;
+    /* The cabinet's steering force, taken from the title's own FFB object. */
+    int forceFeedbackEnabled;
+    int forceFeedbackDiagnostics;
+    /* WMMT6/OpenParrot-compatible FFB tuning, in profile percentages. */
+    int ffbGain;
+    int ffbWeight;
+    int ffbSpringGain;
+    int ffbDamperGain;
+    int ffbVibrationGain;
+    int ffbBaseDamper;
+    int ffbDeadband;
+    int ffbRumbleDuration;
+    int ffbInvert;
     NamcoES1CabinetMode cabinetMode;
     /* Let a WMMT4 drive cabinet boot without a separate terminal process. */
     int terminalEmulatorEnabled;
@@ -355,6 +376,7 @@ typedef struct
     char dnsBbrouterLoc[MAX_PATH_LENGTH];
     char dnsMuchaLocal[MAX_PATH_LENGTH];
     char dnsNaominetJp[MAX_PATH_LENGTH];
+    NamcoES1IcCardConfig icCard;
     /* The terminal cabinet carries a magnetic card reader for transferring
      * WMMT3DX+ cards; the drive cabinet has none. */
     YaCardEmuConfig card;
@@ -377,7 +399,6 @@ typedef struct
     char idCardFolder[MAX_PATH_LENGTH];
     int emulateJVS;
     int fullscreen;
-    int alwaysOnTop;
     char eepromPath[MAX_PATH_LENGTH];
     char sramPath[MAX_PATH_LENGTH];
     char libCgPath[MAX_PATH_LENGTH];

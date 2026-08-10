@@ -1,14 +1,176 @@
 #include <glad/gl.h>
 #include <SDL3/SDL.h>
 #include <windows.h>
+#include <cstdlib>
+#include <mutex>
 #include <string.h>
 #include <string>
 #include <unordered_map>
 #include "glHooks.hpp"
 #include "../graphics/pacloaderGraphics.h"
+#include "../log/log.h"
 
 static thread_local uint32_t lastCompressedImageSize = 0;
 static thread_local uint32_t pendingCompressedImageSize = 0;
+
+struct FramebufferAttachment
+{
+    bool texture;
+    bool ext;
+    GLenum attachment;
+    GLenum objectTarget;
+    GLuint object;
+    GLint level;
+};
+
+static std::mutex g_framebufferLock;
+static std::unordered_map<GLuint, std::unordered_map<GLenum, FramebufferAttachment>> g_framebufferAttachments;
+
+static bool glDiagnosticEnabled();
+
+static bool glFramebufferReplayEnabled()
+{
+    static const bool enabled = std::getenv("LL_GL_REPLAY_FBO") != nullptr;
+    return enabled;
+}
+
+static GLuint currentFramebuffer()
+{
+    if (!glad_glGetIntegerv)
+        return 0;
+
+    GLint framebuffer = 0;
+    glad_glGetIntegerv(GL_FRAMEBUFFER_BINDING, &framebuffer);
+    return framebuffer > 0 ? static_cast<GLuint>(framebuffer) : 0;
+}
+
+static void forgetFramebufferIds(GLsizei n, const GLuint *framebuffers)
+{
+    if (!framebuffers)
+        return;
+
+    std::lock_guard<std::mutex> guard(g_framebufferLock);
+    for (GLsizei i = 0; i < n; ++i)
+        g_framebufferAttachments.erase(framebuffers[i]);
+}
+
+static void rememberFramebufferAttachment(GLenum attachment, bool texture, bool ext,
+                                           GLenum objectTarget, GLuint object, GLint level)
+{
+    const GLuint framebuffer = currentFramebuffer();
+    if (framebuffer == 0)
+        return;
+
+    std::lock_guard<std::mutex> guard(g_framebufferLock);
+    if (object == 0)
+    {
+        auto framebufferIt = g_framebufferAttachments.find(framebuffer);
+        if (framebufferIt != g_framebufferAttachments.end())
+        {
+            framebufferIt->second.erase(attachment);
+            if (framebufferIt->second.empty())
+                g_framebufferAttachments.erase(framebufferIt);
+        }
+        return;
+    }
+
+    g_framebufferAttachments[framebuffer][attachment] = {
+        texture, ext, attachment, objectTarget, object, level};
+}
+
+static void replayFramebufferAttachments(GLuint framebuffer)
+{
+    if (!glFramebufferReplayEnabled() || framebuffer == 0 ||
+        (!glad_glCheckFramebufferStatus && !glad_glCheckFramebufferStatusEXT))
+        return;
+
+    const GLenum status = glad_glCheckFramebufferStatus
+                              ? glad_glCheckFramebufferStatus(GL_FRAMEBUFFER)
+                              : glad_glCheckFramebufferStatusEXT(GL_FRAMEBUFFER);
+    if (status == GL_FRAMEBUFFER_COMPLETE)
+        return;
+
+    std::unordered_map<GLenum, FramebufferAttachment> attachments;
+    {
+        std::lock_guard<std::mutex> guard(g_framebufferLock);
+        auto framebufferIt = g_framebufferAttachments.find(framebuffer);
+        if (framebufferIt == g_framebufferAttachments.end())
+            return;
+        attachments = framebufferIt->second;
+    }
+
+    for (const auto &entry : attachments)
+    {
+        const FramebufferAttachment &state = entry.second;
+        if (state.texture)
+        {
+            if (state.ext && glad_glFramebufferTexture2DEXT)
+                glad_glFramebufferTexture2DEXT(GL_FRAMEBUFFER, state.attachment, state.objectTarget,
+                                                state.object, state.level);
+            else if (glad_glFramebufferTexture2D)
+                glad_glFramebufferTexture2D(GL_FRAMEBUFFER, state.attachment, state.objectTarget,
+                                            state.object, state.level);
+        }
+        else
+        {
+            if (state.ext && glad_glFramebufferRenderbufferEXT)
+                glad_glFramebufferRenderbufferEXT(GL_FRAMEBUFFER, state.attachment, state.objectTarget,
+                                                   state.object);
+            else if (glad_glFramebufferRenderbuffer)
+                glad_glFramebufferRenderbuffer(GL_FRAMEBUFFER, state.attachment, state.objectTarget,
+                                               state.object);
+        }
+    }
+
+    if (glDiagnosticEnabled())
+        log_warn("ES1 GL FBO: replay fbo=%u attachments=%zu context=%p", framebuffer, attachments.size(),
+                 static_cast<void *>(SDL_GL_GetCurrentContext()));
+}
+
+static bool glDiagnosticEnabled()
+{
+    static const bool enabled = std::getenv("LL_GL_DIAG") != nullptr;
+    return enabled;
+}
+
+static bool glLifecycleDiagnosticEnabled()
+{
+    static const bool enabled = std::getenv("LL_GL_FBO_LIFECYCLE") != nullptr;
+    return enabled;
+}
+
+static void traceFramebufferEvent(const char *operation, GLenum target, GLuint object)
+{
+    if (glLifecycleDiagnosticEnabled())
+        log_warn("ES1 GL FBO: op=%s target=0x%04x object=%u context=%p", operation, target, object,
+                 static_cast<void *>(SDL_GL_GetCurrentContext()));
+}
+
+static void traceFramebufferAttachment(const char *operation, GLenum target, GLenum attachment,
+                                       GLuint object, GLenum objectTarget)
+{
+    if (glLifecycleDiagnosticEnabled())
+        log_warn("ES1 GL FBO: op=%s target=0x%04x attachment=0x%04x object=%u objectTarget=0x%04x context=%p",
+                 operation, target, attachment, object, objectTarget,
+                 static_cast<void *>(SDL_GL_GetCurrentContext()));
+}
+
+static void traceRenderbufferStorage(const char *operation, GLenum target, GLenum internalformat,
+                                     GLsizei width, GLsizei height)
+{
+    if (glLifecycleDiagnosticEnabled())
+        log_warn("ES1 GL FBO: op=%s target=0x%04x format=0x%04x size=%dx%d context=%p", operation,
+                 target, internalformat, width, height, static_cast<void *>(SDL_GL_GetCurrentContext()));
+}
+
+static void traceFramebufferIds(const char *operation, GLsizei n, const GLuint *objects)
+{
+    if (!glLifecycleDiagnosticEnabled() || !objects)
+        return;
+
+    for (GLsizei i = 0; i < n; ++i)
+        traceFramebufferEvent(operation, 0, objects[i]);
+}
 
 extern "C" void __attribute__((cdecl)) bridgeglOrtho(
     GLdouble left, GLdouble right, GLdouble bottom, GLdouble top,
@@ -737,12 +899,16 @@ extern "C" void __attribute__((cdecl)) wrap_glGenFramebuffersEXT(GLsizei n, GLui
 {
     if (glad_glGenFramebuffersEXT)
         glad_glGenFramebuffersEXT(n, framebuffers);
+    forgetFramebufferIds(n, framebuffers);
+    traceFramebufferIds("gen-ext", n, framebuffers);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glBindFramebufferEXT(GLenum target, GLuint framebuffer)
 {
     if (glad_glBindFramebufferEXT)
         glad_glBindFramebufferEXT(target, framebuffer);
+    replayFramebufferAttachments(framebuffer);
+    traceFramebufferEvent("bind-ext", target, framebuffer);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glFramebufferTexture2DEXT(GLenum target, GLenum attachment, GLenum textarget, GLuint texture,
@@ -750,12 +916,16 @@ extern "C" void __attribute__((cdecl)) wrap_glFramebufferTexture2DEXT(GLenum tar
 {
     if (glad_glFramebufferTexture2DEXT)
         glad_glFramebufferTexture2DEXT(target, attachment, textarget, texture, level);
+    rememberFramebufferAttachment(attachment, true, true, textarget, texture, level);
+    traceFramebufferAttachment("attach-texture-ext", target, attachment, texture, textarget);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glDeleteFramebuffersEXT(GLsizei n, const GLuint *framebuffers)
 {
     if (glad_glDeleteFramebuffersEXT)
         glad_glDeleteFramebuffersEXT(n, framebuffers);
+    forgetFramebufferIds(n, framebuffers);
+    traceFramebufferIds("delete-ext", n, framebuffers);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glGenProgramsARB(GLsizei n, GLuint *programs)
@@ -848,12 +1018,16 @@ extern "C" void __attribute__((cdecl)) wrap_glGenFramebuffers(GLsizei n, GLuint 
 {
     if (glad_glGenFramebuffers)
         glad_glGenFramebuffers(n, framebuffers);
+    forgetFramebufferIds(n, framebuffers);
+    traceFramebufferIds("gen", n, framebuffers);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glBindFramebuffer(GLenum target, GLuint framebuffer)
 {
     if (glad_glBindFramebuffer)
         glad_glBindFramebuffer(target, framebuffer);
+    replayFramebufferAttachments(framebuffer);
+    traceFramebufferEvent("bind", target, framebuffer);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glFramebufferTexture2D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture,
@@ -861,12 +1035,16 @@ extern "C" void __attribute__((cdecl)) wrap_glFramebufferTexture2D(GLenum target
 {
     if (glad_glFramebufferTexture2D)
         glad_glFramebufferTexture2D(target, attachment, textarget, texture, level);
+    rememberFramebufferAttachment(attachment, true, false, textarget, texture, level);
+    traceFramebufferAttachment("attach-texture", target, attachment, texture, textarget);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glDeleteFramebuffers(GLsizei n, const GLuint *framebuffers)
 {
     if (glad_glDeleteFramebuffers)
         glad_glDeleteFramebuffers(n, framebuffers);
+    forgetFramebufferIds(n, framebuffers);
+    traceFramebufferIds("delete", n, framebuffers);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glFramebufferRenderbuffer(GLenum target, GLenum attachment, GLenum renderbuffertarget,
@@ -874,30 +1052,36 @@ extern "C" void __attribute__((cdecl)) wrap_glFramebufferRenderbuffer(GLenum tar
 {
     if (glad_glFramebufferRenderbuffer)
         glad_glFramebufferRenderbuffer(target, attachment, renderbuffertarget, renderbuffer);
+    rememberFramebufferAttachment(attachment, false, false, renderbuffertarget, renderbuffer, 0);
+    traceFramebufferAttachment("attach-renderbuffer", target, attachment, renderbuffer, renderbuffertarget);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glGenRenderbuffers(GLsizei n, GLuint *renderbuffers)
 {
     if (glad_glGenRenderbuffers)
         glad_glGenRenderbuffers(n, renderbuffers);
+    traceFramebufferIds("gen-renderbuffer", n, renderbuffers);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glBindRenderbuffer(GLenum target, GLuint renderbuffer)
 {
     if (glad_glBindRenderbuffer)
         glad_glBindRenderbuffer(target, renderbuffer);
+    traceFramebufferEvent("bind-renderbuffer", target, renderbuffer);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glRenderbufferStorage(GLenum target, GLenum internalformat, GLsizei width, GLsizei height)
 {
     if (glad_glRenderbufferStorage)
         glad_glRenderbufferStorage(target, internalformat, width, height);
+    traceRenderbufferStorage("renderbuffer-storage", target, internalformat, width, height);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glDeleteRenderbuffers(GLsizei n, const GLuint *renderbuffers)
 {
     if (glad_glDeleteRenderbuffers)
         glad_glDeleteRenderbuffers(n, renderbuffers);
+    traceFramebufferIds("delete-renderbuffer", n, renderbuffers);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glDrawBuffers(GLsizei n, const GLenum *bufs)
@@ -1318,10 +1502,11 @@ extern "C" void __attribute__((cdecl)) wrap_glDrawBuffer(GLenum mode)
         glad_glDrawBuffer(mode);
 }
 
-extern "C" void __attribute__((cdecl)) wrap_glCheckFramebufferStatusEXT(GLenum target)
+extern "C" GLenum __attribute__((cdecl)) wrap_glCheckFramebufferStatusEXT(GLenum target)
 {
     if (glad_glCheckFramebufferStatusEXT)
-        glad_glCheckFramebufferStatusEXT(target);
+        return glad_glCheckFramebufferStatusEXT(target);
+    return (GLenum)0;
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glGenBuffersARB(GLsizei n, GLuint *buffers)
@@ -1444,18 +1629,21 @@ extern "C" void __attribute__((cdecl)) wrap_glGenRenderbuffersEXT(GLsizei n, GLu
 {
     if (glad_glGenRenderbuffersEXT)
         glad_glGenRenderbuffersEXT(n, renderbuffers);
+    traceFramebufferIds("gen-renderbuffer-ext", n, renderbuffers);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glBindRenderbufferEXT(GLenum target, GLuint renderbuffer)
 {
     if (glad_glBindRenderbufferEXT)
         glad_glBindRenderbufferEXT(target, renderbuffer);
+    traceFramebufferEvent("bind-renderbuffer-ext", target, renderbuffer);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glRenderbufferStorageEXT(GLenum target, GLenum internalformat, GLsizei width, GLsizei height)
 {
     if (glad_glRenderbufferStorageEXT)
         glad_glRenderbufferStorageEXT(target, internalformat, width, height);
+    traceRenderbufferStorage("renderbuffer-storage-ext", target, internalformat, width, height);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glFramebufferRenderbufferEXT(GLenum target, GLenum attachment, GLenum renderbuffertarget,
@@ -1463,6 +1651,8 @@ extern "C" void __attribute__((cdecl)) wrap_glFramebufferRenderbufferEXT(GLenum 
 {
     if (glad_glFramebufferRenderbufferEXT)
         glad_glFramebufferRenderbufferEXT(target, attachment, renderbuffertarget, renderbuffer);
+    rememberFramebufferAttachment(attachment, false, true, renderbuffertarget, renderbuffer, 0);
+    traceFramebufferAttachment("attach-renderbuffer-ext", target, attachment, renderbuffer, renderbuffertarget);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glWindowPos2sARB(GLshort x, GLshort y)
@@ -1574,10 +1764,11 @@ extern "C" void __attribute__((cdecl)) wrap_glColor4dv(const GLdouble *v)
         glad_glColor4dv(v);
 }
 
-extern "C" void __attribute__((cdecl)) wrap_glGetUniformLocationARB(GLint program, const GLchar *name)
+extern "C" GLint __attribute__((cdecl)) wrap_glGetUniformLocationARB(GLhandleARB program, const GLcharARB *name)
 {
     if (glad_glGetUniformLocationARB)
-        glad_glGetUniformLocationARB(program, name);
+        return glad_glGetUniformLocationARB(program, name);
+    return (GLint)-1;
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glUniform1fvARB(GLint location, GLsizei count, const GLfloat *value)
@@ -1659,10 +1850,11 @@ extern "C" void __attribute__((cdecl)) wrap_glAttachObjectARB(GLhandleARB contai
         glad_glAttachObjectARB(containerObj, obj);
 }
 
-extern "C" void __attribute__((cdecl)) wrap_glCreateProgramObjectARB()
+extern "C" GLhandleARB __attribute__((cdecl)) wrap_glCreateProgramObjectARB()
 {
     if (glad_glCreateProgramObjectARB)
-        glad_glCreateProgramObjectARB();
+        return glad_glCreateProgramObjectARB();
+    return (GLhandleARB)0;
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glBindAttribLocationARB(GLhandleARB programObj, GLuint index, const GLchar *name)
@@ -1707,10 +1899,11 @@ extern "C" void __attribute__((cdecl)) wrap_glLoadProgramNV(GLenum target, GLuin
         glad_glLoadProgramNV(target, id, len, program);
 }
 
-extern "C" void __attribute__((cdecl)) wrap_glIsProgramNV(GLuint program)
+extern "C" GLboolean __attribute__((cdecl)) wrap_glIsProgramNV(GLuint program)
 {
     if (glad_glIsProgramNV)
-        glad_glIsProgramNV(program);
+        return glad_glIsProgramNV(program);
+    return (GLboolean)0;
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glTrackMatrixNV(GLenum target, GLuint address, GLenum matrix, GLenum transform)
@@ -1859,9 +2052,30 @@ extern "C" const GLubyte *__attribute__((cdecl)) wrap_glGetString(GLenum name)
 
 extern "C" GLenum __attribute__((cdecl)) wrap_glGetError()
 {
-    if (glad_glGetError)
-        return glad_glGetError();
-    return (GLenum)0;
+    const GLenum error = glad_glGetError ? glad_glGetError() : (GLenum)0;
+    if (error != GL_NO_ERROR && glDiagnosticEnabled())
+    {
+        if (error == GL_INVALID_FRAMEBUFFER_OPERATION && glad_glGetIntegerv &&
+            (glad_glCheckFramebufferStatus || glad_glCheckFramebufferStatusEXT))
+        {
+            const GLuint framebuffer = currentFramebuffer();
+            const GLenum status = glad_glCheckFramebufferStatus
+                                      ? glad_glCheckFramebufferStatus(GL_FRAMEBUFFER)
+                                      : glad_glCheckFramebufferStatusEXT(GL_FRAMEBUFFER);
+            log_warn("ES1 GL error: code=0x%04x fbo=%u status=0x%04x caller=%p tid=%lu context=%p",
+                     error, framebuffer, status, __builtin_return_address(0),
+                     static_cast<unsigned long>(GetCurrentThreadId()),
+                     static_cast<void *>(SDL_GL_GetCurrentContext()));
+        }
+        else
+        {
+            log_warn("ES1 GL error: code=0x%04x caller=%p tid=%lu context=%p", error,
+                     __builtin_return_address(0),
+                     static_cast<unsigned long>(GetCurrentThreadId()),
+                     static_cast<void *>(SDL_GL_GetCurrentContext()));
+        }
+    }
+    return error;
 }
 
 extern "C" GLboolean __attribute__((cdecl)) wrap_glIsProgramARB(GLuint program)

@@ -22,9 +22,9 @@
 #include "../input/sdlInput.h"
 #include "../hardware/common/jvs.h"
 #include "../hardware/namco/n2/n2.h"
+#include "../platform/platformBackend.h"
 #if defined(_WIN32) || defined(__MINGW32__)
 #include "../hardware/common/cardControl.h"
-#include "../platform/platformBackend.h"
 extern void bridgeX11PumpInput(void);
 #endif
 #include "../log/log.h"
@@ -173,10 +173,8 @@ void startSDL()
         SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 1);
     }
 
-    // Use a pixel-dense backbuffer for custom resolutions.
+    /* Keep the pixel-dense backbuffer expected by the cabinet renderer. */
     uint32_t windowFlags = SDL_WINDOW_OPENGL | SDL_WINDOW_HIGH_PIXEL_DENSITY | SDL_WINDOW_HIDDEN;
-    if (getConfig()->alwaysOnTop)
-        windowFlags |= SDL_WINDOW_ALWAYS_ON_TOP;
 
     g_SdlWindow = SDL_CreateWindow(getGameName(), gWidth, gHeight, windowFlags);
 
@@ -265,6 +263,10 @@ void startSDL()
     if (gId == QUIZ_AXA_SBMS || gId == QUIZ_AXA_SBUR_LIVE)
         SDL_SetWindowPosition(g_SdlWindow, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
 
+    /* Set WMMT4's windowed position before showing the hidden window. */
+    if (gGrp == GROUP_WMMT4_ES1 && !getConfig()->fullscreen)
+        SDL_SetWindowPosition(g_SdlWindow, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
+
     if (getConfig()->fullscreen)
     {
         SDL_SetWindowFullscreenMode(g_SdlWindow, NULL);
@@ -274,14 +276,18 @@ void startSDL()
 
     initBlitting();
 
-    if (gId != PRIMEVAL_HUNT_SBPP && gGrp != GROUP_LGJ)
+    if (gId != PRIMEVAL_HUNT_SBPP && gGrp != GROUP_LGJ && gGrp != GROUP_WMMT4_ES1)
         SDL_SetWindowResizable(g_SdlWindow, true);
 
     SDL_ShowWindow(g_SdlWindow);
-    if (getConfig()->alwaysOnTop && !SDL_SetWindowAlwaysOnTop(g_SdlWindow, true))
-        log_warn("Failed to keep game window on top: %s", SDL_GetError());
     raiseSDLWindow();
-
+    if (gGrp == GROUP_WMMT4_ES1 && !getConfig()->fullscreen)
+    {
+        void *nativeWindow = SDL_GetPointerProperty(
+            SDL_GetWindowProperties(g_SdlWindow),
+            SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL);
+        platformRememberWindowPosition(nativeWindow);
+    }
     Uint64 startTime = SDL_GetTicks();
     int running = 1;
 
@@ -318,9 +324,9 @@ void raiseSDLWindow(void)
     if (!g_SdlWindow)
         return;
 
-    /* Restoring first also covers a taskbar-minimized game. SDL_RaiseWindow
-     * then asks the native window manager for both Z-order and input focus. */
-    SDL_RestoreWindow(g_SdlWindow);
+    /* Restore only minimized windows; raising is not a restore operation. */
+    if (SDL_GetWindowFlags(g_SdlWindow) & SDL_WINDOW_MINIMIZED)
+        SDL_RestoreWindow(g_SdlWindow);
     if (!SDL_RaiseWindow(g_SdlWindow))
         log_warn("Failed to bring game window to foreground: %s", SDL_GetError());
 
@@ -490,15 +496,20 @@ void pollEvents()
                 break;
             case SDL_EVENT_WINDOW_RESTORED:
             {
-                if (((long long)gWidth * 3 == (long long)gHeight * 4) || gGrp == GROUP_HUMMER)
-                    SDL_SetWindowSize(g_SdlWindow, gWidth + 1, gHeight);
-                else
-                    SDL_SetWindowSize(g_SdlWindow, gWidth, gHeight + 1);
+                /* Keep the legacy resize nudge away from fixed-size ES1 windows. */
+                if (gGrp != GROUP_WMMT4_ES1)
+                {
+                    if (((long long)gWidth * 3 == (long long)gHeight * 4) || gGrp == GROUP_HUMMER)
+                        SDL_SetWindowSize(g_SdlWindow, gWidth + 1, gHeight);
+                    else
+                        SDL_SetWindowSize(g_SdlWindow, gWidth, gHeight + 1);
+                }
             }
             break;
             case SDL_EVENT_WINDOW_MOUSE_LEAVE:
             case SDL_EVENT_WINDOW_MOUSE_ENTER:
                 processSdlEvent(&event);
+                break;
             default:
                 break;
         }

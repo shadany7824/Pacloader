@@ -13,6 +13,7 @@ void *const Es1AudioHandle = reinterpret_cast<void *>(Es1AudioHandleValue);
 
 SDL_AudioStream *g_stream = nullptr;
 bool g_audioInitialized = false;
+int g_bytesPerSecond = 0;
 
 bool isNsAdrv(const char *filename)
 {
@@ -47,12 +48,16 @@ bool initializeAudio(int channels, int rate)
     spec.channels = channels > 0 ? channels : 2;
     spec.freq = rate > 0 ? rate : 48000;
 
+    /* Give WMMT4 enough host audio buffering for short scheduling stalls. */
+    SDL_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, "2048");
     g_stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr);
     if (!g_stream)
     {
         log_warn("System ES1 audio: SDL audio stream creation failed: %s", SDL_GetError());
         return false;
     }
+
+    g_bytesPerSecond = spec.freq * spec.channels * (int)sizeof(int32_t);
 
     if (!SDL_ResumeAudioStreamDevice(g_stream))
         log_warn("System ES1 audio: unable to resume SDL audio stream: %s", SDL_GetError());
@@ -86,9 +91,29 @@ extern "C" int es1NsAdrvWait(int)
     if (!g_stream)
         return 256;
 
-    /* nsAdrv reports the number of frames the game should wait for. Keep the
-     * same low-water behavior as line-mt4's SDL stream bridge. */
-    return SDL_GetAudioStreamAvailable(g_stream) >= 6144 ? 0 : 256;
+    /* Match the cabinet's blocking low-water behavior instead of busy-spinning. */
+    constexpr int LowWaterBytes = 6144;
+    const int available = SDL_GetAudioStreamAvailable(g_stream);
+    if (available < LowWaterBytes)
+        return 256;
+
+    if (g_bytesPerSecond > 0)
+    {
+        /* Cap the sleep so a stalled device cannot wedge the guest thread. */
+        const int64_t excess = available - LowWaterBytes;
+        int64_t milliseconds = (excess * 1000) / g_bytesPerSecond;
+        if (milliseconds < 1)
+            milliseconds = 1;
+        else if (milliseconds > 8)
+            milliseconds = 8;
+        SDL_Delay((Uint32)milliseconds);
+    }
+    else
+    {
+        SDL_Delay(1);
+    }
+
+    return 0;
 }
 
 extern "C" int es1NsAdrvStart()

@@ -24,6 +24,7 @@ double calculateFps(void);
 void frameTiming(void);
 uint64_t videoSyncCount(void);
 void waitVideoSync(uint64_t index);
+int consumeVideoSyncWait(void);
 
 #ifdef __cplusplus
 }

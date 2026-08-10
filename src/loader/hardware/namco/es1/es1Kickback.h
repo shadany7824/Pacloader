@@ -16,6 +16,10 @@ int es1KickbackWrite(int fd, const void *buffer, size_t count);
 int es1KickbackClose(int fd);
 int es1KickbackIoctl(int fd, unsigned long request, void *argument);
 
+/* WMMT4's STR PCB volunteers these reports instead of receiving a request. */
+void es1KickbackReportSelfCheck(void);
+void es1KickbackReportMotorPower(int running);
+
 #ifdef __cplusplus
 }
 #endif

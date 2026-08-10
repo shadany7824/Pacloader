@@ -70,6 +70,20 @@ int createDefaultIni(const char *filePath)
     fprintf(file, "# WMMT4 DRIVE only: supplies terminal settings and clock locally.\n");
     fprintf(file, "TERMINAL_EMULATOR_ENABLED = %s\n\n",
             defaults.namcoES1.terminalEmulatorEnabled ? "true" : "false");
+    fprintf(file, "FORCE_FEEDBACK_ENABLED = %s\n",
+            defaults.namcoES1.forceFeedbackEnabled ? "true" : "false");
+    fprintf(file, "FORCE_FEEDBACK_DIAGNOSTICS = %s\n",
+            defaults.namcoES1.forceFeedbackDiagnostics ? "true" : "false");
+    fprintf(file, "FFB_GAIN = %d\nFFB_WEIGHT = %d\n",
+            defaults.namcoES1.ffbGain, defaults.namcoES1.ffbWeight);
+    fprintf(file, "FFB_SPRING = %d\nFFB_DAMPER = %d\n",
+            defaults.namcoES1.ffbSpringGain, defaults.namcoES1.ffbDamperGain);
+    fprintf(file, "FFB_VIBRATION = %d\nFFB_BASE_DAMPER = %d\n",
+            defaults.namcoES1.ffbVibrationGain, defaults.namcoES1.ffbBaseDamper);
+    fprintf(file, "FFB_DEADBAND = %d\nFFB_RUMBLE_DURATION = %d\n",
+            defaults.namcoES1.ffbDeadband, defaults.namcoES1.ffbRumbleDuration);
+    fprintf(file, "FFB_INVERT = %s\n\n",
+            defaults.namcoES1.ffbInvert ? "true" : "false");
 
     fprintf(file, "# Optional WMMT4 hostname redirects; blank uses normal DNS.\n");
     fprintf(file, "DNS_NBGI_LOC = \"%s\"\n", defaults.namcoES1.dnsNbgiLoc);
@@ -77,6 +91,14 @@ int createDefaultIni(const char *filePath)
     fprintf(file, "DNS_BBROUTER_LOC = \"%s\"\n", defaults.namcoES1.dnsBbrouterLoc);
     fprintf(file, "DNS_MUCHA_LOCAL = \"%s\"\n", defaults.namcoES1.dnsMuchaLocal);
     fprintf(file, "DNS_NAOMINET_JP = \"%s\"\n\n", defaults.namcoES1.dnsNaominetJp);
+
+    fprintf(file, "IC_CARD_ENABLED = %s\n",
+            defaults.namcoES1.icCard.enabled ? "true" : "false");
+    fprintf(file, "IC_CARD_AUTO_INSERT = %s\n",
+            defaults.namcoES1.icCard.autoInsert ? "true" : "false");
+    fprintf(file, "IC_CARD_DIAGNOSTICS = %s\n",
+            defaults.namcoES1.icCard.diagnostics ? "true" : "false");
+    fprintf(file, "IC_CARD_FILE = \"%s\"\n\n", defaults.namcoES1.icCard.cardFile);
 
     fprintf(file, "# Magnetic card reader, for transferring WMMT3DX+ cards.\n");
     fprintf(file, "# TERMINAL cabinets only; the drive cabinet has no reader.\n");
@@ -92,7 +114,6 @@ int createDefaultIni(const char *filePath)
 
     fprintf(file, "[Display]\nWIDTH = AUTO\nHEIGHT = AUTO\n");
     fprintf(file, "FULLSCREEN = %s\n", defaults.fullscreen ? "true" : "false");
-    fprintf(file, "ALWAYS_ON_TOP = %s\n", defaults.alwaysOnTop ? "true" : "false");
     fprintf(file, "KEEP_ASPECT_RATIO = %s\n", defaults.keepAspectRatio ? "true" : "false");
     fprintf(file, "HIDE_CURSOR = %s\n\n", defaults.hideCursor ? "true" : "false");
 
