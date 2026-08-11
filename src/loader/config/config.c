@@ -141,6 +141,10 @@ void setDefaultValues(EmulatorConfig *cfg)
     cfg->namcoES1.icCard.autoInsert = 1;
     cfg->namcoES1.icCard.diagnostics = 0;
     strcpy(cfg->namcoES1.icCard.cardFile, "wmmt4-card.ini");
+    cfg->namcoES1.legacyCard.enabled = 0;
+    cfg->namcoES1.legacyCard.autoInsert = 1;
+    cfg->namcoES1.legacyCard.diagnostics = 0;
+    strcpy(cfg->namcoES1.legacyCard.cardFile, "wmmt3dx-card.bin");
     cfg->namcoES1.forceFeedbackEnabled = 1;
     cfg->namcoES1.forceFeedbackDiagnostics = 0;
     cfg->namcoES1.ffbGain = 100;
@@ -466,6 +470,14 @@ void applyIniConfig(EmulatorConfig *config, const IniConfig *ini)
         getInt(ini, "NamcoES1", "IC_CARD_DIAGNOSTICS", config->namcoES1.icCard.diagnostics);
     getString(ini, "NamcoES1", "IC_CARD_FILE", config->namcoES1.icCard.cardFile,
               sizeof(config->namcoES1.icCard.cardFile));
+    config->namcoES1.legacyCard.enabled = getInt(
+        ini, "NamcoES1", "LEGACY_CARD_ENABLED", config->namcoES1.legacyCard.enabled);
+    config->namcoES1.legacyCard.autoInsert = getInt(
+        ini, "NamcoES1", "LEGACY_CARD_AUTO_INSERT", config->namcoES1.legacyCard.autoInsert);
+    config->namcoES1.legacyCard.diagnostics = getInt(
+        ini, "NamcoES1", "LEGACY_CARD_DIAGNOSTICS", config->namcoES1.legacyCard.diagnostics);
+    getString(ini, "NamcoES1", "LEGACY_CARD_FILE", config->namcoES1.legacyCard.cardFile,
+              sizeof(config->namcoES1.legacyCard.cardFile));
 
     // [NamcoN2]
     getString(ini, "NamcoN2", "DONGLE_ID", config->namcoN2.dongleId,

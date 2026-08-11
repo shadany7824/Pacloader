@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <fstream>
 #include <filesystem>
 #include <iomanip>
 #include <mutex>
@@ -42,9 +43,23 @@ constexpr size_t maximumQueuedBytes = 64 * 1024;
 const char *g_devicePath = "/dev/ttyM2";
 bool g_useEs1Config = false;
 
+std::atomic<bool> localCardInserted{false};
+std::vector<uint8_t> localCardData;
+
 const YaCardEmuConfig &cardConfig()
 {
     return g_useEs1Config ? getConfig()->namcoES1.card : getConfig()->namcoN2.card;
+}
+
+bool localReaderEnabled()
+{
+    return g_useEs1Config && getConfig()->namcoES1.legacyCard.enabled;
+}
+
+bool readerDiagnostics()
+{
+    return localReaderEnabled() ? getConfig()->namcoES1.legacyCard.diagnostics
+                                : cardConfig().diagnostics;
 }
 
 enum class LinkState
@@ -78,7 +93,7 @@ std::atomic<bool> cardInserted{false};
 
 void logFrame(const char *direction, const uint8_t *bytes, size_t size)
 {
-    if (!cardConfig().diagnostics || !bytes || !size)
+    if (!readerDiagnostics() || !bytes || !size)
         return;
 
     std::ostringstream line;
@@ -401,6 +416,188 @@ void neutraliseCancelStatus(std::vector<uint8_t> &frame)
     frame[7] ^= illegalCommand ^ noJob; // The BCC is an XOR over LEN..ETX.
 }
 
+bool readLegacyCard(std::vector<uint8_t> &data)
+{
+    const std::string fileName = getConfig()->namcoES1.legacyCard.cardFile;
+    std::ifstream card(fileName, std::ios::binary);
+    if (card)
+    {
+        data.assign(std::istreambuf_iterator<char>(card), std::istreambuf_iterator<char>());
+    }
+    else
+    {
+        data.clear();
+        for (int track = 0; track < 3; track++)
+        {
+            std::ifstream part(fileName + ".track_" + std::to_string(track), std::ios::binary);
+            if (!part)
+                return false;
+            std::vector<uint8_t> bytes(std::istreambuf_iterator<char>(part), {});
+            data.insert(data.end(), bytes.begin(), bytes.end());
+        }
+    }
+    return data.size() == 0x45 * 3;
+}
+
+std::vector<uint8_t> makeReaderFrame(uint8_t command, uint8_t readerState,
+                                     uint8_t errorState, uint8_t jobState,
+                                     const std::vector<uint8_t> &data = {})
+{
+    std::vector<uint8_t> payload = {command, readerState, errorState, jobState};
+    payload.insert(payload.end(), data.begin(), data.end());
+    const uint8_t length = static_cast<uint8_t>(payload.size() + 2);
+    std::vector<uint8_t> frame = {0x02, length};
+    frame.insert(frame.end(), payload.begin(), payload.end());
+    frame.push_back(0x03);
+    uint8_t checksum = length;
+    for (const uint8_t byte : payload)
+        checksum ^= byte;
+    checksum ^= 0x03;
+    frame.push_back(checksum);
+    return frame;
+}
+
+void queueReaderBytes(const uint8_t *bytes, size_t size)
+{
+    std::lock_guard<std::mutex> lock(bufferMutex);
+    if (receiveQueue.size() + size > maximumQueuedBytes)
+        return;
+    receiveQueue.insert(receiveQueue.end(), bytes, bytes + size);
+}
+
+void queueReaderBytes(const std::vector<uint8_t> &bytes)
+{
+    queueReaderBytes(bytes.data(), bytes.size());
+}
+
+std::vector<uint8_t> localReaderResponse(const std::vector<uint8_t> &request,
+                                         bool &ejectPending)
+{
+    if (request.size() < 7)
+        return {};
+
+    const uint8_t command = request[2];
+    constexpr uint8_t noCard = 0x30;
+    constexpr uint8_t cardOverMag = 0x31;
+    constexpr uint8_t cardInSlot = 0x34;
+    constexpr uint8_t noError = 0x30;
+    constexpr uint8_t illegalError = 0x38;
+    constexpr uint8_t jobEnd = 0x30;
+    constexpr uint8_t awaitingCard = 0x34;
+
+    switch (command)
+    {
+    case 0x10:
+    case 0x20:
+    case 0x40:
+    case 0xB0:
+        return makeReaderFrame(command, localCardInserted.load() ? cardOverMag : noCard,
+                                noError, jobEnd);
+    case 0xF0:
+    {
+        const std::vector<uint8_t> version{'L', 'O', 'C', 'A', 'L'};
+        return makeReaderFrame(command, localCardInserted.load() ? cardOverMag : noCard,
+                               noError, jobEnd, version);
+    }
+    case 0x33:
+    {
+        const bool fullRead = request.size() > 6 && request[6] == 0x30;
+        if (!localCardInserted.load())
+            return makeReaderFrame(command, noCard, noError, awaitingCard);
+        return makeReaderFrame(command, cardOverMag, noError, jobEnd,
+                               fullRead ? localCardData : std::vector<uint8_t>{});
+    }
+    case 0x80:
+        ejectPending = true;
+        return makeReaderFrame(command, cardInSlot, noError, jobEnd);
+    case 0x53:
+        return makeReaderFrame(command, cardOverMag, noError, jobEnd);
+    default:
+        return makeReaderFrame(command, noCard, illegalError, jobEnd);
+    }
+}
+
+void localCardWorker()
+{
+    if (!readLegacyCard(localCardData))
+    {
+        log_error("Namco ES1 legacy card: expected a 207-byte MT3CardTools dump: %s",
+                  getConfig()->namcoES1.legacyCard.cardFile);
+        linkState.store(LinkState::Disconnected, std::memory_order_release);
+        workerRunning.store(false, std::memory_order_release);
+        return;
+    }
+
+    localCardInserted.store(getConfig()->namcoES1.legacyCard.autoInsert != 0,
+                            std::memory_order_release);
+    linkState.store(LinkState::Connected, std::memory_order_release);
+    log_info("Namco ES1 legacy card reader: loaded %s (207 bytes)",
+             getConfig()->namcoES1.legacyCard.cardFile);
+
+    std::deque<uint8_t> incoming;
+    std::vector<uint8_t> response;
+    bool awaitingEnq = false;
+    bool ejectPending = false;
+    while (!workerStopRequested.load(std::memory_order_relaxed))
+    {
+        std::vector<uint8_t> outgoing;
+        {
+            std::lock_guard<std::mutex> lock(bufferMutex);
+            outgoing.assign(transmitQueue.begin(), transmitQueue.end());
+            transmitQueue.clear();
+        }
+        incoming.insert(incoming.end(), outgoing.begin(), outgoing.end());
+
+        while (!incoming.empty())
+        {
+            if (awaitingEnq)
+            {
+                if (incoming.front() != 0x05)
+                {
+                    incoming.pop_front();
+                    continue;
+                }
+                incoming.pop_front();
+                queueReaderBytes(response);
+                logFrame("RX", response.data(), response.size());
+                response.clear();
+                awaitingEnq = false;
+                if (ejectPending)
+                {
+                    localCardInserted.store(false, std::memory_order_release);
+                    ejectPending = false;
+                }
+                continue;
+            }
+
+            if (incoming.front() == 0x05)
+            {
+                incoming.pop_front();
+                continue;
+            }
+            const size_t length = framedLength(incoming);
+            if (length == 0)
+                break;
+            if (length == 1)
+            {
+                incoming.pop_front();
+                continue;
+            }
+            std::vector<uint8_t> request(incoming.begin(), incoming.begin() + length);
+            incoming.erase(incoming.begin(), incoming.begin() + length);
+            logFrame("TX", request.data(), request.size());
+            const uint8_t ack = 0x06;
+            queueReaderBytes(&ack, 1);
+            response = localReaderResponse(request, ejectPending);
+            awaitingEnq = true;
+        }
+        Sleep(1);
+    }
+
+    linkState.store(LinkState::Disconnected, std::memory_order_release);
+    workerRunning.store(false, std::memory_order_release);
+}
+
 void dropQueues()
 {
     /* A reconnect starts a fresh conversation; carrying half of the previous one
@@ -585,12 +782,11 @@ void ensureWorkerStarted()
 {
     std::call_once(workerOnce, []() {
         workerRunning.store(true, std::memory_order_release);
-        workerThread = std::thread(cardWorker);
+        workerThread = std::thread(localReaderEnabled() ? localCardWorker : cardWorker);
         workerThread.detach();
     });
-    std::call_once(controlWorkerOnce, []() {
-        std::thread(cardControlWorker).detach();
-    });
+    if (!localReaderEnabled())
+        std::call_once(controlWorkerOnce, []() { std::thread(cardControlWorker).detach(); });
 }
 
 bool linkIsUp()
@@ -639,18 +835,30 @@ extern "C" const char *n2CardReaderConnectionText(void)
     ensureWorkerStarted();
     if (linkState.load(std::memory_order_acquire) != LinkState::Connected)
         return "Disconnected";
+    if (localReaderEnabled())
+        return "Local WMMT3DX+ card";
     return apiConnected.load(std::memory_order_acquire) ? "Connected" : "Reader only";
 }
 
 extern "C" void n2CardReaderRequestInsert(void)
 {
     ensureWorkerStarted();
+    if (localReaderEnabled())
+    {
+        localCardInserted.store(true, std::memory_order_release);
+        return;
+    }
     queueControlRequest(ControlRequest::Insert);
 }
 
 extern "C" void n2CardReaderRequestEject(void)
 {
     ensureWorkerStarted();
+    if (localReaderEnabled())
+    {
+        localCardInserted.store(false, std::memory_order_release);
+        return;
+    }
     queueControlRequest(ControlRequest::Eject);
 }
 
@@ -681,7 +889,7 @@ CardControlConnectionState n2CardConnectionState(void)
 extern "C" void n2CardReaderRegisterCardControl(void)
 {
     const CardControlBackend backend = {
-        "Namco N2 external YaCardEmu",
+        localReaderEnabled() ? "Namco ES1 local legacy card" : "Namco N2 external YaCardEmu",
         n2SetCardInsertState,
         n2RequestCardEject,
         n2CardConnectionState,
@@ -701,11 +909,12 @@ extern "C" void n2CardReaderLogDiagnostics(void)
         receiveBytes = receiveQueue.size();
         transmitBytes = transmitQueue.size();
     }
-    log_info("Namco N2 card diagnostics: pipe=%s api=%s inserted=%s rx=%zu tx=%zu",
+    log_info("Namco card diagnostics: link=%s inserted=%s rx=%zu tx=%zu",
              linkState.load(std::memory_order_acquire) == LinkState::Connected
                  ? "connected" : "disconnected",
-             apiConnected.load(std::memory_order_acquire) ? "connected" : "disconnected",
-             cardInserted.load(std::memory_order_acquire) ? "yes" : "no",
+             (localReaderEnabled() ? localCardInserted.load(std::memory_order_acquire)
+                                   : cardInserted.load(std::memory_order_acquire))
+                 ? "yes" : "no",
              receiveBytes, transmitBytes);
 }
 

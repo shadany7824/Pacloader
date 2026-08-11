@@ -34,8 +34,7 @@ const char *g_heartbeatSerial = nullptr;
 bool terminalEmulatorEnabled()
 {
     const NamcoES1Config &config = getConfig()->namcoES1;
-    return config.terminalEmulatorEnabled &&
-           config.cabinetMode == NAMCO_ES1_CABINET_DRIVE;
+    return config.terminalEmulatorEnabled != 0;
 }
 
 using TerminalPacket = std::vector<uint8_t>;
@@ -147,27 +146,15 @@ TerminalPacket makeTerminalMessage(uint32_t frameNumber, uint32_t now)
     appendProtoMessage(message, 8, makeTerminalBatchSettings(now));
 
     TerminalPacket information;
-    appendProtoInt32(information, 1, 14); // terminal setting mode
+    appendProtoInt32(information, 1, 14);
     appendProtoInt32(information, 2, -1);
     appendProtoInt32(information, 3, 0);
+    appendProtoInt32(information, 4, 0);
     appendProtoInt32(information, 5, 0);
     appendProtoInt32(information, 6, 0);
-    appendProtoUInt32(information, 8, 0);
-    appendProtoUInt32(information, 9, 0);
-    appendProtoUInt32(information, 10, 0);
-    appendProtoInt32(information, 11, 0);
-    /* game_server_options: field and format still unknown.  Fields 4 and 7 are
-     * the ones never filled in, and the parser is a boost::xpressive static
-     * regex, so LL_WMMT4_GSO_FIELD/VALUE exist to find them by experiment. */
-    static const int optionsField = [] {
-        const char *value = std::getenv("LL_WMMT4_GSO_FIELD");
-        return value ? std::atoi(value) : 0;
-    }();
-    if (optionsField > 0)
-    {
-        const char *value = std::getenv("LL_WMMT4_GSO_VALUE");
-        appendProtoString(information, static_cast<unsigned>(optionsField), value ? value : "");
-    }
+    appendProtoString(information, 7, "");
+    for (unsigned field = 8; field <= 14; ++field)
+        appendProtoInt32(information, field, 0);
     appendProtoMessage(message, 9, information);
     return message;
 }

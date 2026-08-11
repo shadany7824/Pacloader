@@ -100,6 +100,16 @@ int createDefaultIni(const char *filePath)
             defaults.namcoES1.icCard.diagnostics ? "true" : "false");
     fprintf(file, "IC_CARD_FILE = \"%s\"\n\n", defaults.namcoES1.icCard.cardFile);
 
+    fprintf(file, "# WMMT3DX+ magnetic card dump used by the terminal reader.\n");
+    fprintf(file, "LEGACY_CARD_ENABLED = %s\n",
+            defaults.namcoES1.legacyCard.enabled ? "true" : "false");
+    fprintf(file, "LEGACY_CARD_AUTO_INSERT = %s\n",
+            defaults.namcoES1.legacyCard.autoInsert ? "true" : "false");
+    fprintf(file, "LEGACY_CARD_DIAGNOSTICS = %s\n",
+            defaults.namcoES1.legacyCard.diagnostics ? "true" : "false");
+    fprintf(file, "LEGACY_CARD_FILE = \"%s\"\n\n",
+            defaults.namcoES1.legacyCard.cardFile);
+
     fprintf(file, "# Magnetic card reader, for transferring WMMT3DX+ cards.\n");
     fprintf(file, "# TERMINAL cabinets only; the drive cabinet has no reader.\n");
     fprintf(file, "YACARDEMU_ENABLED = %s\n", defaults.namcoES1.card.enabled ? "true" : "false");
@@ -117,7 +127,7 @@ int createDefaultIni(const char *filePath)
     fprintf(file, "KEEP_ASPECT_RATIO = %s\n", defaults.keepAspectRatio ? "true" : "false");
     fprintf(file, "HIDE_CURSOR = %s\n\n", defaults.hideCursor ? "true" : "false");
 
-    fprintf(file, "[Emulation]\nREGION = JP\nFREEPLAY = none\nEMULATE_JVS = true\n\n");
+    fprintf(file, "[Emulation]\nREGION = JP\nFREEPLAY = none\nEMULATE_JVS = true\nEMULATE_TOUCHSCREEN = false\n\n");
     fprintf(file, "[Graphics]\nFPS_LIMITER_ENABLED = %s\nFPS_TARGET = %.1f\n\n",
             defaults.fpsLimiter ? "true" : "false", defaults.fpsTarget);
     fprintf(file, "[System]\nDEBUG_MSGS = %s\n",

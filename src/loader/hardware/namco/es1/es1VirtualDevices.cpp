@@ -663,7 +663,8 @@ extern "C" int es1MagneticCardEnabled(void)
 {
     return platformIsES1() &&
            getConfig()->namcoES1.cabinetMode == NAMCO_ES1_CABINET_TERMINAL &&
-           getConfig()->namcoES1.card.enabled;
+           (getConfig()->namcoES1.card.enabled ||
+            getConfig()->namcoES1.legacyCard.enabled);
 }
 
 extern "C" void es1MagneticCardStart(void)
@@ -676,8 +677,7 @@ extern "C" void es1MagneticCardStart(void)
     /* Connect now: the title opens the port once and treats a single failure
      * as a missing reader, so the pipe must already be up by then. */
     n2CardReaderStart();
-    log_info("System ES1: magnetic card reader on /dev/ttyS1 via YaCardEmu pipe \"%s\"",
-             getConfig()->namcoES1.card.pipeName);
+    log_info("System ES1: magnetic card reader enabled on /dev/ttyS1");
 }
 
 namespace

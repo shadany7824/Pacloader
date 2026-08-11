@@ -291,6 +291,14 @@ typedef struct
     char cardFile[MAX_PATH_LENGTH];
 } NamcoES1IcCardConfig;
 
+typedef struct
+{
+    int enabled;
+    int autoInsert;
+    int diagnostics;
+    char cardFile[MAX_PATH_LENGTH];
+} NamcoES1LegacyCardConfig;
+
 typedef YaCardEmuConfig NamcoN2CardConfig;
 
 typedef struct
@@ -377,6 +385,7 @@ typedef struct
     char dnsMuchaLocal[MAX_PATH_LENGTH];
     char dnsNaominetJp[MAX_PATH_LENGTH];
     NamcoES1IcCardConfig icCard;
+    NamcoES1LegacyCardConfig legacyCard;
     /* The terminal cabinet carries a magnetic card reader for transferring
      * WMMT3DX+ cards; the drive cabinet has none. */
     YaCardEmuConfig card;

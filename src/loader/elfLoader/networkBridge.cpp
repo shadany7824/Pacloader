@@ -10,6 +10,8 @@
 #include "../hardware/namco/n2/n2Host.h"
 #include "../hardware/namco/es1/es1.h"
 #include "../hardware/namco/es1/es1Network.h"
+#include "../hardware/namco/es1/es1Title.h"
+#include "../hardware/namco/es1/wmmt4/es1Wmmt4.h"
 #include "../hardware/namco/es1/wmmt4/es1Wmmt4Network.hpp"
 #include "virtualDeviceRegistry.hpp"
 
@@ -25,6 +27,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <new>
+#include <string>
 #include <unordered_set>
 #include <vector>
 
@@ -822,6 +825,18 @@ extern "C" int bridgeConnect(SOCKET s, const struct sockaddr *name, int namelen)
         rewritten = makeConfiguredBindAddress(name, namelen,
                                               configuredAddress, configuredLength);
     }
+    if (!rewritten && es1IsDetected() && name &&
+        namelen >= static_cast<int>(sizeof(sockaddr_in)) &&
+        name->sa_family == AF_INET &&
+        reinterpret_cast<const sockaddr_in *>(name)->sin_addr.s_addr == htonl(INADDR_ANY) &&
+        ntohs(reinterpret_cast<const sockaddr_in *>(name)->sin_port) == 50765)
+    {
+        auto *loopback = reinterpret_cast<sockaddr_in *>(&configuredAddress);
+        *loopback = *reinterpret_cast<const sockaddr_in *>(name);
+        loopback->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        configuredLength = sizeof(sockaddr_in);
+        rewritten = true;
+    }
     const sockaddr *destination = rewritten ? reinterpret_cast<const sockaddr *>(&configuredAddress) : name;
     const bool es1LocalTerminal = es1IsDetected() && rewritten && destination &&
                                   destination->sa_family == AF_INET &&
@@ -1128,9 +1143,6 @@ extern "C" int bridgeSendto(SOCKET s, const char *buf, int len, int flags, const
     flags &= ~(0x4000 | 0x40);
     sockaddr_storage configuredAddress = {};
     int configuredLength = tolen;
-    /* Leave the discovery destination as multicast: the guest's
-     * IP_MULTICAST_IF already selects the adapter, and rewriting it to unicast
-     * makes the cabinet hear its own status twice. */
     bool rewritten = !isEs1MulticastAddress(to, tolen) &&
                      makeEs1MulticastAddress(to, tolen, configuredAddress, configuredLength);
     if (!rewritten)
@@ -2209,9 +2221,17 @@ extern "C" int NetworkBridge::bridgeGetaddrinfo(const char *node, const char *se
 
     struct addrinfo *hostResult = nullptr;
     const char *lookupNode = wmmt4RedirectedHost(node);
+    static const bool traceDns = std::getenv("LL_WMMT4_DNS_TRACE") != nullptr;
+    if (traceDns && node)
+        log_info("LLDNS getaddrinfo %s%s%s -> %s", node, service ? ":" : "",
+                 service ? service : "", lookupNode);
     const int error = getaddrinfo(lookupNode, service, hostHintsPointer, &hostResult);
     if (error != 0)
+    {
+        if (traceDns && node)
+            log_info("LLDNS getaddrinfo %s failed error=%d", node, error);
         return error;
+    }
 
     LinuxAddrinfo *first = nullptr;
     LinuxAddrinfo *previous = nullptr;
@@ -2255,6 +2275,15 @@ extern "C" int NetworkBridge::bridgeGetaddrinfo(const char *node, const char *se
 
     freeaddrinfo(hostResult);
     *result = first;
+    if (traceDns && node)
+    {
+        const sockaddr_in *address = first && first->aiAddr
+            ? reinterpret_cast<const sockaddr_in *>(first->aiAddr) : nullptr;
+        char text[INET_ADDRSTRLEN] = {};
+        if (address)
+            InetNtopA(AF_INET, &address->sin_addr, text, sizeof(text));
+        log_info("LLDNS getaddrinfo %s resolved %s", node, text[0] ? text : "(none)");
+    }
     return 0;
 }
 
@@ -2371,6 +2400,9 @@ extern "C" void *bridgeGethostbyname(const char *name)
         log_debug("gethostbyname(\"%s\") found no address", name ? name : "(null)");
         return nullptr;
     }
+
+    if (std::getenv("LL_WMMT4_DNS_TRACE") && name)
+        log_info("LLDNS gethostbyname %s resolved", name);
 
     log_trace("gethostbyname(\"%s\") = %u.%u.%u.%u", name,
               (unsigned)(uint8_t)record->h_addr_list[0][0], (unsigned)(uint8_t)record->h_addr_list[0][1],

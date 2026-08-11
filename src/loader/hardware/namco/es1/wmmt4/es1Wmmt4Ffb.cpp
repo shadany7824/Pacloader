@@ -311,6 +311,7 @@ extern "C" void wmmt4FfbSetVibrate(void *object, float value)
 extern "C" void wmmt4FfbPowerOn(void *object, int running)
 {
     GuestTls::HostCallScope hostCall;
+    es1KickbackReportMotorPower(1);
     if (g_originalPowerOn)
         g_originalPowerOn(object, running);
     g_powerActive = true;
@@ -318,12 +319,12 @@ extern "C" void wmmt4FfbPowerOn(void *object, int running)
     g_outputArmed = false;
     g_oneShotPending = false;
     g_neutralFrames = 0;
-    es1KickbackReportMotorPower(1);
 }
 
 extern "C" void wmmt4FfbPowerOff(void *object, int running)
 {
     GuestTls::HostCallScope hostCall;
+    es1KickbackReportMotorPower(0);
     if (g_originalPowerOff)
         g_originalPowerOff(object, running);
     g_powerActive = false;
@@ -332,7 +333,6 @@ extern "C" void wmmt4FfbPowerOff(void *object, int running)
     g_oneShotPending = false;
     g_neutralFrames = 0;
     disableHostFfb();
-    es1KickbackReportMotorPower(0);
 }
 
 extern "C" void wmmt4FfbStartSelfCheck(void *object)

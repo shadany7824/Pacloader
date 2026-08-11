@@ -305,8 +305,10 @@ void startSDL()
 
     printf("  RESOLUTION: %dx%d\n", gWidth, gHeight);
 
-    if (getConfig()->hideCursor)
+    if (getConfig()->hideCursor && !getConfig()->emulateTouchscreen)
         SDL_HideCursor();
+    else
+        SDL_ShowCursor();
 }
 
 SDL_Window *getSDLWindow()

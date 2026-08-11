@@ -8,6 +8,7 @@
 #include "../../../../elfLoader/guestTls.hpp"
 
 #include "../../../../config/config.h"
+#include "../../../../graphics/sdlCalls.h"
 #include "../../../../input/sdlInput.h"
 #include "../../../../log/log.h"
 #include "../../../common/jvs.h"
@@ -24,6 +25,9 @@
 #include <vector>
 
 #include <windows.h>
+
+extern int gWidth;
+extern int gHeight;
 
 namespace
 {
@@ -368,13 +372,32 @@ extern "C" void wmmt4TouchUpdate(Wmmt4TouchIo *touch)
     if (!touch)
         return;
 
-    /* Report a panel that booted and is not being touched.  Pointer input is
-     * not wired up yet, so the terminal menu stays idle rather than reacting
-     * to stale coordinates. */
     touch->booted = 1;
     touch->positionX = 0;
     touch->positionY = 0;
     touch->touched = 0;
+
+    if (!getConfig()->emulateTouchscreen)
+        return;
+
+    SDL_Window *window = getSDLWindow();
+    if (!window || !(SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS))
+        return;
+
+    float mouseX = 0.0f;
+    float mouseY = 0.0f;
+    const SDL_MouseButtonFlags buttons = SDL_GetMouseState(&mouseX, &mouseY);
+    int windowWidth = 0;
+    int windowHeight = 0;
+    SDL_GetWindowSize(window, &windowWidth, &windowHeight);
+    if (windowWidth <= 0 || windowHeight <= 0)
+        return;
+
+    const int targetWidth = gWidth > 0 ? gWidth : windowWidth;
+    const int targetHeight = gHeight > 0 ? gHeight : windowHeight;
+    touch->positionX = std::clamp(static_cast<int>(mouseX * targetWidth / windowWidth), 0, targetWidth - 1);
+    touch->positionY = std::clamp(static_cast<int>(mouseY * targetHeight / windowHeight), 0, targetHeight - 1);
+    touch->touched = (buttons & SDL_BUTTON_LMASK) != 0;
 }
 
 extern "C" bool wmmt4NetworkAddressChanged(void *)
@@ -697,7 +720,10 @@ extern "C" int es1Wmmt4InstallHooks(void)
         getConfig()->namcoES1.cabinetMode == NAMCO_ES1_CABINET_TERMINAL;
     log_info("System ES1 WMMT4: cabinet mode %s, virtual HASP S/N %.12s",
              terminal ? "TERMINAL" : "DRIVE", g_haspData.system.serial);
-    wmmt4StartTerminalEmulator(DriveHaspSerial);
+    if (!terminal || std::getenv("LL_WMMT4_FORCE_TERMINAL_EMULATOR"))
+        wmmt4StartTerminalEmulator(g_haspData.system.serial);
+    else if (getConfig()->namcoES1.terminalEmulatorEnabled)
+        log_warn("System ES1 WMMT4: terminal emulator disabled in TERMINAL cabinet mode");
 
     const Es1HookSpec hooks[] = {
         /* The JVIO subsystem is left unhooked: the title runs a real JVS master
@@ -715,8 +741,6 @@ extern "C" int es1Wmmt4InstallHooks(void)
         {TouchUpdateAddress, reinterpret_cast<void *>(wmmt4TouchUpdate), "Sys_Device_TouchIo_update"},
         {NetworkAddressChangedAddress, reinterpret_cast<void *>(wmmt4NetworkAddressChanged),
          "Sys_Net_interface_isAddressChange"},
-        {NetworkUpdateStateAddress, reinterpret_cast<void *>(wmmt4NetworkUpdateState),
-         "Sys_Network_UpdateState"},
         {NetworkInterfaceUpdateAddress, reinterpret_cast<void *>(wmmt4NetworkInterfaceUpdate),
          "Sys_Net_Interface_update"},
         {LoadRequestAddress, reinterpret_cast<void *>(wmmt4LoadRequest),
@@ -727,6 +751,18 @@ extern "C" int es1Wmmt4InstallHooks(void)
          "directory_filename_match", reinterpret_cast<void **>(&g_originalFilenameMatch)},
     };
     int installed = es1InstallHookTable(hooks, sizeof(hooks) / sizeof(hooks[0]), "WMMT4");
+    if (!std::getenv("LL_WMMT4_NATIVE_NETWORK_STATE"))
+    {
+        const Es1HookSpec networkStateHook[] = {
+            {NetworkUpdateStateAddress, reinterpret_cast<void *>(wmmt4NetworkUpdateState),
+             "Sys_Network_UpdateState"},
+        };
+        installed += es1InstallHookTable(networkStateHook, 1, "WMMT4 network state");
+    }
+    else
+    {
+        log_warn("System ES1 WMMT4: using native network state updates");
+    }
     installed += wmmt4InstallCardHooks() + wmmt4InstallFfbHooks();
     wmmt4InstallNetworkDiagnostics();
 
