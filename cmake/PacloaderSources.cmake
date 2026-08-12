@@ -11,6 +11,8 @@ set(PACLOADER_SOURCES
     src/loader/config/iniParser.c
     src/loader/frontend/frontendApi.c
 
+    src/loader/diagnostics/perfProfiler.cpp
+
     src/loader/elfLoader/cppBridge.cpp
     src/loader/elfLoader/elfLoader.cpp
     src/loader/elfLoader/alsaCompatBridge.cpp

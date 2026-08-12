@@ -1,4 +1,5 @@
 #include "pacloaderGraphics.h"
+#include "../elfLoader/glHooks.hpp"
 
 #if defined(PACLOADER_BUILD)
 
@@ -47,6 +48,7 @@ void bridgeglBindTexture(GLenum target, GLuint texture)
 {
     if (glad_glBindTexture)
         glad_glBindTexture(target, texture);
+    GLHooks_NotifyTextureBinding(target, texture);
 }
 
 /* NV_fence is absent on many AMD and Intel drivers.  Present the NV API the

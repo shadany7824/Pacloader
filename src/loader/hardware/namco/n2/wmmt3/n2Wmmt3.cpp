@@ -291,7 +291,9 @@ extern "C" int n2Wmmt3HandleSystemCommand(const char *command)
         };
         for (const FindCommand &item : commands)
         {
-            if (std::strncmp(command, item.prefix, std::strlen(item.prefix)) != 0)
+            const size_t prefixLength = std::strlen(item.prefix);
+            const size_t extensionLength = std::strlen(item.extension);
+            if (std::strncmp(command, item.prefix, prefixLength) != 0)
                 continue;
 
             std::vector<std::string> matches;
@@ -301,8 +303,8 @@ extern "C" int n2Wmmt3HandleSystemCommand(const char *command)
                 for (const auto &entry : std::filesystem::directory_iterator(item.directory, iteratorError))
                 {
                     const std::string name = entry.path().filename().string();
-                    if (entry.is_regular_file() && name.size() >= std::strlen(item.extension) &&
-                        name.compare(name.size() - std::strlen(item.extension), std::strlen(item.extension), item.extension) == 0)
+                    if (entry.is_regular_file() && name.size() >= extensionLength &&
+                        name.compare(name.size() - extensionLength, extensionLength, item.extension) == 0)
                         matches.push_back(name);
                 }
             }

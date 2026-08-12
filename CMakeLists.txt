@@ -1,6 +1,14 @@
 cmake_minimum_required(VERSION 3.16)
 project(pacloader LANGUAGES C CXX)
 
+option(PACLOADER_ENABLE_LTO
+    "Enable link-time optimization for non-Debug pacloader builds"
+    OFF)
+
+option(PACLOADER_ENABLE_PORTABLE_TUNING
+    "Enable non-native optimization tuning that preserves broad CPU compatibility"
+    OFF)
+
 if(NOT (WIN32 OR MINGW OR CMAKE_C_COMPILER MATCHES "mingw"))
     message(FATAL_ERROR "pacloader currently targets 32-bit Windows/MinGW only")
 endif()
@@ -44,6 +52,41 @@ target_compile_options(pacloader PRIVATE
     -Wno-unused-parameter
     -Wimplicit-fallthrough=0
     -Wstrict-aliasing=0)
+
+# RelWithDebInfo defaults to -O2.  The loader has a large amount of small
+# bridge code spread across translation units, so -O3 plus LTO is useful here:
+# it lets GCC perform cross-TU inlining, propagation and dead-code removal.
+# Keep Debug builds untouched for source-level debugging and ABI diagnostics.
+if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
+    target_compile_options(pacloader PRIVATE -O3)
+    target_compile_options(minhook PRIVATE -O3)
+
+    if(PACLOADER_ENABLE_PORTABLE_TUNING)
+        target_compile_options(pacloader PRIVATE
+            -fno-semantic-interposition
+            -fno-math-errno
+            -fno-trapping-math
+            -ftree-vectorize)
+        target_compile_options(minhook PRIVATE
+            -fno-semantic-interposition
+            -fno-math-errno
+            -fno-trapping-math
+            -ftree-vectorize)
+    endif()
+
+    if(PACLOADER_ENABLE_LTO)
+        include(CheckIPOSupported)
+        check_ipo_supported(RESULT PACLOADER_IPO_SUPPORTED
+                            OUTPUT PACLOADER_IPO_ERROR
+                            LANGUAGES C CXX)
+        if(PACLOADER_IPO_SUPPORTED)
+            set_property(TARGET minhook PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+            set_property(TARGET pacloader PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
+        else()
+            message(WARNING "LTO is unavailable; using -O3 without LTO: ${PACLOADER_IPO_ERROR}")
+        endif()
+    endif()
+endif()
 
 target_link_options(pacloader PRIVATE
     -m32

@@ -1,12 +1,15 @@
 #include <glad/gl.h>
 #include <SDL3/SDL.h>
 #include <windows.h>
+#include <array>
 #include <cstdlib>
 #include <mutex>
 #include <string.h>
 #include <string>
 #include <unordered_map>
+#include <vector>
 #include "glHooks.hpp"
+#include "../diagnostics/perfProfiler.hpp"
 #include "../graphics/pacloaderGraphics.h"
 #include "../log/log.h"
 
@@ -25,6 +28,627 @@ struct FramebufferAttachment
 
 static std::mutex g_framebufferLock;
 static std::unordered_map<GLuint, std::unordered_map<GLenum, FramebufferAttachment>> g_framebufferAttachments;
+
+namespace
+{
+constexpr size_t kStateCacheSlots = 32;
+constexpr size_t kTextureBindingSets = 16;
+constexpr size_t kTextureBindingWays = 4;
+constexpr size_t kTextureBindingSlots = kTextureBindingSets * kTextureBindingWays;
+constexpr size_t kTextureParameterSlots = 256;
+constexpr size_t kBufferBindingSlots = 8;
+constexpr size_t kAttribSlots = 32;
+
+struct IntStateSlot
+{
+    bool valid = false;
+    GLenum unit = 0;
+    GLenum target = 0;
+    GLenum pname = 0;
+    GLint value = 0;
+};
+
+struct TextureParameterSlot
+{
+    bool valid = false;
+    void *context = nullptr;
+    GLenum unit = 0;
+    GLenum target = 0;
+    GLenum pname = 0;
+    GLuint texture = 0;
+    GLint value = 0;
+};
+
+struct TextureBindingSlot
+{
+    bool valid = false;
+    GLenum unit = 0;
+    GLenum target = 0;
+    GLuint texture = 0;
+};
+
+struct BufferBindingSlot
+{
+    bool valid = false;
+    GLenum target = 0;
+    GLuint buffer = 0;
+};
+
+struct VertexAttribPointerSlot
+{
+    bool valid = false;
+    GLuint index = 0;
+    GLint size = 0;
+    GLenum type = 0;
+    GLboolean normalized = GL_FALSE;
+    GLsizei stride = 0;
+    const GLvoid *pointer = nullptr;
+    GLuint arrayBuffer = 0;
+};
+
+struct GlStateCache
+{
+    bool activeTextureValid = false;
+    GLenum activeTexture = GL_TEXTURE0;
+    IntStateSlot texEnv[kStateCacheSlots]{};
+    TextureParameterSlot texParameters[kTextureParameterSlots]{};
+    TextureBindingSlot textureBindings[kTextureBindingSlots]{};
+    BufferBindingSlot bufferBindings[kBufferBindingSlots]{};
+    unsigned char attribEnabled[kAttribSlots]{};
+    VertexAttribPointerSlot attribPointers[kAttribSlots]{};
+};
+
+thread_local GlStateCache g_glStateCache;
+thread_local std::vector<GLuint> g_recycledBuffers;
+struct StreamBufferRecord
+{
+    bool active = false;
+    bool pooled = false;
+    bool hasData = false;
+    bool hostAllocated = false;
+    GLenum target = 0;
+    GLenum usage = 0;
+    GLsizeiptr size = 0;
+    GLenum allocatedTarget = 0;
+    GLenum allocatedUsage = 0;
+    GLsizeiptr allocatedSize = 0;
+};
+
+thread_local std::vector<GLuint> g_streamRecycledBuffers;
+thread_local std::unordered_map<GLuint, StreamBufferRecord> g_streamBufferRecords;
+thread_local void *g_glContextTag = nullptr;
+
+GLuint currentBuffer(GLenum target);
+
+bool glStateCacheEnabled()
+{
+    /* The cache is still useful for controlled A/B profiling, but it changes
+     * the guest-visible GL state assumptions. Keep it opt-in under an explicit
+     * experimental value so stale `LL_GL_STATE_CACHE=1` settings cannot make a
+     * normal game launch use the risky path. */
+    static const bool enabled = [] {
+        const char *setting = std::getenv("LL_GL_STATE_CACHE");
+        return setting && strcmp(setting, "experimental") == 0;
+    }();
+    return enabled;
+}
+
+bool glBufferPoolEnabled()
+{
+    /* Reusing a deleted OpenGL name without a guest-to-host name map is not
+     * semantically safe: another context may still own the object, and the
+     * guest may rely on deletion clearing its state. Keep this experimental
+     * path opt-in under an explicit unsafe value while retaining the code for
+     * future mapped-buffer work. */
+    static const bool enabled = [] {
+        const char *setting = std::getenv("LL_GL_BUFFER_POOL");
+        return setting && strcmp(setting, "unsafe") == 0;
+    }();
+    return enabled;
+}
+
+bool glStreamBufferPoolEnabled()
+{
+    static const bool enabled = [] {
+        const char *setting = std::getenv("LL_GL_BUFFER_POOL");
+        return setting && strcmp(setting, "stream") == 0;
+    }();
+    return enabled;
+}
+
+bool glStreamBufferDataReuseEnabled()
+{
+    static const bool enabled = [] {
+        const char *setting = std::getenv("LL_GL_BUFFER_DATA_REUSE");
+        return setting && strcmp(setting, "1") == 0;
+    }();
+    return enabled;
+}
+
+bool streamBufferSizeCandidate(GLsizeiptr size)
+{
+    return size == 64 || size == 192 || size == 768 || size == 960 || size == 1920;
+}
+
+void beginStreamBuffer(GLuint buffer)
+{
+    if (!glStreamBufferPoolEnabled() || buffer == 0)
+        return;
+    StreamBufferRecord &record = g_streamBufferRecords[buffer];
+    record.active = true;
+    record.pooled = false;
+    record.hasData = false;
+}
+
+void rememberStreamBufferData(GLenum target, GLsizeiptr size, GLenum usage)
+{
+    if (!glStreamBufferPoolEnabled())
+        return;
+    const GLuint buffer = currentBuffer(target);
+    if (buffer == 0)
+        return;
+    StreamBufferRecord &record = g_streamBufferRecords[buffer];
+    record.active = true;
+    record.pooled = false;
+    record.hasData = true;
+    record.target = target;
+    record.usage = usage;
+    record.size = size;
+    record.hostAllocated = true;
+    record.allocatedTarget = target;
+    record.allocatedUsage = usage;
+    record.allocatedSize = size;
+}
+
+bool streamBufferDataCanReuse(GLenum target, GLsizeiptr size, GLenum usage,
+                              const GLvoid *data)
+{
+    if (!glStreamBufferDataReuseEnabled() || !data || !glStreamBufferPoolEnabled())
+        return false;
+    const GLuint buffer = currentBuffer(target);
+    if (buffer == 0)
+        return false;
+    auto it = g_streamBufferRecords.find(buffer);
+    if (it == g_streamBufferRecords.end())
+        return false;
+    const StreamBufferRecord &record = it->second;
+    return record.active && !record.pooled && record.hostAllocated &&
+           record.allocatedTarget == target && record.allocatedUsage == usage &&
+           record.allocatedSize == size;
+}
+
+bool streamBufferIsCandidate(GLuint buffer)
+{
+    if (!glStreamBufferPoolEnabled() || buffer == 0)
+        return false;
+    auto it = g_streamBufferRecords.find(buffer);
+    if (it == g_streamBufferRecords.end())
+        return false;
+    const StreamBufferRecord &record = it->second;
+    return record.active && !record.pooled && record.hasData &&
+           record.target == GL_ARRAY_BUFFER && record.usage == GL_STREAM_DRAW &&
+           streamBufferSizeCandidate(record.size);
+}
+
+bool takeStreamRecycledBuffer(GLuint *buffer)
+{
+    if (!glStreamBufferPoolEnabled() || !buffer || g_streamRecycledBuffers.empty())
+        return false;
+    *buffer = g_streamRecycledBuffers.back();
+    g_streamRecycledBuffers.pop_back();
+    beginStreamBuffer(*buffer);
+    PerfProfiler_CacheSkip("StreamBufferPoolGen");
+    return true;
+}
+
+bool glBufferTraceEnabled()
+{
+    static const bool enabled = [] {
+        const char *setting = std::getenv("LL_GL_BUFFER_TRACE");
+        return setting && strcmp(setting, "1") == 0;
+    }();
+    return enabled;
+}
+
+bool glTextureQueryCacheEnabled()
+{
+    static const bool enabled = [] {
+        const char *setting = std::getenv("LL_GL_TEX_QUERY_CACHE");
+        return !setting || strcmp(setting, "0") != 0;
+    }();
+    return enabled;
+}
+
+bool glTextureResidentCacheEnabled()
+{
+    static const bool enabled = [] {
+        const char *setting = std::getenv("LL_GL_TEX_RESIDENT_CACHE");
+        /* Residency changes are invalidated on texture image updates and
+         * object deletion. Keep this narrow cache enabled by default; the
+         * environment switch remains available for driver A/B tests. */
+        return !setting || strcmp(setting, "0") != 0;
+    }();
+    return enabled;
+}
+
+GLenum currentTextureUnit()
+{
+    return g_glStateCache.activeTextureValid ? g_glStateCache.activeTexture : GL_TEXTURE0;
+}
+
+TextureBindingSlot *findTextureBinding(GLenum unit, GLenum target, bool create)
+{
+    const uintptr_t key = (static_cast<uintptr_t>(unit) * 1315423911u) ^
+                          (static_cast<uintptr_t>(target) * 2654435761u);
+    const size_t first = (key % kTextureBindingSets) * kTextureBindingWays;
+    TextureBindingSlot *freeSlot = nullptr;
+    for (size_t way = 0; way < kTextureBindingWays; ++way)
+    {
+        TextureBindingSlot &slot = g_glStateCache.textureBindings[first + way];
+        if (slot.valid && slot.unit == unit && slot.target == target)
+            return &slot;
+        if (!slot.valid && !freeSlot)
+            freeSlot = &slot;
+    }
+    if (create && freeSlot)
+    {
+        freeSlot->valid = true;
+        freeSlot->unit = unit;
+        freeSlot->target = target;
+        freeSlot->texture = 0;
+        return freeSlot;
+    }
+    return nullptr;
+}
+
+GLuint currentTexture(GLenum target)
+{
+    TextureBindingSlot *slot = findTextureBinding(currentTextureUnit(), target, false);
+    return slot ? slot->texture : 0;
+}
+
+IntStateSlot *findTexEnvSlot(GLenum unit, GLenum target, GLenum pname, bool create)
+{
+    IntStateSlot *freeSlot = nullptr;
+    for (IntStateSlot &slot : g_glStateCache.texEnv)
+    {
+        if (slot.valid && slot.unit == unit && slot.target == target && slot.pname == pname)
+            return &slot;
+        if (!slot.valid && !freeSlot)
+            freeSlot = &slot;
+    }
+    if (create && freeSlot)
+    {
+        freeSlot->valid = true;
+        freeSlot->unit = unit;
+        freeSlot->target = target;
+        freeSlot->pname = pname;
+        return freeSlot;
+    }
+    return nullptr;
+}
+
+bool shouldSkipTexEnv(GLenum target, GLenum pname, GLint value)
+{
+    if (!glStateCacheEnabled())
+        return false;
+    IntStateSlot *slot = findTexEnvSlot(currentTextureUnit(), target, pname, false);
+    if (!slot)
+    {
+        slot = findTexEnvSlot(currentTextureUnit(), target, pname, true);
+        if (slot)
+            slot->value = value;
+        return false;
+    }
+    if (slot->value == value)
+    {
+        PerfProfiler_CacheSkip("TexEnv");
+        return true;
+    }
+    slot->value = value;
+    return false;
+}
+
+void invalidateTexEnv(GLenum target, GLenum pname)
+{
+    for (IntStateSlot &slot : g_glStateCache.texEnv)
+    {
+        if (slot.valid && slot.unit == currentTextureUnit() && slot.target == target &&
+            slot.pname == pname)
+            slot.valid = false;
+    }
+}
+
+TextureParameterSlot *findTextureParameterSlot(GLenum unit, GLenum target, GLenum pname,
+                                                GLuint texture, bool create)
+{
+    const uintptr_t key = (static_cast<uintptr_t>(unit) * 1315423911u) ^
+                          (static_cast<uintptr_t>(target) * 2654435761u) ^
+                          (static_cast<uintptr_t>(pname) * 2246822519u) ^ texture;
+    TextureParameterSlot &slot =
+        g_glStateCache.texParameters[key % kTextureParameterSlots];
+    if (slot.valid && slot.context == g_glContextTag && slot.unit == unit &&
+        slot.target == target && slot.pname == pname && slot.texture == texture)
+        return &slot;
+    if (create)
+    {
+        slot.valid = true;
+        slot.context = g_glContextTag;
+        slot.unit = unit;
+        slot.target = target;
+        slot.pname = pname;
+        slot.texture = texture;
+        slot.value = 0;
+        return &slot;
+    }
+    return nullptr;
+}
+
+bool cacheableTextureParameter(GLenum pname)
+{
+    return pname == GL_TEXTURE_MAG_FILTER || pname == GL_TEXTURE_MIN_FILTER ||
+           pname == GL_TEXTURE_WRAP_S || pname == GL_TEXTURE_WRAP_T ||
+           pname == GL_TEXTURE_WRAP_R ||
+           (pname == GL_TEXTURE_RESIDENT && glTextureResidentCacheEnabled());
+}
+
+bool shouldSkipTexParameteri(GLenum target, GLenum pname, GLint value)
+{
+    if (!glStateCacheEnabled() || !cacheableTextureParameter(pname))
+        return false;
+    TextureParameterSlot *slot = findTextureParameterSlot(
+        currentTextureUnit(), target, pname, currentTexture(target), false);
+    if (!slot)
+    {
+        slot = findTextureParameterSlot(
+            currentTextureUnit(), target, pname, currentTexture(target), true);
+        if (slot)
+            slot->value = value;
+        return false;
+    }
+    if (slot->value == value)
+    {
+        PerfProfiler_CacheSkip("TexParameteri");
+        return true;
+    }
+    slot->value = value;
+    return false;
+}
+
+bool cachedTexParameter(GLenum target, GLenum pname, GLint *params)
+{
+    if (!glTextureQueryCacheEnabled() || !params || !cacheableTextureParameter(pname))
+        return false;
+    TextureParameterSlot *slot = findTextureParameterSlot(
+        currentTextureUnit(), target, pname, currentTexture(target), false);
+    if (!slot)
+        return false;
+    *params = slot->value;
+    PerfProfiler_CacheSkip("GetTexParameteriv");
+    return true;
+}
+
+void rememberTexParameter(GLenum target, GLenum pname, GLint value)
+{
+    if (!glTextureQueryCacheEnabled() || !cacheableTextureParameter(pname))
+        return;
+    TextureParameterSlot *slot = findTextureParameterSlot(
+        currentTextureUnit(), target, pname, currentTexture(target), true);
+    if (slot)
+        slot->value = value;
+}
+
+void invalidateTexParameter(GLenum target, GLenum pname)
+{
+    for (TextureParameterSlot &slot : g_glStateCache.texParameters)
+    {
+        if (slot.valid && slot.unit == currentTextureUnit() && slot.target == target &&
+            slot.pname == pname && slot.texture == currentTexture(target))
+            slot.valid = false;
+    }
+}
+
+void invalidateDeletedTextures(GLsizei n, const GLuint *textures)
+{
+    if (!textures)
+        return;
+    for (GLsizei i = 0; i < n; ++i)
+    {
+        const GLuint texture = textures[i];
+        for (TextureParameterSlot &slot : g_glStateCache.texParameters)
+        {
+            if (slot.valid && slot.texture == texture)
+                slot.valid = false;
+        }
+        for (TextureBindingSlot &slot : g_glStateCache.textureBindings)
+        {
+            if (slot.valid && slot.texture == texture)
+                slot.texture = 0;
+        }
+    }
+}
+
+BufferBindingSlot *findBufferBinding(GLenum target, bool create)
+{
+    BufferBindingSlot *freeSlot = nullptr;
+    for (BufferBindingSlot &slot : g_glStateCache.bufferBindings)
+    {
+        if (slot.valid && slot.target == target)
+            return &slot;
+        if (!slot.valid && !freeSlot)
+            freeSlot = &slot;
+    }
+    if (create && freeSlot)
+    {
+        freeSlot->valid = true;
+        freeSlot->target = target;
+        freeSlot->buffer = 0;
+        return freeSlot;
+    }
+    return nullptr;
+}
+
+GLuint currentBuffer(GLenum target)
+{
+    BufferBindingSlot *slot = findBufferBinding(target, false);
+    return slot ? slot->buffer : 0;
+}
+
+bool shouldSkipBindBuffer(GLenum target, GLuint buffer)
+{
+    if (!glStateCacheEnabled())
+        return false;
+    BufferBindingSlot *slot = findBufferBinding(target, false);
+    if (!slot)
+    {
+        slot = findBufferBinding(target, true);
+        if (slot)
+            slot->buffer = buffer;
+        return false;
+    }
+    if (slot->buffer == buffer)
+    {
+        PerfProfiler_CacheSkip("BindBuffer");
+        return true;
+    }
+    slot->buffer = buffer;
+    return false;
+}
+
+void rememberBufferBinding(GLenum target, GLuint buffer)
+{
+    BufferBindingSlot *slot = findBufferBinding(target, true);
+    if (slot)
+        slot->buffer = buffer;
+}
+
+bool shouldSkipAttribEnabled(GLuint index, bool enabled)
+{
+    if (!glStateCacheEnabled() || index >= kAttribSlots)
+        return false;
+    const unsigned char desired = enabled ? 2 : 1;
+    if (g_glStateCache.attribEnabled[index] == desired)
+    {
+        PerfProfiler_CacheSkip(enabled ? "EnableVertexAttribArray" : "DisableVertexAttribArray");
+        return true;
+    }
+    g_glStateCache.attribEnabled[index] = desired;
+    return false;
+}
+
+bool shouldSkipAttribPointer(GLuint index, GLint size, GLenum type, GLboolean normalized,
+                             GLsizei stride, const GLvoid *pointer)
+{
+    if (!glStateCacheEnabled() || index >= kAttribSlots)
+        return false;
+    VertexAttribPointerSlot &slot = g_glStateCache.attribPointers[index];
+    const GLuint arrayBuffer = currentBuffer(GL_ARRAY_BUFFER);
+    if (slot.valid && slot.index == index && slot.size == size && slot.type == type &&
+        slot.normalized == normalized && slot.stride == stride && slot.pointer == pointer &&
+        slot.arrayBuffer == arrayBuffer)
+    {
+        PerfProfiler_CacheSkip("VertexAttribPointer");
+        return true;
+    }
+    slot.valid = true;
+    slot.index = index;
+    slot.size = size;
+    slot.type = type;
+    slot.normalized = normalized;
+    slot.stride = stride;
+    slot.pointer = pointer;
+    slot.arrayBuffer = arrayBuffer;
+    return false;
+}
+
+void callBindBuffer(GLenum target, GLuint buffer)
+{
+    if (glad_glBindBuffer)
+        glad_glBindBuffer(target, buffer);
+    else if (glad_glBindBufferARB)
+        glad_glBindBufferARB(target, buffer);
+    rememberBufferBinding(target, buffer);
+}
+
+void unbindDeletedBuffers(GLsizei n, const GLuint *buffers)
+{
+    if (!buffers)
+        return;
+    for (BufferBindingSlot &slot : g_glStateCache.bufferBindings)
+    {
+        if (!slot.valid)
+            continue;
+        for (GLsizei i = 0; i < n; ++i)
+        {
+            if (slot.buffer == buffers[i])
+            {
+                callBindBuffer(slot.target, 0);
+                break;
+            }
+        }
+    }
+}
+
+bool takeRecycledBuffer(GLuint *buffer)
+{
+    if (!glBufferPoolEnabled() || !buffer || g_recycledBuffers.empty())
+        return false;
+    *buffer = g_recycledBuffers.back();
+    g_recycledBuffers.pop_back();
+    PerfProfiler_CacheSkip("GenBuffersPool");
+    return true;
+}
+
+void recycleBuffers(GLsizei n, const GLuint *buffers)
+{
+    if (!glBufferPoolEnabled() || !buffers)
+        return;
+    unbindDeletedBuffers(n, buffers);
+    for (GLsizei i = 0; i < n; ++i)
+    {
+        if (buffers[i] != 0)
+        {
+            g_recycledBuffers.push_back(buffers[i]);
+            PerfProfiler_CacheSkip("DeleteBuffersPool");
+        }
+    }
+}
+}
+
+extern "C" void GLHooks_ResetStateCache()
+{
+    g_glStateCache = GlStateCache{};
+}
+
+extern "C" void GLHooks_NotifyContextCurrent(void *context)
+{
+    if (g_glContextTag != context)
+    {
+        g_glStateCache = GlStateCache{};
+        g_recycledBuffers.clear();
+        g_streamRecycledBuffers.clear();
+        g_streamBufferRecords.clear();
+        g_glContextTag = context;
+    }
+    else
+    {
+        g_glStateCache = GlStateCache{};
+        g_streamRecycledBuffers.clear();
+        g_streamBufferRecords.clear();
+    }
+}
+
+extern "C" void GLHooks_NotifyTextureBinding(unsigned int target, unsigned int texture)
+{
+    TextureBindingSlot *slot = findTextureBinding(currentTextureUnit(), static_cast<GLenum>(target), true);
+    if (slot)
+        slot->texture = static_cast<GLuint>(texture);
+}
+
+extern "C" void GLHooks_NotifyTextureDeleted(int count, const unsigned int *textures)
+{
+    invalidateDeletedTextures(static_cast<GLsizei>(count), reinterpret_cast<const GLuint *>(textures));
+}
 
 static bool glDiagnosticEnabled();
 
@@ -176,12 +800,14 @@ extern "C" void __attribute__((cdecl)) bridgeglOrtho(
     GLdouble left, GLdouble right, GLdouble bottom, GLdouble top,
     GLdouble nearPlane, GLdouble farPlane)
 {
+    PERF_PROFILE_SCOPE("GL");
     glad_glOrtho(left, right, bottom, top, nearPlane, farPlane);
 }
 
 extern "C" void __attribute__((cdecl)) bridgeglViewport(
     GLint x, GLint y, GLsizei width, GLsizei height)
 {
+    PERF_PROFILE_SCOPE("GL");
     glad_glViewport(x, y, width, height);
 }
 
@@ -189,6 +815,8 @@ extern "C" void __attribute__((cdecl)) bridgeglTexImage2D(
     GLenum target, GLint level, GLint internalFormat, GLsizei width,
     GLsizei height, GLint border, GLenum format, GLenum type, const void *pixels)
 {
+    PERF_PROFILE_SCOPE("GL");
+    invalidateTexParameter(target, GL_TEXTURE_RESIDENT);
     glad_glTexImage2D(target, level, internalFormat, width, height, border, format, type, pixels);
 }
 
@@ -205,7 +833,13 @@ static GLint clampToEdge(GLenum name, GLint value)
 extern "C" void __attribute__((cdecl)) bridgeglTexParameteri(
     GLenum target, GLenum name, GLint value)
 {
-    glad_glTexParameteri(target, name, clampToEdge(name, value));
+    PERF_PROFILE_SCOPE("GL");
+    const GLint clampedValue = clampToEdge(name, value);
+    if (shouldSkipTexParameteri(target, name, clampedValue))
+        return;
+    if (glad_glTexParameteri)
+        glad_glTexParameteri(target, name, clampedValue);
+    rememberTexParameter(target, name, clampedValue);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glBlitFramebufferEXT(
@@ -213,12 +847,14 @@ extern "C" void __attribute__((cdecl)) wrap_glBlitFramebufferEXT(
     GLint dstX0, GLint dstY0, GLint dstX1, GLint dstY1,
     GLbitfield mask, GLenum filter)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glBlitFramebufferEXT)
         glad_glBlitFramebufferEXT(srcX0, srcY0, srcX1, srcY1, dstX0, dstY0, dstX1, dstY1, mask, filter);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glGetQueryiv(GLenum target, GLenum pname, GLint *params)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glGetQueryiv)
         glad_glGetQueryiv(target, pname, params);
 }
@@ -226,6 +862,7 @@ extern "C" void __attribute__((cdecl)) wrap_glGetQueryiv(GLenum target, GLenum p
 extern "C" void __attribute__((cdecl)) wrap_glMultiDrawArrays(GLenum mode, const GLint *first,
                                                                 const GLsizei *count, GLsizei drawcount)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glMultiDrawArrays)
         glad_glMultiDrawArrays(mode, first, count, drawcount);
 }
@@ -233,6 +870,7 @@ extern "C" void __attribute__((cdecl)) wrap_glMultiDrawArrays(GLenum mode, const
 extern "C" void __attribute__((cdecl)) wrap_glRenderbufferStorageMultisampleEXT(
     GLenum target, GLsizei samples, GLenum internalformat, GLsizei width, GLsizei height)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glRenderbufferStorageMultisampleEXT)
         glad_glRenderbufferStorageMultisampleEXT(target, samples, internalformat, width, height);
 }
@@ -246,276 +884,324 @@ uint32_t GLHooks_ConsumeCompressedImageSize()
 
 extern "C" void __attribute__((cdecl)) wrap_glBegin(GLenum mode)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glBegin)
         glad_glBegin(mode);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glEnd()
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glEnd)
         glad_glEnd();
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glVertex3f(GLfloat x, GLfloat y, GLfloat z)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glVertex3f)
         glad_glVertex3f(x, y, z);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glColor4f(GLfloat r, GLfloat g, GLfloat b, GLfloat a)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glColor4f)
         glad_glColor4f(r, g, b, a);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glEnable(GLenum cap)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glEnable)
         glad_glEnable(cap);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glDisable(GLenum cap)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glDisable)
         glad_glDisable(cap);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glMatrixMode(GLenum mode)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glMatrixMode)
         glad_glMatrixMode(mode);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glLoadIdentity()
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glLoadIdentity)
         glad_glLoadIdentity();
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glPushMatrix()
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glPushMatrix)
         glad_glPushMatrix();
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glPopMatrix()
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glPopMatrix)
         glad_glPopMatrix();
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glTranslated(GLdouble x, GLdouble y, GLdouble z)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glTranslated)
         glad_glTranslated(x, y, z);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glTranslatef(GLfloat x, GLfloat y, GLfloat z)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glTranslatef)
         glad_glTranslatef(x, y, z);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glRotatef(GLfloat a, GLfloat x, GLfloat y, GLfloat z)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glRotatef)
         glad_glRotatef(a, x, y, z);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glScalef(GLfloat x, GLfloat y, GLfloat z)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glScalef)
         glad_glScalef(x, y, z);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glDepthRange(GLclampd n, GLclampd f)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glDepthRange)
         glad_glDepthRange(n, f);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glPolygonOffset(GLfloat factor, GLfloat units)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glPolygonOffset)
         glad_glPolygonOffset(factor, units);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glFlush()
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glFlush)
         glad_glFlush();
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glFinish()
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glFinish)
         glad_glFinish();
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glClear(GLbitfield mask)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glClear)
         glad_glClear(mask);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glClearColor(GLclampf r, GLclampf g, GLclampf b, GLclampf a)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glClearColor)
         glad_glClearColor(r, g, b, a);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glDeleteTextures(GLsizei n, const GLuint *textures)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glDeleteTextures)
         glad_glDeleteTextures(n, textures);
+    GLHooks_NotifyTextureDeleted(n, reinterpret_cast<const unsigned int *>(textures));
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glGenTextures(GLsizei n, GLuint *textures)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glGenTextures)
         glad_glGenTextures(n, textures);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glGetLightfv(GLenum light, GLenum pname, GLfloat *params)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glGetLightfv)
         glad_glGetLightfv(light, pname, params);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glCullFace(GLenum mode)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glCullFace)
         glad_glCullFace(mode);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glFrontFace(GLenum mode)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glFrontFace)
         glad_glFrontFace(mode);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glHint(GLenum target, GLenum mode)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glHint)
         glad_glHint(target, mode);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glLineWidth(GLfloat width)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glLineWidth)
         glad_glLineWidth(width);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glPointSize(GLfloat size)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glPointSize)
         glad_glPointSize(size);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glPolygonMode(GLenum face, GLenum mode)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glPolygonMode)
         glad_glPolygonMode(face, mode);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glScissor(GLint x, GLint y, GLsizei width, GLsizei height)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glScissor)
         glad_glScissor(x, y, width, height);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glShadeModel(GLenum mode)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glShadeModel)
         glad_glShadeModel(mode);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glPixelStorei(GLenum pname, GLint param)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glPixelStorei)
         glad_glPixelStorei(pname, param);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glPixelStoref(GLenum pname, GLfloat param)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glPixelStoref)
         glad_glPixelStoref(pname, param);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glGetBooleanv(GLenum pname, GLboolean *params)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glGetBooleanv)
         glad_glGetBooleanv(pname, params);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glGetDoublev(GLenum pname, GLdouble *params)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glGetDoublev)
         glad_glGetDoublev(pname, params);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glGetFloatv(GLenum pname, GLfloat *params)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glGetFloatv)
         glad_glGetFloatv(pname, params);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glGetIntegerv(GLenum pname, GLint *params)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glGetIntegerv)
         glad_glGetIntegerv(pname, params);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glPushAttrib(GLbitfield mask)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glPushAttrib)
         glad_glPushAttrib(mask);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glPopAttrib()
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glPopAttrib)
         glad_glPopAttrib();
+    GLHooks_ResetStateCache();
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glPushClientAttrib(GLbitfield mask)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glPushClientAttrib)
         glad_glPushClientAttrib(mask);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glPopClientAttrib()
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glPopClientAttrib)
         glad_glPopClientAttrib();
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glAlphaFunc(GLenum func, GLclampf ref)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glAlphaFunc)
         glad_glAlphaFunc(func, ref);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glBlendFunc(GLenum sfactor, GLenum dfactor)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glBlendFunc)
         glad_glBlendFunc(sfactor, dfactor);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glLogicOp(GLenum opcode)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glLogicOp)
         glad_glLogicOp(opcode);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glStencilFunc(GLenum func, GLint ref, GLuint mask)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glStencilFunc)
         glad_glStencilFunc(func, ref, mask);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glStencilOp(GLenum fail, GLenum zfail, GLenum zpass)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glStencilOp)
         glad_glStencilOp(fail, zfail, zpass);
 }
@@ -523,6 +1209,7 @@ extern "C" void __attribute__((cdecl)) wrap_glStencilOp(GLenum fail, GLenum zfai
 extern "C" void __attribute__((cdecl)) wrap_glStencilFuncSeparate(GLenum face, GLenum func,
                                                                     GLint ref, GLuint mask)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glStencilFuncSeparate)
         glad_glStencilFuncSeparate(face, func, ref, mask);
 }
@@ -530,186 +1217,227 @@ extern "C" void __attribute__((cdecl)) wrap_glStencilFuncSeparate(GLenum face, G
 extern "C" void __attribute__((cdecl)) wrap_glStencilOpSeparate(GLenum face, GLenum fail,
                                                                  GLenum zfail, GLenum zpass)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glStencilOpSeparate)
         glad_glStencilOpSeparate(face, fail, zfail, zpass);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glDepthFunc(GLenum func)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glDepthFunc)
         glad_glDepthFunc(func);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glDepthMask(GLboolean flag)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glDepthMask)
         glad_glDepthMask(flag);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glLightfv(GLenum light, GLenum pname, const GLfloat *params)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glLightfv)
         glad_glLightfv(light, pname, params);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glLightf(GLenum light, GLenum pname, GLfloat param)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glLightf)
         glad_glLightf(light, pname, param);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glLightModelfv(GLenum pname, const GLfloat *params)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glLightModelfv)
         glad_glLightModelfv(pname, params);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glMaterialfv(GLenum face, GLenum pname, const GLfloat *params)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glMaterialfv)
         glad_glMaterialfv(face, pname, params);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glNormal3f(GLfloat nx, GLfloat ny, GLfloat nz)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glNormal3f)
         glad_glNormal3f(nx, ny, nz);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glTexCoord2f(GLfloat s, GLfloat t)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glTexCoord2f)
         glad_glTexCoord2f(s, t);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glTexCoord2fv(const GLfloat *v)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glTexCoord2fv)
         glad_glTexCoord2fv(v);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glActiveTexture(GLenum texture)
 {
+    PERF_PROFILE_SCOPE("GL");
+    if (glStateCacheEnabled() && g_glStateCache.activeTextureValid &&
+        g_glStateCache.activeTexture == texture)
+        return;
+    g_glStateCache.activeTextureValid = true;
+    g_glStateCache.activeTexture = texture;
     if (glad_glActiveTexture)
         glad_glActiveTexture(texture);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glMultiTexCoord2f(GLenum target, GLfloat s, GLfloat t)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glMultiTexCoord2f)
         glad_glMultiTexCoord2f(target, s, t);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glMultiTexCoord2fv(GLenum target, const GLfloat *v)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glMultiTexCoord2fv)
         glad_glMultiTexCoord2fv(target, v);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glActiveTextureARB(GLenum texture)
 {
+    PERF_PROFILE_SCOPE("GL");
+    if (glStateCacheEnabled() && g_glStateCache.activeTextureValid &&
+        g_glStateCache.activeTexture == texture)
+        return;
+    g_glStateCache.activeTextureValid = true;
+    g_glStateCache.activeTexture = texture;
     if (glad_glActiveTextureARB)
         glad_glActiveTextureARB(texture);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glMultiTexCoord2fARB(GLenum target, GLfloat s, GLfloat t)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glMultiTexCoord2fARB)
         glad_glMultiTexCoord2fARB(target, s, t);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glMultiTexCoord2fvARB(GLenum target, const GLfloat *v)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glMultiTexCoord2fvARB)
         glad_glMultiTexCoord2fvARB(target, v);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glVertex2d(GLdouble x, GLdouble y)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glVertex2d)
         glad_glVertex2d(x, y);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glVertex2f(GLfloat x, GLfloat y)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glVertex2f)
         glad_glVertex2f(x, y);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glVertex2i(GLint x, GLint y)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glVertex2i)
         glad_glVertex2i(x, y);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glVertex3fv(const GLfloat *v)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glVertex3fv)
         glad_glVertex3fv(v);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glRasterPos2i(GLint x, GLint y)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glRasterPos2i)
         glad_glRasterPos2i(x, y);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glRasterPos3f(GLfloat x, GLfloat y, GLfloat z)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glRasterPos3f)
         glad_glRasterPos3f(x, y, z);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glColor3f(GLfloat r, GLfloat g, GLfloat b)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glColor3f)
         glad_glColor3f(r, g, b);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glColor4ub(GLubyte r, GLubyte g, GLubyte b, GLubyte a)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glColor4ub)
         glad_glColor4ub(r, g, b, a);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glColor4fv(const GLfloat *v)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glColor4fv)
         glad_glColor4fv(v);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glRectf(GLfloat x1, GLfloat y1, GLfloat x2, GLfloat y2)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glRectf)
         glad_glRectf(x1, y1, x2, y2);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glRecti(GLint x1, GLint y1, GLint x2, GLint y2)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glRecti)
         glad_glRecti(x1, y1, x2, y2);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glNewList(GLuint list, GLenum mode)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glNewList)
         glad_glNewList(list, mode);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glEndList()
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glEndList)
         glad_glEndList();
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glCallList(GLuint list)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glCallList)
         glad_glCallList(list);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glDeleteLists(GLuint list, GLsizei range)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glDeleteLists)
         glad_glDeleteLists(list, range);
 }
@@ -717,186 +1445,223 @@ extern "C" void __attribute__((cdecl)) wrap_glDeleteLists(GLuint list, GLsizei r
 extern "C" void __attribute__((cdecl)) wrap_glFrustum(GLdouble left, GLdouble right, GLdouble bottom, GLdouble top, GLdouble zNear,
                                                       GLdouble zFar)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glFrustum)
         glad_glFrustum(left, right, bottom, top, zNear, zFar);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glEnableClientState(GLenum array)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glEnableClientState)
         glad_glEnableClientState(array);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glDisableClientState(GLenum array)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glDisableClientState)
         glad_glDisableClientState(array);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glClientActiveTexture(GLenum texture)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glClientActiveTexture)
         glad_glClientActiveTexture(texture);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glVertexPointer(GLint size, GLenum type, GLsizei stride, const GLvoid *pointer)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glVertexPointer)
         glad_glVertexPointer(size, type, stride, pointer);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glTexCoordPointer(GLint size, GLenum type, GLsizei stride, const GLvoid *pointer)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glTexCoordPointer)
         glad_glTexCoordPointer(size, type, stride, pointer);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glNormalPointer(GLenum type, GLsizei stride, const GLvoid *pointer)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glNormalPointer)
         glad_glNormalPointer(type, stride, pointer);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glColorPointer(GLint size, GLenum type, GLsizei stride, const GLvoid *pointer)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glColorPointer)
         glad_glColorPointer(size, type, stride, pointer);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glDrawArrays(GLenum mode, GLint first, GLsizei count)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glDrawArrays)
         glad_glDrawArrays(mode, first, count);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glDrawElements(GLenum mode, GLsizei count, GLenum type, const GLvoid *indices)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glDrawElements)
         glad_glDrawElements(mode, count, type, indices);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glTexEnvf(GLenum target, GLenum pname, GLfloat param)
 {
+    PERF_PROFILE_SCOPE("GL");
+    invalidateTexEnv(target, pname);
     if (glad_glTexEnvf)
         glad_glTexEnvf(target, pname, param);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glTexEnvi(GLenum target, GLenum pname, GLint param)
 {
+    PERF_PROFILE_SCOPE("GL");
+    if (shouldSkipTexEnv(target, pname, param))
+        return;
     if (glad_glTexEnvi)
         glad_glTexEnvi(target, pname, param);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glTexEnvfv(GLenum target, GLenum pname, const GLfloat *params)
 {
+    PERF_PROFILE_SCOPE("GL");
+    invalidateTexEnv(target, pname);
     if (glad_glTexEnvfv)
         glad_glTexEnvfv(target, pname, params);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glTexEnviv(GLenum target, GLenum pname, const GLint *params)
 {
+    PERF_PROFILE_SCOPE("GL");
+    invalidateTexEnv(target, pname);
     if (glad_glTexEnviv)
         glad_glTexEnviv(target, pname, params);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glColor3ub(GLubyte red, GLubyte green, GLubyte blue)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glColor3ub)
         glad_glColor3ub(red, green, blue);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glColorMaterial(GLenum face, GLenum mode)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glColorMaterial)
         glad_glColorMaterial(face, mode);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glFogf(GLenum pname, GLfloat param)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glFogf)
         glad_glFogf(pname, param);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glFogfv(GLenum pname, const GLfloat *params)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glFogfv)
         glad_glFogfv(pname, params);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glFogi(GLenum pname, GLint param)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glFogi)
         glad_glFogi(pname, param);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glMaterialf(GLenum face, GLenum pname, GLfloat param)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glMaterialf)
         glad_glMaterialf(face, pname, param);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glLightModeli(GLenum pname, GLint param)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glLightModeli)
         glad_glLightModeli(pname, param);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glSecondaryColor3ub(GLubyte red, GLubyte green, GLubyte blue)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glSecondaryColor3ub)
         glad_glSecondaryColor3ub(red, green, blue);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glBlendColor(GLclampf red, GLclampf green, GLclampf blue, GLclampf alpha)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glBlendColor)
         glad_glBlendColor(red, green, blue, alpha);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glBlendEquation(GLenum mode)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glBlendEquation)
         glad_glBlendEquation(mode);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glTexCoord4f(GLfloat s, GLfloat t, GLfloat r, GLfloat q)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glTexCoord4f)
         glad_glTexCoord4f(s, t, r, q);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glTexParameterfv(GLenum target, GLenum pname, const GLfloat *params)
 {
+    PERF_PROFILE_SCOPE("GL");
+    invalidateTexParameter(target, pname);
     if (glad_glTexParameterfv)
         glad_glTexParameterfv(target, pname, params);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glPointParameterf(GLenum pname, GLfloat param)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glPointParameterf)
         glad_glPointParameterf(pname, param);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glPointParameterfv(GLenum pname, const GLfloat *params)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glPointParameterfv)
         glad_glPointParameterfv(pname, params);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glVertex4f(GLfloat x, GLfloat y, GLfloat z, GLfloat w)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glVertex4f)
         glad_glVertex4f(x, y, z, w);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glMultMatrixf(const GLfloat *m)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glMultMatrixf)
         glad_glMultMatrixf(m);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glGenFramebuffersEXT(GLsizei n, GLuint *framebuffers)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glGenFramebuffersEXT)
         glad_glGenFramebuffersEXT(n, framebuffers);
     forgetFramebufferIds(n, framebuffers);
@@ -905,6 +1670,7 @@ extern "C" void __attribute__((cdecl)) wrap_glGenFramebuffersEXT(GLsizei n, GLui
 
 extern "C" void __attribute__((cdecl)) wrap_glBindFramebufferEXT(GLenum target, GLuint framebuffer)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glBindFramebufferEXT)
         glad_glBindFramebufferEXT(target, framebuffer);
     replayFramebufferAttachments(framebuffer);
@@ -914,6 +1680,7 @@ extern "C" void __attribute__((cdecl)) wrap_glBindFramebufferEXT(GLenum target, 
 extern "C" void __attribute__((cdecl)) wrap_glFramebufferTexture2DEXT(GLenum target, GLenum attachment, GLenum textarget, GLuint texture,
                                                                       GLint level)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glFramebufferTexture2DEXT)
         glad_glFramebufferTexture2DEXT(target, attachment, textarget, texture, level);
     rememberFramebufferAttachment(attachment, true, true, textarget, texture, level);
@@ -922,6 +1689,7 @@ extern "C" void __attribute__((cdecl)) wrap_glFramebufferTexture2DEXT(GLenum tar
 
 extern "C" void __attribute__((cdecl)) wrap_glDeleteFramebuffersEXT(GLsizei n, const GLuint *framebuffers)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glDeleteFramebuffersEXT)
         glad_glDeleteFramebuffersEXT(n, framebuffers);
     forgetFramebufferIds(n, framebuffers);
@@ -930,18 +1698,21 @@ extern "C" void __attribute__((cdecl)) wrap_glDeleteFramebuffersEXT(GLsizei n, c
 
 extern "C" void __attribute__((cdecl)) wrap_glGenProgramsARB(GLsizei n, GLuint *programs)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glGenProgramsARB)
         glad_glGenProgramsARB(n, programs);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glBindProgramARB(GLenum target, GLuint program)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glBindProgramARB)
         glad_glBindProgramARB(target, program);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glProgramStringARB(GLenum target, GLenum format, GLsizei len, const GLvoid *string)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glProgramStringARB)
         glad_glProgramStringARB(target, format, len, string);
 }
@@ -949,36 +1720,46 @@ extern "C" void __attribute__((cdecl)) wrap_glProgramStringARB(GLenum target, GL
 extern "C" void __attribute__((cdecl)) wrap_glProgramLocalParameter4fARB(GLenum target, GLuint index, GLfloat x, GLfloat y, GLfloat z,
                                                                          GLfloat w)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glProgramLocalParameter4fARB)
         glad_glProgramLocalParameter4fARB(target, index, x, y, z, w);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glProgramLocalParameter4fvARB(GLenum target, GLuint index, const GLfloat *params)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glProgramLocalParameter4fvARB)
         glad_glProgramLocalParameter4fvARB(target, index, params);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glGetProgramivARB(GLenum target, GLenum pname, GLint *params)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glGetProgramivARB)
         glad_glGetProgramivARB(target, pname, params);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glClientActiveTextureARB(GLenum texture)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glClientActiveTextureARB)
         glad_glClientActiveTextureARB(texture);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glEnableVertexAttribArrayARB(GLuint index)
 {
+    PERF_PROFILE_SCOPE("GL");
+    if (shouldSkipAttribEnabled(index, true))
+        return;
     if (glad_glEnableVertexAttribArrayARB)
         glad_glEnableVertexAttribArrayARB(index);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glDisableVertexAttribArrayARB(GLuint index)
 {
+    PERF_PROFILE_SCOPE("GL");
+    if (shouldSkipAttribEnabled(index, false))
+        return;
     if (glad_glDisableVertexAttribArrayARB)
         glad_glDisableVertexAttribArrayARB(index);
 }
@@ -986,36 +1767,119 @@ extern "C" void __attribute__((cdecl)) wrap_glDisableVertexAttribArrayARB(GLuint
 extern "C" void __attribute__((cdecl)) wrap_glVertexAttribPointerARB(GLuint index, GLint size, GLenum type, GLboolean normalized,
                                                                      GLsizei stride, const GLvoid *pointer)
 {
+    PERF_PROFILE_SCOPE("GL");
+    if (shouldSkipAttribPointer(index, size, type, normalized, stride, pointer))
+        return;
     if (glad_glVertexAttribPointerARB)
         glad_glVertexAttribPointerARB(index, size, type, normalized, stride, pointer);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glBindBuffer(GLenum target, GLuint buffer)
 {
+    PERF_PROFILE_SCOPE("GL");
+    if (glBufferTraceEnabled())
+        PerfProfiler_GLBufferEvent("bind",
+                                   reinterpret_cast<uintptr_t>(__builtin_return_address(0)),
+                                   reinterpret_cast<uintptr_t>(g_glContextTag),
+                                   target, 0, 0, buffer);
+    if (shouldSkipBindBuffer(target, buffer))
+        return;
     if (glad_glBindBuffer)
         glad_glBindBuffer(target, buffer);
+    rememberBufferBinding(target, buffer);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glDeleteBuffers(GLsizei n, const GLuint *buffers)
 {
+    PERF_PROFILE_SCOPE("GL");
+    if (glBufferTraceEnabled() && buffers && n > 0)
+    {
+        const uintptr_t caller = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+        for (GLsizei i = 0; i < n; ++i)
+            PerfProfiler_GLBufferEvent("delete", caller,
+                                       reinterpret_cast<uintptr_t>(g_glContextTag),
+                                       0, 0, 0, buffers[i]);
+    }
+    if (glStreamBufferPoolEnabled() && buffers && n > 0)
+    {
+        std::vector<GLuint> hostDelete;
+        hostDelete.reserve(static_cast<size_t>(n));
+        for (GLsizei i = 0; i < n; ++i)
+        {
+            const GLuint buffer = buffers[i];
+            if (!streamBufferIsCandidate(buffer))
+            {
+                hostDelete.push_back(buffer);
+                g_streamBufferRecords.erase(buffer);
+                continue;
+            }
+            const StreamBufferRecord record = g_streamBufferRecords[buffer];
+            if (record.target != 0 && glad_glBindBuffer)
+                glad_glBindBuffer(record.target, 0);
+            g_streamBufferRecords[buffer].active = false;
+            g_streamBufferRecords[buffer].pooled = true;
+            g_streamRecycledBuffers.push_back(buffer);
+            PerfProfiler_CacheSkip("StreamBufferPoolDelete");
+        }
+        if (!hostDelete.empty() && glad_glDeleteBuffers)
+            glad_glDeleteBuffers(static_cast<GLsizei>(hostDelete.size()), hostDelete.data());
+        return;
+    }
+    if (glBufferPoolEnabled())
+    {
+        recycleBuffers(n, buffers);
+        return;
+    }
     if (glad_glDeleteBuffers)
         glad_glDeleteBuffers(n, buffers);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glGenBuffers(GLsizei n, GLuint *buffers)
 {
-    if (glad_glGenBuffers)
-        glad_glGenBuffers(n, buffers);
+    PERF_PROFILE_SCOPE("GL");
+    if (!buffers || n <= 0)
+        return;
+    GLsizei recycled = 0;
+    while (recycled < n && takeStreamRecycledBuffer(&buffers[recycled]))
+        ++recycled;
+    while (recycled < n && takeRecycledBuffer(&buffers[recycled]))
+        ++recycled;
+    if (recycled < n && glad_glGenBuffers)
+        glad_glGenBuffers(n - recycled, buffers + recycled);
+    if (glBufferTraceEnabled())
+    {
+        const uintptr_t caller = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+        for (GLsizei i = 0; i < n; ++i)
+            PerfProfiler_GLBufferEvent("gen", caller,
+                                       reinterpret_cast<uintptr_t>(g_glContextTag),
+                                       0, 0, 0, buffers[i]);
+    }
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glBufferData(GLenum target, GLsizeiptr size, const GLvoid *data, GLenum usage)
 {
+    PERF_PROFILE_SCOPE("GL");
+    if (streamBufferDataCanReuse(target, size, usage, data) && glad_glBufferSubData)
+    {
+        glad_glBufferSubData(target, 0, size, data);
+        rememberStreamBufferData(target, size, usage);
+        PerfProfiler_CacheSkip("StreamBufferDataReuse");
+        return;
+    }
     if (glad_glBufferData)
         glad_glBufferData(target, size, data, usage);
+    rememberStreamBufferData(target, size, usage);
+    if (glBufferTraceEnabled())
+        PerfProfiler_GLBufferEvent("data",
+                                   reinterpret_cast<uintptr_t>(__builtin_return_address(0)),
+                                   reinterpret_cast<uintptr_t>(g_glContextTag),
+                                   target, usage, size > 0 ? static_cast<uint64_t>(size) : 0,
+                                   currentBuffer(target));
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glGenFramebuffers(GLsizei n, GLuint *framebuffers)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glGenFramebuffers)
         glad_glGenFramebuffers(n, framebuffers);
     forgetFramebufferIds(n, framebuffers);
@@ -1024,6 +1888,7 @@ extern "C" void __attribute__((cdecl)) wrap_glGenFramebuffers(GLsizei n, GLuint 
 
 extern "C" void __attribute__((cdecl)) wrap_glBindFramebuffer(GLenum target, GLuint framebuffer)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glBindFramebuffer)
         glad_glBindFramebuffer(target, framebuffer);
     replayFramebufferAttachments(framebuffer);
@@ -1033,6 +1898,7 @@ extern "C" void __attribute__((cdecl)) wrap_glBindFramebuffer(GLenum target, GLu
 extern "C" void __attribute__((cdecl)) wrap_glFramebufferTexture2D(GLenum target, GLenum attachment, GLenum textarget, GLuint texture,
                                                                    GLint level)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glFramebufferTexture2D)
         glad_glFramebufferTexture2D(target, attachment, textarget, texture, level);
     rememberFramebufferAttachment(attachment, true, false, textarget, texture, level);
@@ -1041,6 +1907,7 @@ extern "C" void __attribute__((cdecl)) wrap_glFramebufferTexture2D(GLenum target
 
 extern "C" void __attribute__((cdecl)) wrap_glDeleteFramebuffers(GLsizei n, const GLuint *framebuffers)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glDeleteFramebuffers)
         glad_glDeleteFramebuffers(n, framebuffers);
     forgetFramebufferIds(n, framebuffers);
@@ -1050,6 +1917,7 @@ extern "C" void __attribute__((cdecl)) wrap_glDeleteFramebuffers(GLsizei n, cons
 extern "C" void __attribute__((cdecl)) wrap_glFramebufferRenderbuffer(GLenum target, GLenum attachment, GLenum renderbuffertarget,
                                                                       GLuint renderbuffer)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glFramebufferRenderbuffer)
         glad_glFramebufferRenderbuffer(target, attachment, renderbuffertarget, renderbuffer);
     rememberFramebufferAttachment(attachment, false, false, renderbuffertarget, renderbuffer, 0);
@@ -1058,6 +1926,7 @@ extern "C" void __attribute__((cdecl)) wrap_glFramebufferRenderbuffer(GLenum tar
 
 extern "C" void __attribute__((cdecl)) wrap_glGenRenderbuffers(GLsizei n, GLuint *renderbuffers)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glGenRenderbuffers)
         glad_glGenRenderbuffers(n, renderbuffers);
     traceFramebufferIds("gen-renderbuffer", n, renderbuffers);
@@ -1065,6 +1934,7 @@ extern "C" void __attribute__((cdecl)) wrap_glGenRenderbuffers(GLsizei n, GLuint
 
 extern "C" void __attribute__((cdecl)) wrap_glBindRenderbuffer(GLenum target, GLuint renderbuffer)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glBindRenderbuffer)
         glad_glBindRenderbuffer(target, renderbuffer);
     traceFramebufferEvent("bind-renderbuffer", target, renderbuffer);
@@ -1072,6 +1942,7 @@ extern "C" void __attribute__((cdecl)) wrap_glBindRenderbuffer(GLenum target, GL
 
 extern "C" void __attribute__((cdecl)) wrap_glRenderbufferStorage(GLenum target, GLenum internalformat, GLsizei width, GLsizei height)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glRenderbufferStorage)
         glad_glRenderbufferStorage(target, internalformat, width, height);
     traceRenderbufferStorage("renderbuffer-storage", target, internalformat, width, height);
@@ -1079,6 +1950,7 @@ extern "C" void __attribute__((cdecl)) wrap_glRenderbufferStorage(GLenum target,
 
 extern "C" void __attribute__((cdecl)) wrap_glDeleteRenderbuffers(GLsizei n, const GLuint *renderbuffers)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glDeleteRenderbuffers)
         glad_glDeleteRenderbuffers(n, renderbuffers);
     traceFramebufferIds("delete-renderbuffer", n, renderbuffers);
@@ -1086,24 +1958,28 @@ extern "C" void __attribute__((cdecl)) wrap_glDeleteRenderbuffers(GLsizei n, con
 
 extern "C" void __attribute__((cdecl)) wrap_glDrawBuffers(GLsizei n, const GLenum *bufs)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glDrawBuffers)
         glad_glDrawBuffers(n, bufs);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glPixelMapusv(GLenum map, GLsizei size, const GLushort *values)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glPixelMapusv)
         glad_glPixelMapusv(map, size, values);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glPixelTransferf(GLenum pname, GLfloat param)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glPixelTransferf)
         glad_glPixelTransferf(pname, param);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glPixelTransferi(GLenum pname, GLint param)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glPixelTransferi)
         glad_glPixelTransferi(pname, param);
 }
@@ -1111,126 +1987,147 @@ extern "C" void __attribute__((cdecl)) wrap_glPixelTransferi(GLenum pname, GLint
 extern "C" void __attribute__((cdecl)) wrap_glReadPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type,
                                                          GLvoid *pixels)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glReadPixels)
         glad_glReadPixels(x, y, width, height, format, type, pixels);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glShaderSource(GLuint shader, GLsizei count, const GLchar *const *string, const GLint *length)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glShaderSource)
         glad_glShaderSource(shader, count, string, length);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glCompileShader(GLuint shader)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glCompileShader)
         glad_glCompileShader(shader);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glGetShaderiv(GLuint shader, GLenum pname, GLint *params)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glGetShaderiv)
         glad_glGetShaderiv(shader, pname, params);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glGetShaderInfoLog(GLuint shader, GLsizei bufSize, GLsizei *length, GLchar *infoLog)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glGetShaderInfoLog)
         glad_glGetShaderInfoLog(shader, bufSize, length, infoLog);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glDeleteShader(GLuint shader)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glDeleteShader)
         glad_glDeleteShader(shader);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glAttachShader(GLuint program, GLuint shader)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glAttachShader)
         glad_glAttachShader(program, shader);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glLinkProgram(GLuint program)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glLinkProgram)
         glad_glLinkProgram(program);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glGetProgramiv(GLuint program, GLenum pname, GLint *params)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glGetProgramiv)
         glad_glGetProgramiv(program, pname, params);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glGetProgramInfoLog(GLuint program, GLsizei bufSize, GLsizei *length, GLchar *infoLog)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glGetProgramInfoLog)
         glad_glGetProgramInfoLog(program, bufSize, length, infoLog);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glUseProgram(GLuint program)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glUseProgram)
         glad_glUseProgram(program);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glDeleteProgram(GLuint program)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glDeleteProgram)
         glad_glDeleteProgram(program);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glUniform1f(GLint location, GLfloat v0)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glUniform1f)
         glad_glUniform1f(location, v0);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glUniform1fv(GLint location, GLsizei count, const GLfloat *value)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glUniform1fv)
         glad_glUniform1fv(location, count, value);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glUniform1i(GLint location, GLint v0)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glUniform1i)
         glad_glUniform1i(location, v0);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glUniform1iv(GLint location, GLsizei count, const GLint *value)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glUniform1iv)
         glad_glUniform1iv(location, count, value);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glUniform2fv(GLint location, GLsizei count, const GLfloat *value)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glUniform2fv)
         glad_glUniform2fv(location, count, value);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glUniform2f(GLint location, GLfloat v0, GLfloat v1)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glUniform2f)
         glad_glUniform2f(location, v0, v1);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glUniform2i(GLint location, GLint v0, GLint v1)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glUniform2i)
         glad_glUniform2i(location, v0, v1);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glUniform3f(GLint location, GLfloat v0, GLfloat v1, GLfloat v2)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glUniform3f)
         glad_glUniform3f(location, v0, v1, v2);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glUniform3i(GLint location, GLint v0, GLint v1, GLint v2)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glUniform3i)
         glad_glUniform3i(location, v0, v1, v2);
 }
@@ -1238,6 +2135,7 @@ extern "C" void __attribute__((cdecl)) wrap_glUniform3i(GLint location, GLint v0
 extern "C" void __attribute__((cdecl)) wrap_glUniform4f(GLint location, GLfloat v0, GLfloat v1,
                                                          GLfloat v2, GLfloat v3)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glUniform4f)
         glad_glUniform4f(location, v0, v1, v2, v3);
 }
@@ -1245,54 +2143,63 @@ extern "C" void __attribute__((cdecl)) wrap_glUniform4f(GLint location, GLfloat 
 extern "C" void __attribute__((cdecl)) wrap_glUniform4i(GLint location, GLint v0, GLint v1,
                                                          GLint v2, GLint v3)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glUniform4i)
         glad_glUniform4i(location, v0, v1, v2, v3);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glUniform2iv(GLint location, GLsizei count, const GLint *value)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glUniform2iv)
         glad_glUniform2iv(location, count, value);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glUniform3fv(GLint location, GLsizei count, const GLfloat *value)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glUniform3fv)
         glad_glUniform3fv(location, count, value);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glUniform3iv(GLint location, GLsizei count, const GLint *value)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glUniform3iv)
         glad_glUniform3iv(location, count, value);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glUniform4fv(GLint location, GLsizei count, const GLfloat *value)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glUniform4fv)
         glad_glUniform4fv(location, count, value);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glUniform4iv(GLint location, GLsizei count, const GLint *value)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glUniform4iv)
         glad_glUniform4iv(location, count, value);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glUniformMatrix2fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glUniformMatrix2fv)
         glad_glUniformMatrix2fv(location, count, transpose, value);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glUniformMatrix3fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glUniformMatrix3fv)
         glad_glUniformMatrix3fv(location, count, transpose, value);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glUniformMatrix4fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glUniformMatrix4fv)
         glad_glUniformMatrix4fv(location, count, transpose, value);
 }
@@ -1300,18 +2207,25 @@ extern "C" void __attribute__((cdecl)) wrap_glUniformMatrix4fv(GLint location, G
 extern "C" void __attribute__((cdecl)) wrap_glGetActiveUniform(GLuint program, GLuint index, GLsizei bufSize, GLsizei *length, GLint *size,
                                                                GLenum *type, GLchar *name)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glGetActiveUniform)
         glad_glGetActiveUniform(program, index, bufSize, length, size, type, name);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glEnableVertexAttribArray(GLuint index)
 {
+    PERF_PROFILE_SCOPE("GL");
+    if (shouldSkipAttribEnabled(index, true))
+        return;
     if (glad_glEnableVertexAttribArray)
         glad_glEnableVertexAttribArray(index);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glDisableVertexAttribArray(GLuint index)
 {
+    PERF_PROFILE_SCOPE("GL");
+    if (shouldSkipAttribEnabled(index, false))
+        return;
     if (glad_glDisableVertexAttribArray)
         glad_glDisableVertexAttribArray(index);
 }
@@ -1319,54 +2233,76 @@ extern "C" void __attribute__((cdecl)) wrap_glDisableVertexAttribArray(GLuint in
 extern "C" void __attribute__((cdecl)) wrap_glVertexAttribPointer(GLuint index, GLint size, GLenum type, GLboolean normalized,
                                                                   GLsizei stride, const GLvoid *pointer)
 {
+    PERF_PROFILE_SCOPE("GL");
+    if (shouldSkipAttribPointer(index, size, type, normalized, stride, pointer))
+        return;
     if (glad_glVertexAttribPointer)
         glad_glVertexAttribPointer(index, size, type, normalized, stride, pointer);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glTexParameterf(GLenum target, GLenum pname, GLfloat param)
 {
+    PERF_PROFILE_SCOPE("GL");
+    if (glTextureQueryCacheEnabled() && cacheableTextureParameter(pname))
+        invalidateTexParameter(target, pname);
     if (glad_glTexParameterf)
         glad_glTexParameterf(target, pname, param);
 }
 
+extern "C" void __attribute__((cdecl)) wrap_glTexParameteriv(GLenum target, GLenum pname,
+                                                               const GLint *params)
+{
+    PERF_PROFILE_SCOPE("GL");
+    invalidateTexParameter(target, pname);
+    if (glad_glTexParameteriv)
+        glad_glTexParameteriv(target, pname, params);
+}
+
 extern "C" void __attribute__((cdecl)) wrap_glInterleavedArrays(GLenum format, GLsizei stride, const GLvoid *pointer)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glInterleavedArrays)
         glad_glInterleavedArrays(format, stride, pointer);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glSetFenceNV(GLuint fence, GLenum condition)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glSetFenceNV)
         glad_glSetFenceNV(fence, condition);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glMultTransposeMatrixf(const GLfloat *m)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glMultTransposeMatrixf)
         glad_glMultTransposeMatrixf(m);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glColor4ubv(const GLubyte *v)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glColor4ubv)
         glad_glColor4ubv(v);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glFinishFenceNV(GLuint fence)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glFinishFenceNV)
         glad_glFinishFenceNV(fence);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glVertexAttrib1f(GLuint index, GLfloat x)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glVertexAttrib1f)
         glad_glVertexAttrib1f(index, x);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glClampColorARB(GLenum target, GLenum clamp)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glClampColorARB)
         glad_glClampColorARB(target, clamp);
 }
@@ -1374,24 +2310,28 @@ extern "C" void __attribute__((cdecl)) wrap_glClampColorARB(GLenum target, GLenu
 extern "C" void __attribute__((cdecl)) wrap_glBlendFuncSeparate(GLenum sfactorRGB, GLenum dfactorRGB, GLenum sfactorAlpha,
                                                                 GLenum dfactorAlpha)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glBlendFuncSeparate)
         glad_glBlendFuncSeparate(sfactorRGB, dfactorRGB, sfactorAlpha, dfactorAlpha);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glGetBufferParameterivARB(GLenum target, GLenum pname, GLint *params)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glGetBufferParameterivARB)
         glad_glGetBufferParameterivARB(target, pname, params);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glDeleteProgramsARB(GLsizei n, const GLuint *programs)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glDeleteProgramsARB)
         glad_glDeleteProgramsARB(n, programs);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glGetTexLevelParameteriv(GLenum target, GLint level, GLenum pname, GLint *params)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glGetTexLevelParameteriv)
         glad_glGetTexLevelParameteriv(target, level, pname, params);
     if (pname == GL_TEXTURE_COMPRESSED_IMAGE_SIZE && params && *params > 0)
@@ -1400,49 +2340,119 @@ extern "C" void __attribute__((cdecl)) wrap_glGetTexLevelParameteriv(GLenum targ
 
 extern "C" void __attribute__((cdecl)) wrap_glRasterPos2f(GLfloat x, GLfloat y)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glRasterPos2f)
         glad_glRasterPos2f(x, y);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glDeleteRenderbuffersEXT(GLsizei n, const GLuint *renderbuffers)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glDeleteRenderbuffersEXT)
         glad_glDeleteRenderbuffersEXT(n, renderbuffers);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glDeleteBuffersARB(GLsizei n, const GLuint *buffers)
 {
+    PERF_PROFILE_SCOPE("GL");
+    if (glBufferTraceEnabled() && buffers && n > 0)
+    {
+        const uintptr_t caller = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+        for (GLsizei i = 0; i < n; ++i)
+            PerfProfiler_GLBufferEvent("delete", caller,
+                                       reinterpret_cast<uintptr_t>(g_glContextTag),
+                                       0, 0, 0, buffers[i]);
+    }
+    if (glStreamBufferPoolEnabled() && buffers && n > 0)
+    {
+        std::vector<GLuint> hostDelete;
+        hostDelete.reserve(static_cast<size_t>(n));
+        for (GLsizei i = 0; i < n; ++i)
+        {
+            const GLuint buffer = buffers[i];
+            if (!streamBufferIsCandidate(buffer))
+            {
+                hostDelete.push_back(buffer);
+                g_streamBufferRecords.erase(buffer);
+                continue;
+            }
+            const StreamBufferRecord record = g_streamBufferRecords[buffer];
+            if (record.target != 0 && glad_glBindBufferARB)
+                glad_glBindBufferARB(record.target, 0);
+            g_streamBufferRecords[buffer].active = false;
+            g_streamBufferRecords[buffer].pooled = true;
+            g_streamRecycledBuffers.push_back(buffer);
+            PerfProfiler_CacheSkip("StreamBufferPoolDelete");
+        }
+        if (!hostDelete.empty() && glad_glDeleteBuffersARB)
+            glad_glDeleteBuffersARB(static_cast<GLsizei>(hostDelete.size()), hostDelete.data());
+        return;
+    }
+    if (glBufferPoolEnabled())
+    {
+        recycleBuffers(n, buffers);
+        return;
+    }
     if (glad_glDeleteBuffersARB)
         glad_glDeleteBuffersARB(n, buffers);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glCopyTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint x, GLint y,
-                                                                GLsizei width, GLsizei height)
+                                                                 GLsizei width, GLsizei height)
 {
+    PERF_PROFILE_SCOPE("GL");
+    invalidateTexParameter(target, GL_TEXTURE_RESIDENT);
     if (glad_glCopyTexSubImage2D)
         glad_glCopyTexSubImage2D(target, level, xoffset, yoffset, x, y, width, height);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glBufferDataARB(GLenum target, GLsizeiptrARB size, const GLvoid *data, GLenum usage)
 {
+    PERF_PROFILE_SCOPE("GL");
+    if (streamBufferDataCanReuse(target, static_cast<GLsizeiptr>(size), usage, data) &&
+        glad_glBufferSubData)
+    {
+        glad_glBufferSubData(target, 0, static_cast<GLsizeiptr>(size), data);
+        rememberStreamBufferData(target, static_cast<GLsizeiptr>(size), usage);
+        PerfProfiler_CacheSkip("StreamBufferDataReuse");
+        return;
+    }
     if (glad_glBufferDataARB)
         glad_glBufferDataARB(target, size, data, usage);
+    rememberStreamBufferData(target, static_cast<GLsizeiptr>(size), usage);
+    if (glBufferTraceEnabled())
+        PerfProfiler_GLBufferEvent("data",
+                                   reinterpret_cast<uintptr_t>(__builtin_return_address(0)),
+                                   reinterpret_cast<uintptr_t>(g_glContextTag),
+                                   target, usage, size > 0 ? static_cast<uint64_t>(size) : 0,
+                                   currentBuffer(target));
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glBindBufferARB(GLenum target, GLuint buffer)
 {
+    PERF_PROFILE_SCOPE("GL");
+    if (glBufferTraceEnabled())
+        PerfProfiler_GLBufferEvent("bind",
+                                   reinterpret_cast<uintptr_t>(__builtin_return_address(0)),
+                                   reinterpret_cast<uintptr_t>(g_glContextTag),
+                                   target, 0, 0, buffer);
+    if (shouldSkipBindBuffer(target, buffer))
+        return;
     if (glad_glBindBufferARB)
         glad_glBindBufferARB(target, buffer);
+    rememberBufferBinding(target, buffer);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glLoadTransposeMatrixf(const GLfloat *m)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glLoadTransposeMatrixf)
         glad_glLoadTransposeMatrixf(m);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glGetMaterialfv(GLenum face, GLenum pname, GLfloat *params)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glGetMaterialfv)
         glad_glGetMaterialfv(face, pname, params);
 }
@@ -1450,60 +2460,70 @@ extern "C" void __attribute__((cdecl)) wrap_glGetMaterialfv(GLenum face, GLenum 
 extern "C" void __attribute__((cdecl)) wrap_glProgramEnvParameter4fARB(GLenum target, GLuint index, GLfloat x, GLfloat y, GLfloat z,
                                                                        GLfloat w)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glProgramEnvParameter4fARB)
         glad_glProgramEnvParameter4fARB(target, index, x, y, z, w);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glReadBuffer(GLenum mode)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glReadBuffer)
         glad_glReadBuffer(mode);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glProgramEnvParameter4fvARB(GLenum target, GLuint index, const GLfloat *params)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glProgramEnvParameter4fvARB)
         glad_glProgramEnvParameter4fvARB(target, index, params);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glColorMask(GLboolean red, GLboolean green, GLboolean blue, GLboolean alpha)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glColorMask)
         glad_glColorMask(red, green, blue, alpha);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glClearDepth(GLclampd depth)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glClearDepth)
         glad_glClearDepth(depth);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glClearStencil(GLint s)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glClearStencil)
         glad_glClearStencil(s);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glStencilMask(GLuint mask)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glStencilMask)
         glad_glStencilMask(mask);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glLoadMatrixf(const GLfloat *m)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glLoadMatrixf)
         glad_glLoadMatrixf(m);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glDrawBuffer(GLenum mode)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glDrawBuffer)
         glad_glDrawBuffer(mode);
 }
 
 extern "C" GLenum __attribute__((cdecl)) wrap_glCheckFramebufferStatusEXT(GLenum target)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glCheckFramebufferStatusEXT)
         return glad_glCheckFramebufferStatusEXT(target);
     return (GLenum)0;
@@ -1511,18 +2531,36 @@ extern "C" GLenum __attribute__((cdecl)) wrap_glCheckFramebufferStatusEXT(GLenum
 
 extern "C" void __attribute__((cdecl)) wrap_glGenBuffersARB(GLsizei n, GLuint *buffers)
 {
-    if (glad_glGenBuffersARB)
-        glad_glGenBuffersARB(n, buffers);
+    PERF_PROFILE_SCOPE("GL");
+    if (!buffers || n <= 0)
+        return;
+    GLsizei recycled = 0;
+    while (recycled < n && takeStreamRecycledBuffer(&buffers[recycled]))
+        ++recycled;
+    while (recycled < n && takeRecycledBuffer(&buffers[recycled]))
+        ++recycled;
+    if (recycled < n && glad_glGenBuffersARB)
+        glad_glGenBuffersARB(n - recycled, buffers + recycled);
+    if (glBufferTraceEnabled())
+    {
+        const uintptr_t caller = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
+        for (GLsizei i = 0; i < n; ++i)
+            PerfProfiler_GLBufferEvent("gen", caller,
+                                       reinterpret_cast<uintptr_t>(g_glContextTag),
+                                       0, 0, 0, buffers[i]);
+    }
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glBufferSubDataARB(GLenum target, GLintptrARB offset, GLsizeiptrARB size, const GLvoid *data)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glBufferSubDataARB)
         glad_glBufferSubDataARB(target, offset, size, data);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, const GLvoid *data)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glBufferSubData)
         glad_glBufferSubData(target, offset, size, data);
 }
@@ -1530,72 +2568,84 @@ extern "C" void __attribute__((cdecl)) wrap_glBufferSubData(GLenum target, GLint
 extern "C" void __attribute__((cdecl)) wrap_glShaderSourceARB(GLhandleARB shader, GLsizei count, const GLcharARB **string,
                                                               const GLint *length)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glShaderSourceARB)
         glad_glShaderSourceARB(shader, count, string, length);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glCompileShaderARB(GLhandleARB shader)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glCompileShaderARB)
         glad_glCompileShaderARB(shader);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glUseProgramObjectARB(GLhandleARB program)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glUseProgramObjectARB)
         glad_glUseProgramObjectARB(program);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glLinkProgramARB(GLhandleARB program)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glLinkProgramARB)
         glad_glLinkProgramARB(program);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glDeleteObjectARB(GLhandleARB obj)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glDeleteObjectARB)
         glad_glDeleteObjectARB(obj);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glGetObjectParameterivARB(GLhandleARB obj, GLenum pname, GLint *params)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glGetObjectParameterivARB)
         glad_glGetObjectParameterivARB(obj, pname, params);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glGetInfoLogARB(GLhandleARB obj, GLsizei maxLength, GLsizei *length, GLcharARB *infoLog)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glGetInfoLogARB)
         glad_glGetInfoLogARB(obj, maxLength, length, infoLog);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glGenQueriesARB(GLsizei n, GLuint *ids)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glGenQueriesARB)
         glad_glGenQueriesARB(n, ids);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glDeleteQueriesARB(GLsizei n, const GLuint *ids)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glDeleteQueriesARB)
         glad_glDeleteQueriesARB(n, ids);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glBeginQueryARB(GLenum target, GLuint id)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glBeginQueryARB)
         glad_glBeginQueryARB(target, id);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glEndQueryARB(GLenum target)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glEndQueryARB)
         glad_glEndQueryARB(target);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glGetQueryObjectuivARB(GLuint id, GLenum pname, GLuint *params)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glGetQueryObjectuivARB)
         glad_glGetQueryObjectuivARB(id, pname, params);
 }
@@ -1603,30 +2653,35 @@ extern "C" void __attribute__((cdecl)) wrap_glGetQueryObjectuivARB(GLuint id, GL
 extern "C" void __attribute__((cdecl)) wrap_glBlendFuncSeparateEXT(GLenum sfactorRGB, GLenum dfactorRGB, GLenum sfactorAlpha,
                                                                    GLenum dfactorAlpha)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glBlendFuncSeparateEXT)
         glad_glBlendFuncSeparateEXT(sfactorRGB, dfactorRGB, sfactorAlpha, dfactorAlpha);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glBlendEquationEXT(GLenum mode)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glBlendEquationEXT)
         glad_glBlendEquationEXT(mode);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glBlendColorEXT(GLclampf red, GLclampf green, GLclampf blue, GLclampf alpha)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glBlendColorEXT)
         glad_glBlendColorEXT(red, green, blue, alpha);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glBlendEquationSeparateEXT(GLenum modeRGB, GLenum modeAlpha)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glBlendEquationSeparateEXT)
         glad_glBlendEquationSeparateEXT(modeRGB, modeAlpha);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glGenRenderbuffersEXT(GLsizei n, GLuint *renderbuffers)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glGenRenderbuffersEXT)
         glad_glGenRenderbuffersEXT(n, renderbuffers);
     traceFramebufferIds("gen-renderbuffer-ext", n, renderbuffers);
@@ -1634,6 +2689,7 @@ extern "C" void __attribute__((cdecl)) wrap_glGenRenderbuffersEXT(GLsizei n, GLu
 
 extern "C" void __attribute__((cdecl)) wrap_glBindRenderbufferEXT(GLenum target, GLuint renderbuffer)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glBindRenderbufferEXT)
         glad_glBindRenderbufferEXT(target, renderbuffer);
     traceFramebufferEvent("bind-renderbuffer-ext", target, renderbuffer);
@@ -1641,6 +2697,7 @@ extern "C" void __attribute__((cdecl)) wrap_glBindRenderbufferEXT(GLenum target,
 
 extern "C" void __attribute__((cdecl)) wrap_glRenderbufferStorageEXT(GLenum target, GLenum internalformat, GLsizei width, GLsizei height)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glRenderbufferStorageEXT)
         glad_glRenderbufferStorageEXT(target, internalformat, width, height);
     traceRenderbufferStorage("renderbuffer-storage-ext", target, internalformat, width, height);
@@ -1649,6 +2706,7 @@ extern "C" void __attribute__((cdecl)) wrap_glRenderbufferStorageEXT(GLenum targ
 extern "C" void __attribute__((cdecl)) wrap_glFramebufferRenderbufferEXT(GLenum target, GLenum attachment, GLenum renderbuffertarget,
                                                                          GLuint renderbuffer)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glFramebufferRenderbufferEXT)
         glad_glFramebufferRenderbufferEXT(target, attachment, renderbuffertarget, renderbuffer);
     rememberFramebufferAttachment(attachment, false, true, renderbuffertarget, renderbuffer, 0);
@@ -1657,6 +2715,7 @@ extern "C" void __attribute__((cdecl)) wrap_glFramebufferRenderbufferEXT(GLenum 
 
 extern "C" void __attribute__((cdecl)) wrap_glWindowPos2sARB(GLshort x, GLshort y)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glWindowPos2sARB)
         glad_glWindowPos2sARB(x, y);
 }
@@ -1664,108 +2723,126 @@ extern "C" void __attribute__((cdecl)) wrap_glWindowPos2sARB(GLshort x, GLshort 
 extern "C" void __attribute__((cdecl)) wrap_glDrawRangeElements(GLenum mode, GLuint start, GLuint end, GLsizei count, GLenum type,
                                                                 const GLvoid *indices)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glDrawRangeElements)
         glad_glDrawRangeElements(mode, start, end, count, type, indices);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glCopyPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum type)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glCopyPixels)
         glad_glCopyPixels(x, y, width, height, type);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glGetTexImage(GLenum target, GLint level, GLenum format, GLenum type, GLvoid *pixels)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glGetTexImage)
         glad_glGetTexImage(target, level, format, type, pixels);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glPrimitiveRestartIndexNV(GLuint index)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glPrimitiveRestartIndexNV)
         glad_glPrimitiveRestartIndexNV(index);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glClipPlane(GLenum plane, const GLdouble *equation)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glClipPlane)
         glad_glClipPlane(plane, equation);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glNormal3dv(const GLdouble *v)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glNormal3dv)
         glad_glNormal3dv(v);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glNormal3d(GLdouble nx, GLdouble ny, GLdouble nz)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glNormal3d)
         glad_glNormal3d(nx, ny, nz);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glLightModeliv(GLenum pname, const GLint *params)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glLightModeliv)
         glad_glLightModeliv(pname, params);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glVertex4dv(const GLdouble *v)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glVertex4dv)
         glad_glVertex4dv(v);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glVertex3dv(const GLdouble *v)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glVertex3dv)
         glad_glVertex3dv(v);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glVertex2dv(const GLdouble *v)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glVertex2dv)
         glad_glVertex2dv(v);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glTexGeni(GLenum coord, GLenum pname, GLint param)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glTexGeni)
         glad_glTexGeni(coord, pname, param);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glTexGenfv(GLenum coord, GLenum pname, const GLfloat *params)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glTexGenfv)
         glad_glTexGenfv(coord, pname, params);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glLineStipple(GLint factor, GLushort pattern)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glLineStipple)
         glad_glLineStipple(factor, pattern);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glColor3dv(const GLdouble *v)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glColor3dv)
         glad_glColor3dv(v);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glColor3d(GLdouble red, GLdouble green, GLdouble blue)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glColor3d)
         glad_glColor3d(red, green, blue);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glColor4dv(const GLdouble *v)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glColor4dv)
         glad_glColor4dv(v);
 }
 
 extern "C" GLint __attribute__((cdecl)) wrap_glGetUniformLocationARB(GLhandleARB program, const GLcharARB *name)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glGetUniformLocationARB)
         return glad_glGetUniformLocationARB(program, name);
     return (GLint)-1;
@@ -1773,42 +2850,49 @@ extern "C" GLint __attribute__((cdecl)) wrap_glGetUniformLocationARB(GLhandleARB
 
 extern "C" void __attribute__((cdecl)) wrap_glUniform1fvARB(GLint location, GLsizei count, const GLfloat *value)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glUniform1fvARB)
         glad_glUniform1fvARB(location, count, value);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glSecondaryColor3fv(const GLfloat *v)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glSecondaryColor3fv)
         glad_glSecondaryColor3fv(v);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glUniformMatrix3fvARB(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glUniformMatrix3fvARB)
         glad_glUniformMatrix3fvARB(location, count, transpose, value);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glUniform4fvARB(GLint location, GLsizei count, const GLfloat *value)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glUniform4fvARB)
         glad_glUniform4fvARB(location, count, value);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glUniform1fARB(GLint location, GLfloat value)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glUniform1fARB)
         glad_glUniform1fARB(location, value);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glSecondaryColorPointer(GLint size, GLenum type, GLsizei stride, const GLvoid *pointer)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glSecondaryColorPointer)
         glad_glSecondaryColorPointer(size, type, stride, pointer);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glLockArraysEXT(GLint first, GLsizei count)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glLockArraysEXT)
         glad_glLockArraysEXT(first, count);
 }
@@ -1816,42 +2900,49 @@ extern "C" void __attribute__((cdecl)) wrap_glLockArraysEXT(GLint first, GLsizei
 extern "C" void __attribute__((cdecl)) wrap_glMultiDrawElements(GLenum mode, const GLsizei *count, GLenum type,
                                                                 const GLvoid *const *indices, GLsizei drawcount)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glMultiDrawElements)
         glad_glMultiDrawElements(mode, count, type, indices, drawcount);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glUnlockArraysEXT()
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glUnlockArraysEXT)
         glad_glUnlockArraysEXT();
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glUniform1iARB(GLint location, GLint value)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glUniform1iARB)
         glad_glUniform1iARB(location, value);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glVertexAttrib3fARB(GLuint index, GLfloat x, GLfloat y, GLfloat z)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glVertexAttrib3fARB)
         glad_glVertexAttrib3fARB(index, x, y, z);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glDetachObjectARB(GLhandleARB containerObj, GLhandleARB attachedObj)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glDetachObjectARB)
         glad_glDetachObjectARB(containerObj, attachedObj);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glAttachObjectARB(GLhandleARB containerObj, GLhandleARB obj)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glAttachObjectARB)
         glad_glAttachObjectARB(containerObj, obj);
 }
 
 extern "C" GLhandleARB __attribute__((cdecl)) wrap_glCreateProgramObjectARB()
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glCreateProgramObjectARB)
         return glad_glCreateProgramObjectARB();
     return (GLhandleARB)0;
@@ -1859,48 +2950,56 @@ extern "C" GLhandleARB __attribute__((cdecl)) wrap_glCreateProgramObjectARB()
 
 extern "C" void __attribute__((cdecl)) wrap_glBindAttribLocationARB(GLhandleARB programObj, GLuint index, const GLchar *name)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glBindAttribLocationARB)
         glad_glBindAttribLocationARB(programObj, index, name);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glUniformMatrix4fvARB(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glUniformMatrix4fvARB)
         glad_glUniformMatrix4fvARB(location, count, transpose, value);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glColor3fv(const GLfloat *v)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glColor3fv)
         glad_glColor3fv(v);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glGenProgramsNV(GLsizei n, GLuint *programs)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glGenProgramsNV)
         glad_glGenProgramsNV(n, programs);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glDeleteProgramsNV(GLsizei n, const GLuint *programs)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glDeleteProgramsNV)
         glad_glDeleteProgramsNV(n, programs);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glBindProgramNV(GLenum target, GLuint program)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glBindProgramNV)
         glad_glBindProgramNV(target, program);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glLoadProgramNV(GLenum target, GLuint id, GLsizei len, const GLubyte *program)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glLoadProgramNV)
         glad_glLoadProgramNV(target, id, len, program);
 }
 
 extern "C" GLboolean __attribute__((cdecl)) wrap_glIsProgramNV(GLuint program)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glIsProgramNV)
         return glad_glIsProgramNV(program);
     return (GLboolean)0;
@@ -1908,54 +3007,63 @@ extern "C" GLboolean __attribute__((cdecl)) wrap_glIsProgramNV(GLuint program)
 
 extern "C" void __attribute__((cdecl)) wrap_glTrackMatrixNV(GLenum target, GLuint address, GLenum matrix, GLenum transform)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glTrackMatrixNV)
         glad_glTrackMatrixNV(target, address, matrix, transform);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glProgramParameter4fNV(GLenum target, GLuint index, GLfloat x, GLfloat y, GLfloat z, GLfloat w)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glProgramParameter4fNV)
         glad_glProgramParameter4fNV(target, index, x, y, z, w);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glProgramParameter4fvNV(GLenum target, GLuint index, const GLfloat *v)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glProgramParameter4fvNV)
         glad_glProgramParameter4fvNV(target, index, v);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glProgramParameters4fvNV(GLenum target, GLuint index, GLsizei count, const GLfloat *v)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glProgramParameters4fvNV)
         glad_glProgramParameters4fvNV(target, index, count, v);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glGenOcclusionQueriesNV(GLsizei n, GLuint *ids)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glGenOcclusionQueriesNV)
         glad_glGenOcclusionQueriesNV(n, ids);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glBeginOcclusionQueryNV(GLuint id)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glBeginOcclusionQueryNV)
         glad_glBeginOcclusionQueryNV(id);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glEndOcclusionQueryNV()
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glEndOcclusionQueryNV)
         glad_glEndOcclusionQueryNV();
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glGetOcclusionQueryuivNV(GLuint id, GLenum pname, GLuint *params)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glGetOcclusionQueryuivNV)
         glad_glGetOcclusionQueryuivNV(id, pname, params);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glProgramEnvParameters4fvEXT(GLenum target, GLuint index, GLsizei count, const GLfloat *params)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glProgramEnvParameters4fvEXT)
         glad_glProgramEnvParameters4fvEXT(target, index, count, params);
 }
@@ -1963,67 +3071,79 @@ extern "C" void __attribute__((cdecl)) wrap_glProgramEnvParameters4fvEXT(GLenum 
 extern "C" void __attribute__((cdecl)) wrap_glProgramLocalParameters4fvEXT(GLenum target, GLuint index, GLsizei count,
                                                                            const GLfloat *params)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glProgramLocalParameters4fvEXT)
         glad_glProgramLocalParameters4fvEXT(target, index, count, params);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glNormal3fv(const GLfloat *v)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glNormal3fv)
         glad_glNormal3fv(v);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glCopyTexImage2D(GLenum target, GLint level, GLenum internalFormat, GLint x, GLint y,
-                                                             GLsizei width, GLsizei height, GLint border)
+                                                              GLsizei width, GLsizei height, GLint border)
 {
+    PERF_PROFILE_SCOPE("GL");
+    invalidateTexParameter(target, GL_TEXTURE_RESIDENT);
     if (glad_glCopyTexImage2D)
         glad_glCopyTexImage2D(target, level, internalFormat, x, y, width, height, border);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glTexCoord3f(GLfloat s, GLfloat t, GLfloat r)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glTexCoord3f)
         glad_glTexCoord3f(s, t, r);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glArrayElement(GLint i)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glArrayElement)
         glad_glArrayElement(i);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glPointParameterfARB(GLenum pname, GLfloat param)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glPointParameterfARB)
         glad_glPointParameterfARB(pname, param);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glGetQueryObjectivARB(GLuint id, GLenum pname, GLint *params)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glGetQueryObjectivARB)
         glad_glGetQueryObjectivARB(id, pname, params);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glDrawArraysEXT(GLenum mode, GLint first, GLsizei count)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glDrawArraysEXT)
         glad_glDrawArraysEXT(mode, first, count);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glGenFencesNV(GLsizei n, GLuint *fences)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glGenFencesNV)
         glad_glGenFencesNV(n, fences);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glDeleteFencesNV(GLsizei n, const GLuint *fences)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glDeleteFencesNV)
         glad_glDeleteFencesNV(n, fences);
 }
 
 extern "C" int __attribute__((cdecl)) wrap_glIsEnabled(GLenum cap)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glIsEnabled)
         return glad_glIsEnabled(cap);
     return (int)0;
@@ -2031,6 +3151,7 @@ extern "C" int __attribute__((cdecl)) wrap_glIsEnabled(GLenum cap)
 
 extern "C" GLuint __attribute__((cdecl)) wrap_glGenLists(GLsizei range)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glGenLists)
         return glad_glGenLists(range);
     return (GLuint)0;
@@ -2038,6 +3159,7 @@ extern "C" GLuint __attribute__((cdecl)) wrap_glGenLists(GLsizei range)
 
 extern "C" GLboolean __attribute__((cdecl)) wrap_glIsList(GLuint list)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glIsList)
         return glad_glIsList(list);
     return (GLboolean)0;
@@ -2045,6 +3167,7 @@ extern "C" GLboolean __attribute__((cdecl)) wrap_glIsList(GLuint list)
 
 extern "C" const GLubyte *__attribute__((cdecl)) wrap_glGetString(GLenum name)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glGetString)
         return glad_glGetString(name);
     return (const GLubyte *)0;
@@ -2052,6 +3175,13 @@ extern "C" const GLubyte *__attribute__((cdecl)) wrap_glGetString(GLenum name)
 
 extern "C" GLenum __attribute__((cdecl)) wrap_glGetError()
 {
+    PERF_PROFILE_SCOPE("GL");
+    static const bool fastPath = [] {
+        const char *setting = std::getenv("LL_GL_GETERROR_FAST");
+        return setting && strcmp(setting, "1") == 0;
+    }();
+    if (fastPath)
+        return GL_NO_ERROR;
     const GLenum error = glad_glGetError ? glad_glGetError() : (GLenum)0;
     if (error != GL_NO_ERROR && glDiagnosticEnabled())
     {
@@ -2080,6 +3210,7 @@ extern "C" GLenum __attribute__((cdecl)) wrap_glGetError()
 
 extern "C" GLboolean __attribute__((cdecl)) wrap_glIsProgramARB(GLuint program)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glIsProgramARB)
         return glad_glIsProgramARB(program);
     return (GLboolean)0;
@@ -2087,6 +3218,7 @@ extern "C" GLboolean __attribute__((cdecl)) wrap_glIsProgramARB(GLuint program)
 
 extern "C" GLenum __attribute__((cdecl)) wrap_glCheckFramebufferStatus(GLenum target)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glCheckFramebufferStatus)
         return glad_glCheckFramebufferStatus(target);
     return (GLenum)0;
@@ -2094,6 +3226,7 @@ extern "C" GLenum __attribute__((cdecl)) wrap_glCheckFramebufferStatus(GLenum ta
 
 extern "C" GLuint __attribute__((cdecl)) wrap_glCreateShader(GLenum type)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glCreateShader)
         return glad_glCreateShader(type);
     return (GLuint)0;
@@ -2101,6 +3234,7 @@ extern "C" GLuint __attribute__((cdecl)) wrap_glCreateShader(GLenum type)
 
 extern "C" GLuint __attribute__((cdecl)) wrap_glCreateProgram()
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glCreateProgram)
         return glad_glCreateProgram();
     return (GLuint)0;
@@ -2108,6 +3242,7 @@ extern "C" GLuint __attribute__((cdecl)) wrap_glCreateProgram()
 
 extern "C" GLint __attribute__((cdecl)) wrap_glGetUniformLocation(GLuint program, const GLchar *name)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glGetUniformLocation)
         return glad_glGetUniformLocation(program, name);
     return (GLint)0;
@@ -2115,6 +3250,7 @@ extern "C" GLint __attribute__((cdecl)) wrap_glGetUniformLocation(GLuint program
 
 extern "C" GLint __attribute__((cdecl)) wrap_glGetAttribLocation(GLuint program, const GLchar *name)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glGetAttribLocation)
         return glad_glGetAttribLocation(program, name);
     return (GLint)0;
@@ -2122,6 +3258,7 @@ extern "C" GLint __attribute__((cdecl)) wrap_glGetAttribLocation(GLuint program,
 
 extern "C" GLboolean __attribute__((cdecl)) wrap_glIsTexture(GLuint texture)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glIsTexture)
         return glad_glIsTexture(texture);
     return (GLboolean)0;
@@ -2129,6 +3266,7 @@ extern "C" GLboolean __attribute__((cdecl)) wrap_glIsTexture(GLuint texture)
 
 extern "C" GLvoid *__attribute__((cdecl)) wrap_glMapBuffer(GLenum target, GLenum access)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glMapBuffer)
         return glad_glMapBuffer(target, access);
     return (GLvoid *)0;
@@ -2136,6 +3274,7 @@ extern "C" GLvoid *__attribute__((cdecl)) wrap_glMapBuffer(GLenum target, GLenum
 
 extern "C" GLboolean __attribute__((cdecl)) wrap_glIsBufferARB(GLuint buffer)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glIsBufferARB)
         return glad_glIsBufferARB(buffer);
     return (GLboolean)0;
@@ -2143,6 +3282,7 @@ extern "C" GLboolean __attribute__((cdecl)) wrap_glIsBufferARB(GLuint buffer)
 
 extern "C" GLboolean __attribute__((cdecl)) wrap_glUnmapBuffer(GLenum target)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glUnmapBuffer)
         return glad_glUnmapBuffer(target);
     return (GLboolean)0;
@@ -2150,6 +3290,7 @@ extern "C" GLboolean __attribute__((cdecl)) wrap_glUnmapBuffer(GLenum target)
 
 extern "C" GLboolean __attribute__((cdecl)) wrap_glIsFenceNV(GLuint fence)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glIsFenceNV)
         return glad_glIsFenceNV(fence);
     return (GLboolean)0;
@@ -2157,6 +3298,7 @@ extern "C" GLboolean __attribute__((cdecl)) wrap_glIsFenceNV(GLuint fence)
 
 extern "C" GLvoid *__attribute__((cdecl)) wrap_glMapBufferARB(GLenum target, GLenum access)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glMapBufferARB)
         return glad_glMapBufferARB(target, access);
     return (GLvoid *)0;
@@ -2164,6 +3306,7 @@ extern "C" GLvoid *__attribute__((cdecl)) wrap_glMapBufferARB(GLenum target, GLe
 
 extern "C" GLboolean __attribute__((cdecl)) wrap_glUnmapBufferARB(GLenum target)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glUnmapBufferARB)
         return glad_glUnmapBufferARB(target);
     return (GLboolean)0;
@@ -2171,6 +3314,7 @@ extern "C" GLboolean __attribute__((cdecl)) wrap_glUnmapBufferARB(GLenum target)
 
 extern "C" GLhandleARB __attribute__((cdecl)) wrap_glCreateShaderObjectARB(GLenum shaderType)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glCreateShaderObjectARB)
         return glad_glCreateShaderObjectARB(shaderType);
     return (GLhandleARB)0;
@@ -2179,6 +3323,8 @@ extern "C" GLhandleARB __attribute__((cdecl)) wrap_glCreateShaderObjectARB(GLenu
 extern "C" void __attribute__((cdecl)) wrap_glCompressedTexImage2DARB(GLenum target, GLint level, GLenum internalformat, GLsizei width,
                                                                       GLsizei height, GLint border, GLsizei imageSize, const void *data)
 {
+    PERF_PROFILE_SCOPE("GL");
+    invalidateTexParameter(target, GL_TEXTURE_RESIDENT);
     if (glad_glCompressedTexImage2DARB)
         glad_glCompressedTexImage2DARB(target, level, internalformat, width, height, border, imageSize, data);
 }
@@ -2186,6 +3332,8 @@ extern "C" void __attribute__((cdecl)) wrap_glCompressedTexImage2DARB(GLenum tar
 extern "C" void __attribute__((cdecl)) wrap_glTexSubImage2D(GLenum target, GLint level, GLint xoffset, GLint yoffset, GLsizei width,
                                                             GLsizei height, GLenum format, GLenum type, const GLvoid *pixels)
 {
+    PERF_PROFILE_SCOPE("GL");
+    invalidateTexParameter(target, GL_TEXTURE_RESIDENT);
     if (glad_glTexSubImage2D)
         glad_glTexSubImage2D(target, level, xoffset, yoffset, width, height, format, type, pixels);
 }
@@ -2194,6 +3342,8 @@ extern "C" void __attribute__((cdecl)) wrap_glCompressedTexSubImage2DARB(GLenum 
                                                                          GLsizei width, GLsizei height, GLenum format, GLsizei imageSize,
                                                                          const void *data)
 {
+    PERF_PROFILE_SCOPE("GL");
+    invalidateTexParameter(target, GL_TEXTURE_RESIDENT);
     if (glad_glCompressedTexSubImage2DARB)
         glad_glCompressedTexSubImage2DARB(target, level, xoffset, yoffset, width, height, format, imageSize, data);
 }
@@ -2201,6 +3351,8 @@ extern "C" void __attribute__((cdecl)) wrap_glCompressedTexSubImage2DARB(GLenum 
 extern "C" void __attribute__((cdecl)) wrap_glCompressedTexImage2D(GLenum target, GLint level, GLenum internalformat, GLsizei width,
                                                                    GLsizei height, GLint border, GLsizei imageSize, const void *data)
 {
+    PERF_PROFILE_SCOPE("GL");
+    invalidateTexParameter(target, GL_TEXTURE_RESIDENT);
     if (glad_glCompressedTexImage2D)
         glad_glCompressedTexImage2D(target, level, internalformat, width, height, border, imageSize, data);
 }
@@ -2208,24 +3360,29 @@ extern "C" void __attribute__((cdecl)) wrap_glCompressedTexImage2D(GLenum target
 extern "C" void __attribute__((cdecl)) wrap_glTexImage1D(GLenum target, GLint level, GLint internalformat, GLsizei width, GLint border,
                                                          GLenum format, GLenum type, const GLvoid *pixels)
 {
+    PERF_PROFILE_SCOPE("GL");
+    invalidateTexParameter(target, GL_TEXTURE_RESIDENT);
     if (glad_glTexImage1D)
         glad_glTexImage1D(target, level, internalformat, width, border, format, type, pixels);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glBeginQuery(GLenum target, GLuint id)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glBeginQuery)
         glad_glBeginQuery(target, id);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glEndQuery(GLenum target)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glEndQuery)
         glad_glEndQuery(target);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glGetQueryObjectiv(GLuint id, GLenum pname, GLint *params)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glGetQueryObjectiv)
         glad_glGetQueryObjectiv(id, pname, params);
 }
@@ -2234,12 +3391,15 @@ extern "C" void __attribute__((cdecl)) wrap_glCompressedTexSubImage2D(GLenum tar
                                                                       GLsizei width, GLsizei height, GLenum format, GLsizei imageSize,
                                                                       const void *data)
 {
+    PERF_PROFILE_SCOPE("GL");
+    invalidateTexParameter(target, GL_TEXTURE_RESIDENT);
     if (glad_glCompressedTexSubImage2D)
         glad_glCompressedTexSubImage2D(target, level, xoffset, yoffset, width, height, format, imageSize, data);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glGetCompressedTexImage(GLenum target, GLint level, void *img)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glGetCompressedTexImage)
         glad_glGetCompressedTexImage(target, level, img);
     pendingCompressedImageSize = lastCompressedImageSize;
@@ -2247,6 +3407,7 @@ extern "C" void __attribute__((cdecl)) wrap_glGetCompressedTexImage(GLenum targe
 
 extern "C" void __attribute__((cdecl)) wrap_glGetCompressedTexImageARB(GLenum target, GLint level, void *img)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glGetCompressedTexImageARB)
         glad_glGetCompressedTexImageARB(target, level, img);
     pendingCompressedImageSize = lastCompressedImageSize;
@@ -2254,90 +3415,113 @@ extern "C" void __attribute__((cdecl)) wrap_glGetCompressedTexImageARB(GLenum ta
 
 extern "C" void __attribute__((cdecl)) wrap_glGetQueryObjectuiv(GLuint id, GLenum pname, GLuint *params)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glGetQueryObjectuiv)
         glad_glGetQueryObjectuiv(id, pname, params);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glGetProgramEnvParameterfvARB(GLhandleARB program, GLuint index, GLfloat *params)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glGetProgramEnvParameterfvARB)
         glad_glGetProgramEnvParameterfvARB(program, index, params);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glGetTexParameteriv(GLenum target, GLenum pname, GLint *params)
 {
+    PERF_PROFILE_SCOPE("GL");
+    if (cachedTexParameter(target, pname, params))
+    {
+        PerfProfiler_TextureQuery(static_cast<uint32_t>(pname), 1);
+        return;
+    }
+    PerfProfiler_TextureQuery(static_cast<uint32_t>(pname), 0);
     if (glad_glGetTexParameteriv)
         glad_glGetTexParameteriv(target, pname, params);
+    if (params)
+        rememberTexParameter(target, pname, *params);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glMultiTexCoord4f(GLenum target, GLfloat s, GLfloat t, GLfloat r, GLfloat q)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glMultiTexCoord4f)
         glad_glMultiTexCoord4f(target, s, t, r, q);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glVertexAttrib4fv(GLuint index, const GLfloat *v)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glVertexAttrib4fv)
         glad_glVertexAttrib4fv(index, v);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glDeleteQueries(GLsizei n, const GLuint *ids)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glDeleteQueries)
         glad_glDeleteQueries(n, ids);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glPointParameteri(GLenum target, GLint param)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glPointParameteri)
         glad_glPointParameteri(target, param);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glGenQueries(GLsizei n, GLuint *ids)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glGenQueries)
         glad_glGenQueries(n, ids);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glSecondaryColor3f(GLfloat red, GLfloat green, GLfloat blue)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glSecondaryColor3f)
         glad_glSecondaryColor3f(red, green, blue);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glUniform3fvARB(GLhandleARB location, GLsizei count, const GLfloat *v)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glUniform3fvARB)
         glad_glUniform3fvARB(location, count, v);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glDrawPixels(GLsizei width, GLsizei height, GLenum format, GLenum type, const void *pixels)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glDrawPixels)
         glad_glDrawPixels(width, height, format, type, pixels);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glGetTexEnvfv(GLenum target, GLenum pname, GLfloat *params)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glGetTexEnvfv)
         glad_glGetTexEnvfv(target, pname, params);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glGetTexEnviv(GLenum target, GLenum pname, GLint *params)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glGetTexEnviv)
         glad_glGetTexEnviv(target, pname, params);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glGetTexParameterfv(GLenum target, GLenum pname, GLfloat *params)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glGetTexParameterfv)
         glad_glGetTexParameterfv(target, pname, params);
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glMultMatrixd(const GLdouble *m)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glMultMatrixd)
         glad_glMultMatrixd(m);
 }
@@ -2345,6 +3529,7 @@ extern "C" void __attribute__((cdecl)) wrap_glMultMatrixd(const GLdouble *m)
 
 extern "C" void __attribute__((cdecl)) wrap_glGenerateMipmapEXT(GLenum target)
 {
+    PERF_PROFILE_SCOPE("GL");
     if (glad_glGenerateMipmapEXT)
         glad_glGenerateMipmapEXT(target);
 }
@@ -2956,6 +4141,8 @@ void *GLHooks_GetProcAddress(const char *procName)
         return (void *)&wrap_glTexGeni;
     if (strcmp(procName, "glTexParameterf") == 0)
         return (void *)&wrap_glTexParameterf;
+    if (strcmp(procName, "glTexParameteriv") == 0)
+        return (void *)&wrap_glTexParameteriv;
     if (strcmp(procName, "glTexParameterfv") == 0)
         return (void *)&wrap_glTexParameterfv;
     if (strcmp(procName, "glTrackMatrixNV") == 0)

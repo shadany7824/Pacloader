@@ -112,13 +112,18 @@ void answerRequest(const uint8_t *frame, size_t length)
         return;
     }
 
-    // Every request, for when the wire itself is in question.
+    const bool manufacturerCommand = length > 3 && frame[3] == 0x70;
+    const bool traceRequest = logIsEnabled(LOG_TRACE);
     char hex[3 * 48 + 4] = {};
     size_t written = 0;
-    for (size_t i = 0; i < length && written + 4 < sizeof(hex); i++)
-        written += static_cast<size_t>(std::snprintf(hex + written, sizeof(hex) - written,
-                                                     "%02X ", frame[i]));
-    log_trace("Namco N2 JVS: request %s", hex);
+    if (traceRequest || manufacturerCommand)
+    {
+        for (size_t i = 0; i < length && written + 4 < sizeof(hex); i++)
+            written += static_cast<size_t>(std::snprintf(hex + written, sizeof(hex) - written,
+                                                         "%02X ", frame[i]));
+        if (traceRequest)
+            log_trace("Namco N2 JVS: request %s", hex);
+    }
 
     /*
      * The manufacturer specific command, whose payload is still undecoded:
@@ -127,7 +132,7 @@ void answerRequest(const uint8_t *frame, size_t length)
      * bare status and the game is satisfied - it repeats every ten seconds and
      * never retries.
      */
-    if (length > 3 && frame[3] == 0x70)
+    if (manufacturerCommand)
         log_debug("Namco N2 JVS: manufacturer command %s", hex);
 
     JVSIO *io = getJVSIO();
@@ -201,9 +206,11 @@ void answerRequest(const uint8_t *frame, size_t length)
 
 void consumeRequests()
 {
+    std::vector<uint8_t> frame;
+    frame.reserve(256);
     for (;;)
     {
-        std::vector<uint8_t> frame;
+        frame.clear();
         bool complete = false;
         {
             std::lock_guard<std::mutex> lock(bufferMutex);

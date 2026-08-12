@@ -1,0 +1,1015 @@
+#include "perfProfiler.hpp"
+
+#if defined(_WIN32) || defined(__MINGW32__)
+
+#include <windows.h>
+
+#include <array>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <functional>
+#include <mutex>
+#include <new>
+#include <cstdint>
+
+namespace
+{
+constexpr size_t kEntryCount = 1024;
+constexpr size_t kFrameSampleCount = 4096;
+constexpr size_t kFrameSpikeCount = 2048;
+constexpr size_t kPresentSpikeCount = 4096;
+constexpr size_t kTextureQueryStatCount = 128;
+
+struct Entry
+{
+    const char *domain = nullptr;
+    const char *name = nullptr;
+    std::atomic<uint64_t> calls{0};
+    std::atomic<uint64_t> ticks{0};
+    std::atomic<uint64_t> maxTicks{0};
+    std::atomic<uint64_t> bytes{0};
+};
+
+struct ThreadData
+{
+    DWORD threadId = 0;
+    std::atomic<size_t> used{0};
+    std::array<Entry, kEntryCount> entries{};
+};
+
+struct ExtraStats
+{
+    std::atomic<uint64_t> cacheSkips{0};
+    std::atomic<uint64_t> frameSamples{0};
+    std::atomic<uint64_t> frameTicks[kFrameSampleCount]{};
+};
+
+struct TextureQueryStat
+{
+    std::atomic<uint32_t> pname{0};
+    std::atomic<uint64_t> calls{0};
+    std::atomic<uint64_t> hits{0};
+};
+
+struct FrameSpike
+{
+    uint64_t sequence = 0;
+    uint64_t totalTicks = 0;
+    uint64_t glTicks = 0;
+    uint64_t pthreadTicks = 0;
+    uint64_t presentTicks = 0;
+    uint64_t glxTicks = 0;
+    uint64_t otherTicks = 0;
+    uint64_t glCalls = 0;
+    uint64_t pthreadCalls = 0;
+    uint64_t presentCalls = 0;
+    uint64_t glxCalls = 0;
+};
+
+struct FrameAccumulator
+{
+    std::atomic<uint64_t> glTicks{0};
+    std::atomic<uint64_t> pthreadTicks{0};
+    std::atomic<uint64_t> presentTicks{0};
+    std::atomic<uint64_t> glxTicks{0};
+    std::atomic<uint64_t> otherTicks{0};
+    std::atomic<uint64_t> glCalls{0};
+    std::atomic<uint64_t> pthreadCalls{0};
+    std::atomic<uint64_t> presentCalls{0};
+    std::atomic<uint64_t> glxCalls{0};
+};
+
+struct PresentSpike
+{
+    char source[8]{};
+    uint64_t sequence = 0;
+    uint64_t totalTicks = 0;
+    uint64_t eventTicks = 0;
+    uint64_t pacingTicks = 0;
+    uint64_t swapTicks = 0;
+};
+
+std::once_flag g_initOnce;
+std::atomic<int> g_enabledState{-1};
+bool g_enabled = false;
+LARGE_INTEGER g_frequency{};
+std::mutex g_threadsLock;
+std::mutex g_writeLock;
+constexpr size_t kMaxThreads = 64;
+ThreadData *g_threads[kMaxThreads]{};
+size_t g_threadCount = 0;
+DWORD g_tlsIndex = TLS_OUT_OF_INDEXES;
+std::atomic_flag g_writing = ATOMIC_FLAG_INIT;
+std::atomic<bool> g_runtimeReady{false};
+std::atomic<bool> g_flushStop{false};
+HANDLE g_flushThread = nullptr;
+bool g_backgroundFlushEnabled = true;
+ExtraStats g_extraStats;
+TextureQueryStat g_textureQueryStats[kTextureQueryStatCount]{};
+FrameAccumulator g_frameAccumulator;
+std::atomic<bool> g_frameBoundaryActive{false};
+std::atomic<uint64_t> g_frameBoundaryStart{0};
+std::atomic<uint64_t> g_frameSequence{0};
+std::mutex g_frameSpikeLock;
+FrameSpike g_frameSpikes[kFrameSpikeCount]{};
+size_t g_frameSpikeCount = 0;
+uint64_t g_frameSpikeThresholdTicks = 0;
+std::mutex g_presentSpikeLock;
+PresentSpike g_presentSpikes[kPresentSpikeCount]{};
+size_t g_presentSpikeCount = 0;
+
+constexpr size_t kBufferSiteCount = 1024;
+constexpr size_t kBufferPatternCount = 1024;
+constexpr size_t kBufferObjectCount = 8192;
+
+enum class BufferOperation : uint8_t
+{
+    Gen = 1,
+    Data = 2,
+    Delete = 3,
+    Bind = 4,
+};
+
+struct BufferSiteEntry
+{
+    bool valid = false;
+    BufferOperation operation = BufferOperation::Gen;
+    uintptr_t caller = 0;
+    uintptr_t context = 0;
+    uint32_t target = 0;
+    uint32_t usage = 0;
+    uint64_t size = 0;
+    uint64_t calls = 0;
+    uint64_t bytes = 0;
+};
+
+struct BufferPatternEntry
+{
+    bool valid = false;
+    uintptr_t context = 0;
+    uint32_t target = 0;
+    uint32_t usage = 0;
+    uint64_t size = 0;
+    uint64_t dataCalls = 0;
+    uint64_t deletedObjects = 0;
+    uint64_t reusedNames = 0;
+    uint64_t objectsWithData = 0;
+    uint64_t bindCalls = 0;
+    uint64_t objectsWithBinds = 0;
+};
+
+struct BufferObjectEntry
+{
+    bool valid = false;
+    bool active = false;
+    bool everDeleted = false;
+    uintptr_t context = 0;
+    uint32_t buffer = 0;
+    uint32_t target = 0;
+    uint32_t usage = 0;
+    uint64_t size = 0;
+    uint64_t dataCalls = 0;
+    uint64_t bindCalls = 0;
+};
+
+std::mutex g_bufferTraceLock;
+BufferSiteEntry g_bufferSites[kBufferSiteCount]{};
+BufferPatternEntry g_bufferPatterns[kBufferPatternCount]{};
+BufferObjectEntry g_bufferObjects[kBufferObjectCount]{};
+bool g_bufferTraceEnabled = false;
+
+uint64_t bufferHash(BufferOperation operation, uintptr_t caller, uintptr_t context,
+                    uint32_t target, uint32_t usage, uint64_t size)
+{
+    uint64_t hash = 1469598103934665603ULL;
+    hash = (hash ^ static_cast<uint64_t>(operation)) * 1099511628211ULL;
+    hash = (hash ^ static_cast<uint64_t>(caller)) * 1099511628211ULL;
+    hash = (hash ^ static_cast<uint64_t>(context)) * 1099511628211ULL;
+    hash = (hash ^ target) * 1099511628211ULL;
+    hash = (hash ^ usage) * 1099511628211ULL;
+    hash = (hash ^ size) * 1099511628211ULL;
+    return hash;
+}
+
+BufferSiteEntry *findBufferSite(BufferOperation operation, uintptr_t caller,
+                                uintptr_t context, uint32_t target, uint32_t usage,
+                                uint64_t size)
+{
+    const size_t first = static_cast<size_t>(bufferHash(operation, caller, context,
+                                                        target, usage, size) % kBufferSiteCount);
+    for (size_t probe = 0; probe < kBufferSiteCount; ++probe)
+    {
+        BufferSiteEntry &entry = g_bufferSites[(first + probe) % kBufferSiteCount];
+        if (!entry.valid)
+        {
+            entry.valid = true;
+            entry.operation = operation;
+            entry.caller = caller;
+            entry.context = context;
+            entry.target = target;
+            entry.usage = usage;
+            entry.size = size;
+            return &entry;
+        }
+        if (entry.operation == operation && entry.caller == caller &&
+            entry.context == context && entry.target == target &&
+            entry.usage == usage && entry.size == size)
+            return &entry;
+    }
+    return nullptr;
+}
+
+BufferPatternEntry *findBufferPattern(uintptr_t context, uint32_t target,
+                                      uint32_t usage, uint64_t size)
+{
+    const size_t first = static_cast<size_t>(bufferHash(BufferOperation::Data, 0, context,
+                                                        target, usage, size) % kBufferPatternCount);
+    for (size_t probe = 0; probe < kBufferPatternCount; ++probe)
+    {
+        BufferPatternEntry &entry = g_bufferPatterns[(first + probe) % kBufferPatternCount];
+        if (!entry.valid)
+        {
+            entry.valid = true;
+            entry.context = context;
+            entry.target = target;
+            entry.usage = usage;
+            entry.size = size;
+            return &entry;
+        }
+        if (entry.context == context && entry.target == target &&
+            entry.usage == usage && entry.size == size)
+            return &entry;
+    }
+    return nullptr;
+}
+
+BufferObjectEntry *findBufferObject(uintptr_t context, uint32_t buffer, bool create)
+{
+    const size_t first = static_cast<size_t>(bufferHash(BufferOperation::Gen, 0, context,
+                                                        0, 0, buffer) % kBufferObjectCount);
+    for (size_t probe = 0; probe < kBufferObjectCount; ++probe)
+    {
+        BufferObjectEntry &entry = g_bufferObjects[(first + probe) % kBufferObjectCount];
+        if (!entry.valid)
+        {
+            if (!create)
+                return nullptr;
+            entry.valid = true;
+            entry.context = context;
+            entry.buffer = buffer;
+            return &entry;
+        }
+        if (entry.context == context && entry.buffer == buffer)
+            return &entry;
+    }
+    return nullptr;
+}
+
+const char *bufferOperationName(BufferOperation operation)
+{
+    switch (operation)
+    {
+    case BufferOperation::Gen: return "glGenBuffers";
+    case BufferOperation::Data: return "glBufferData";
+    case BufferOperation::Delete: return "glDeleteBuffers";
+    case BufferOperation::Bind: return "glBindBuffer";
+    }
+    return "unknown";
+}
+
+void writeBufferTraceReport(const std::function<bool(const char *, size_t)> &writeText,
+                            bool &ok)
+{
+    if (!g_bufferTraceEnabled)
+        return;
+
+    std::lock_guard<std::mutex> lock(g_bufferTraceLock);
+    for (const BufferSiteEntry &entry : g_bufferSites)
+    {
+        if (!ok || !entry.valid || entry.calls == 0)
+            continue;
+        char line[512];
+        const int length = std::snprintf(
+            line, sizeof(line), "extra,GLBufferSite,%s,0x%llx,0x%llx,0x%08lx,0x%08lx,%llu,%llu,%llu\r\n",
+            bufferOperationName(entry.operation),
+            static_cast<unsigned long long>(entry.caller),
+            static_cast<unsigned long long>(entry.context),
+            static_cast<unsigned long>(entry.target), static_cast<unsigned long>(entry.usage),
+            static_cast<unsigned long long>(entry.size),
+            static_cast<unsigned long long>(entry.calls),
+            static_cast<unsigned long long>(entry.bytes));
+        ok = length > 0 && static_cast<size_t>(length) < sizeof(line) &&
+             writeText(line, static_cast<size_t>(length));
+    }
+
+    for (const BufferPatternEntry &entry : g_bufferPatterns)
+    {
+        if (!ok || !entry.valid ||
+            (entry.dataCalls == 0 && entry.deletedObjects == 0 && entry.reusedNames == 0 &&
+             entry.bindCalls == 0))
+            continue;
+        char line[512];
+        const int length = std::snprintf(
+            line, sizeof(line), "extra,GLBufferPattern,0x%llx,0x%08lx,0x%08lx,%llu,%llu,%llu,%llu,%llu,%llu,%llu\r\n",
+            static_cast<unsigned long long>(entry.context),
+            static_cast<unsigned long>(entry.target), static_cast<unsigned long>(entry.usage),
+            static_cast<unsigned long long>(entry.size),
+            static_cast<unsigned long long>(entry.dataCalls),
+            static_cast<unsigned long long>(entry.deletedObjects),
+            static_cast<unsigned long long>(entry.reusedNames),
+            static_cast<unsigned long long>(entry.objectsWithData),
+            static_cast<unsigned long long>(entry.bindCalls),
+            static_cast<unsigned long long>(entry.objectsWithBinds));
+        ok = length > 0 && static_cast<size_t>(length) < sizeof(line) &&
+             writeText(line, static_cast<size_t>(length));
+    }
+}
+
+void resetFrameAccumulator()
+{
+    g_frameAccumulator.glTicks.store(0, std::memory_order_relaxed);
+    g_frameAccumulator.pthreadTicks.store(0, std::memory_order_relaxed);
+    g_frameAccumulator.presentTicks.store(0, std::memory_order_relaxed);
+    g_frameAccumulator.glxTicks.store(0, std::memory_order_relaxed);
+    g_frameAccumulator.otherTicks.store(0, std::memory_order_relaxed);
+    g_frameAccumulator.glCalls.store(0, std::memory_order_relaxed);
+    g_frameAccumulator.pthreadCalls.store(0, std::memory_order_relaxed);
+    g_frameAccumulator.presentCalls.store(0, std::memory_order_relaxed);
+    g_frameAccumulator.glxCalls.store(0, std::memory_order_relaxed);
+}
+
+void addFrameEvent(const char *domain, uint64_t elapsed)
+{
+    if (!g_frameBoundaryActive.load(std::memory_order_acquire))
+        return;
+    if (domain && std::strcmp(domain, "GL") == 0)
+    {
+        g_frameAccumulator.glTicks.fetch_add(elapsed, std::memory_order_relaxed);
+        g_frameAccumulator.glCalls.fetch_add(1, std::memory_order_relaxed);
+    }
+    else if (domain && std::strcmp(domain, "PthreadMap") == 0)
+    {
+        g_frameAccumulator.pthreadTicks.fetch_add(elapsed, std::memory_order_relaxed);
+        g_frameAccumulator.pthreadCalls.fetch_add(1, std::memory_order_relaxed);
+    }
+    else if (domain && std::strcmp(domain, "Present") == 0)
+    {
+        g_frameAccumulator.presentTicks.fetch_add(elapsed, std::memory_order_relaxed);
+        g_frameAccumulator.presentCalls.fetch_add(1, std::memory_order_relaxed);
+    }
+    else if (domain && std::strcmp(domain, "GLX") == 0)
+    {
+        g_frameAccumulator.glxTicks.fetch_add(elapsed, std::memory_order_relaxed);
+        g_frameAccumulator.glxCalls.fetch_add(1, std::memory_order_relaxed);
+    }
+    else
+    {
+        g_frameAccumulator.otherTicks.fetch_add(elapsed, std::memory_order_relaxed);
+    }
+}
+
+void writeFrameSpikeReport(const std::function<bool(const char *, size_t)> &writeText,
+                           bool &ok)
+{
+    std::lock_guard<std::mutex> lock(g_frameSpikeLock);
+    const double scale = 1000000.0 / static_cast<double>(g_frequency.QuadPart);
+    char summary[256];
+    const int summaryLength = std::snprintf(
+        summary, sizeof(summary), "extra,FrameSpikeStats,threshold_us,%.3f,count,%llu\r\n",
+        g_frameSpikeThresholdTicks * scale,
+        static_cast<unsigned long long>(g_frameSpikeCount));
+    ok = summaryLength > 0 && static_cast<size_t>(summaryLength) < sizeof(summary) &&
+         writeText(summary, static_cast<size_t>(summaryLength));
+    for (size_t i = 0; ok && i < g_frameSpikeCount; ++i)
+    {
+        const FrameSpike &spike = g_frameSpikes[i];
+        char line[768];
+        const int length = std::snprintf(
+            line, sizeof(line),
+            "extra,FrameSpike,%llu,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%llu,%llu,%llu,%llu\r\n",
+            static_cast<unsigned long long>(spike.sequence),
+            spike.totalTicks * scale, spike.glTicks * scale,
+            spike.pthreadTicks * scale, spike.presentTicks * scale,
+            spike.glxTicks * scale, spike.otherTicks * scale,
+            static_cast<unsigned long long>(spike.glCalls),
+            static_cast<unsigned long long>(spike.pthreadCalls),
+            static_cast<unsigned long long>(spike.presentCalls),
+            static_cast<unsigned long long>(spike.glxCalls));
+        ok = length > 0 && static_cast<size_t>(length) < sizeof(line) &&
+             writeText(line, static_cast<size_t>(length));
+    }
+}
+
+void writePresentSpikeReport(const std::function<bool(const char *, size_t)> &writeText,
+                             bool &ok)
+{
+    std::lock_guard<std::mutex> lock(g_presentSpikeLock);
+    char summary[256];
+    const int summaryLength = std::snprintf(
+        summary, sizeof(summary), "extra,PresentSpikeStats,threshold_us,%.3f,count,%llu\r\n",
+        g_frameSpikeThresholdTicks * 1000000.0 /
+            static_cast<double>(g_frequency.QuadPart),
+        static_cast<unsigned long long>(g_presentSpikeCount));
+    ok = summaryLength > 0 && static_cast<size_t>(summaryLength) < sizeof(summary) &&
+         writeText(summary, static_cast<size_t>(summaryLength));
+
+    const double scale = 1000000.0 / static_cast<double>(g_frequency.QuadPart);
+    for (size_t i = 0; ok && i < g_presentSpikeCount; ++i)
+    {
+        const PresentSpike &spike = g_presentSpikes[i];
+        const uint64_t accounted = spike.eventTicks + spike.pacingTicks + spike.swapTicks;
+        const uint64_t other = spike.totalTicks > accounted ? spike.totalTicks - accounted : 0;
+        char line[512];
+        const int length = std::snprintf(
+            line, sizeof(line),
+            "extra,PresentSpike,%s,%llu,%.3f,%.3f,%.3f,%.3f,%.3f\r\n",
+            spike.source, static_cast<unsigned long long>(spike.sequence),
+            spike.totalTicks * scale, spike.eventTicks * scale,
+            spike.pacingTicks * scale, spike.swapTicks * scale,
+            other * scale);
+        ok = length > 0 && static_cast<size_t>(length) < sizeof(line) &&
+             writeText(line, static_cast<size_t>(length));
+    }
+}
+
+uint64_t nowTicks()
+{
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    return static_cast<uint64_t>(now.QuadPart);
+}
+
+uint64_t hashKey(const char *domain, const char *name)
+{
+    uint64_t hash = 1469598103934665603ULL;
+    for (const char *p = domain; p && *p; ++p)
+        hash = (hash ^ static_cast<unsigned char>(*p)) * 1099511628211ULL;
+    hash = (hash ^ ':') * 1099511628211ULL;
+    for (const char *p = name; p && *p; ++p)
+        hash = (hash ^ static_cast<unsigned char>(*p)) * 1099511628211ULL;
+    return hash;
+}
+
+void writeReport()
+{
+    if (!g_enabled)
+        return;
+    if (g_writing.test_and_set(std::memory_order_acquire))
+        return;
+
+    std::lock_guard<std::mutex> writeLock(g_writeLock);
+
+    const char *path = std::getenv("LL_PERF_PROFILE_FILE");
+    if (!path || !*path)
+        path = "pacloader-perf.csv";
+
+    // Do not use stdio, std::string, or std::vector here. This function can run
+    // concurrently with the guest/GL threads, and those paths may be backed by
+    // the loader's allocator. Direct Win32 I/O keeps report generation outside
+    // that allocator bridge.
+    HANDLE file = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                              CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+    {
+        g_writing.clear(std::memory_order_release);
+        return;
+    }
+
+    auto writeText = [file](const char *text, size_t length) {
+        while (length > 0)
+        {
+            DWORD written = 0;
+            if (!WriteFile(file, text, static_cast<DWORD>(length), &written, nullptr) ||
+                written == 0)
+                return false;
+            text += written;
+            length -= written;
+        }
+        return true;
+    };
+
+    static constexpr char header[] =
+        "thread_id,domain,function,calls,total_us,average_us,max_us,bytes\r\n";
+    bool ok = writeText(header, sizeof(header) - 1);
+
+    std::lock_guard<std::mutex> lock(g_threadsLock);
+    for (size_t threadIndex = 0; ok && threadIndex < g_threadCount; ++threadIndex)
+    {
+        const ThreadData *thread = g_threads[threadIndex];
+        // Entries are placed by hash, so they are sparse; `used` is only a
+        // count and cannot be used as the upper bound for this scan.
+        for (size_t i = 0; ok && i < kEntryCount; ++i)
+        {
+            const Entry &entry = thread->entries[i];
+            if (!entry.name)
+                continue;
+            const uint64_t calls = entry.calls.load(std::memory_order_relaxed);
+            const uint64_t ticks = entry.ticks.load(std::memory_order_relaxed);
+            const uint64_t maxTicks = entry.maxTicks.load(std::memory_order_relaxed);
+            const uint64_t bytes = entry.bytes.load(std::memory_order_relaxed);
+            const double totalUs = static_cast<double>(ticks) * 1000000.0 /
+                                   static_cast<double>(g_frequency.QuadPart);
+            const double maxUs = static_cast<double>(maxTicks) * 1000000.0 /
+                                 static_cast<double>(g_frequency.QuadPart);
+            const double averageUs = calls ? totalUs / static_cast<double>(calls) : 0.0;
+
+            char line[1024];
+            const int length = std::snprintf(
+                line, sizeof(line), "%lu,%s,%s,%llu,%.3f,%.3f,%.3f,%llu\r\n",
+                static_cast<unsigned long>(thread->threadId),
+                entry.domain ? entry.domain : "", entry.name ? entry.name : "",
+                static_cast<unsigned long long>(calls), totalUs, averageUs, maxUs,
+                static_cast<unsigned long long>(bytes));
+            if (length <= 0 || static_cast<size_t>(length) >= sizeof(line))
+            {
+                ok = false;
+                break;
+            }
+            ok = writeText(line, static_cast<size_t>(length));
+        }
+    }
+
+    if (ok)
+    {
+        const uint64_t skips = g_extraStats.cacheSkips.load(std::memory_order_relaxed);
+        const uint64_t samples = g_extraStats.frameSamples.load(std::memory_order_relaxed);
+        char line[256];
+        const int length = std::snprintf(line, sizeof(line),
+                                         "extra,GLCache,skipped_calls,%llu,,,,\r\n",
+                                         static_cast<unsigned long long>(skips));
+        ok = length > 0 && static_cast<size_t>(length) < sizeof(line) &&
+             writeText(line, static_cast<size_t>(length));
+        if (ok)
+        {
+            const int sampleLength = std::snprintf(
+                line, sizeof(line), "extra,FrameStats,samples,%llu,,,,\r\n",
+                static_cast<unsigned long long>(samples));
+            ok = sampleLength > 0 && static_cast<size_t>(sampleLength) < sizeof(line) &&
+                 writeText(line, static_cast<size_t>(sampleLength));
+        }
+        if (ok && samples > 0)
+        {
+            uint64_t sorted[kFrameSampleCount];
+            const size_t count = static_cast<size_t>(samples > kFrameSampleCount
+                                                          ? kFrameSampleCount
+                                                          : samples);
+            for (size_t i = 0; i < count; ++i)
+                sorted[i] = g_extraStats.frameTicks[i].load(std::memory_order_relaxed);
+            for (size_t i = 1; i < count; ++i)
+            {
+                uint64_t value = sorted[i];
+                size_t j = i;
+                while (j > 0 && sorted[j - 1] > value)
+                {
+                    sorted[j] = sorted[j - 1];
+                    --j;
+                }
+                sorted[j] = value;
+            }
+            const size_t p50 = (count - 1) * 50 / 100;
+            const size_t p95 = (count - 1) * 95 / 100;
+            const size_t p99 = (count - 1) * 99 / 100;
+            const double scale = 1000000.0 / static_cast<double>(g_frequency.QuadPart);
+            const int statsLength = std::snprintf(
+                line, sizeof(line), "extra,FrameStats,p50_p95_p99_us,%llu/%.3f/%.3f/%.3f,,,,\r\n",
+                static_cast<unsigned long long>(count), sorted[p50] * scale,
+                sorted[p95] * scale, sorted[p99] * scale);
+            ok = statsLength > 0 && static_cast<size_t>(statsLength) < sizeof(line) &&
+                 writeText(line, static_cast<size_t>(statsLength));
+        }
+    }
+
+    if (ok)
+    {
+        for (size_t i = 0; i < kTextureQueryStatCount; ++i)
+        {
+            const uint64_t calls = g_textureQueryStats[i].calls.load(std::memory_order_relaxed);
+            if (calls == 0)
+                continue;
+            char line[256];
+            const uint64_t hits = g_textureQueryStats[i].hits.load(std::memory_order_relaxed);
+            const uint32_t pname = g_textureQueryStats[i].pname.load(std::memory_order_relaxed);
+            const int length = std::snprintf(
+                line, sizeof(line), "extra,TexQueryStats,pname,0x%08llx,calls,%llu,hits,%llu,misses,%llu\r\n",
+                static_cast<unsigned long long>(pname),
+                static_cast<unsigned long long>(calls),
+                static_cast<unsigned long long>(hits),
+                static_cast<unsigned long long>(calls - hits));
+            ok = length > 0 && static_cast<size_t>(length) < sizeof(line) &&
+                 writeText(line, static_cast<size_t>(length));
+            if (!ok)
+                break;
+        }
+    }
+
+    if (ok)
+        writeBufferTraceReport(writeText, ok);
+    if (ok)
+        writeFrameSpikeReport(writeText, ok);
+    if (ok)
+        writePresentSpikeReport(writeText, ok);
+
+    CloseHandle(file);
+    g_writing.clear(std::memory_order_release);
+}
+
+DWORD WINAPI flushThreadProc(void *)
+{
+    while (!g_flushStop.load(std::memory_order_acquire))
+    {
+        Sleep(2000);
+        if (!g_flushStop.load(std::memory_order_acquire))
+            writeReport();
+    }
+    return 0;
+}
+
+void shutdownProfiler()
+{
+    g_flushStop.store(true, std::memory_order_release);
+    if (g_flushThread)
+    {
+        WaitForSingleObject(g_flushThread, 3000);
+        CloseHandle(g_flushThread);
+        g_flushThread = nullptr;
+    }
+    writeReport();
+}
+
+void initialize()
+{
+    QueryPerformanceFrequency(&g_frequency);
+    g_frameSpikeThresholdTicks = static_cast<uint64_t>(
+        (static_cast<long double>(g_frequency.QuadPart) * 16667.0L) / 1000000.0L);
+    const char *spikeSetting = std::getenv("LL_PERF_SPIKE_US");
+    if (spikeSetting && *spikeSetting)
+    {
+        const long value = std::strtol(spikeSetting, nullptr, 10);
+        if (value > 0)
+            g_frameSpikeThresholdTicks = static_cast<uint64_t>(
+                (static_cast<long double>(g_frequency.QuadPart) * value) / 1000000.0L);
+    }
+    const char *setting = std::getenv("LL_PERF_PROFILE");
+    g_enabled = setting && *setting && std::strcmp(setting, "0") != 0;
+    const char *bufferTrace = std::getenv("LL_GL_BUFFER_TRACE");
+    g_bufferTraceEnabled = g_enabled && bufferTrace &&
+                           std::strcmp(bufferTrace, "1") == 0;
+    const char *flushSetting = std::getenv("LL_PERF_PROFILE_FLUSH");
+    g_backgroundFlushEnabled = !flushSetting || std::strcmp(flushSetting, "0") != 0;
+    g_enabledState.store(g_enabled ? 1 : 0, std::memory_order_release);
+    if (g_enabled)
+    {
+        g_tlsIndex = TlsAlloc();
+        std::atexit(shutdownProfiler);
+        if (g_backgroundFlushEnabled)
+            g_flushThread = CreateThread(nullptr, 0, flushThreadProc, nullptr, 0, nullptr);
+    }
+}
+
+ThreadData *threadData()
+{
+    if (g_tlsIndex == TLS_OUT_OF_INDEXES)
+        return nullptr;
+
+    if (ThreadData *existing = static_cast<ThreadData *>(TlsGetValue(g_tlsIndex)))
+        return existing;
+
+    void *memory = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(ThreadData));
+    if (!memory)
+        return nullptr;
+
+    ThreadData *created = new (memory) ThreadData{};
+    created->threadId = GetCurrentThreadId();
+    std::lock_guard<std::mutex> lock(g_threadsLock);
+    if (g_threadCount >= kMaxThreads)
+        return nullptr;
+    g_threads[g_threadCount++] = created;
+    TlsSetValue(g_tlsIndex, created);
+    return created;
+}
+
+Entry *findEntry(ThreadData *thread, const char *domain, const char *name)
+{
+    const uint64_t hash = hashKey(domain, name);
+    size_t index = static_cast<size_t>(hash % kEntryCount);
+    for (size_t probe = 0; probe < kEntryCount; ++probe)
+    {
+        Entry &entry = thread->entries[index];
+        if (!entry.name)
+        {
+            const size_t used = thread->used.load(std::memory_order_relaxed);
+            if (used == kEntryCount)
+                return nullptr;
+            entry.domain = domain;
+            entry.name = name;
+            thread->used.store(used + 1, std::memory_order_release);
+            return &entry;
+        }
+        if (std::strcmp(entry.domain, domain) == 0 && std::strcmp(entry.name, name) == 0)
+            return &entry;
+        index = (index + 1) % kEntryCount;
+    }
+    return nullptr;
+}
+}
+
+extern "C" int PerfProfiler_IsEnabled(void)
+{
+    const int state = g_enabledState.load(std::memory_order_acquire);
+    if (state >= 0)
+        return state;
+    std::call_once(g_initOnce, initialize);
+    return g_enabledState.load(std::memory_order_acquire);
+}
+
+extern "C" uint64_t PerfProfiler_Begin(const char *domain, const char *name)
+{
+    if (!PerfProfiler_IsEnabled() ||
+        !g_runtimeReady.load(std::memory_order_acquire))
+        return 0;
+    return nowTicks();
+}
+
+extern "C" void PerfProfiler_End(const char *domain, const char *name,
+                                  uint64_t start, uint64_t bytes)
+{
+    if (!start || !PerfProfiler_IsEnabled())
+        return;
+
+    ThreadData *thread = threadData();
+    if (!thread)
+        return;
+    Entry *entry = findEntry(thread, domain, name);
+    if (!entry)
+        return;
+
+    const uint64_t elapsed = nowTicks() - start;
+    addFrameEvent(domain, elapsed);
+    if (domain && name && std::strcmp(domain, "Frame") == 0 &&
+        std::strcmp(name, "frameTiming") == 0)
+        PerfProfiler_FrameSample(elapsed);
+    entry->calls.fetch_add(1, std::memory_order_relaxed);
+    entry->ticks.fetch_add(elapsed, std::memory_order_relaxed);
+    entry->bytes.fetch_add(bytes, std::memory_order_relaxed);
+
+    uint64_t previousMax = entry->maxTicks.load(std::memory_order_relaxed);
+    while (previousMax < elapsed &&
+           !entry->maxTicks.compare_exchange_weak(previousMax, elapsed,
+                                                  std::memory_order_relaxed,
+                                                  std::memory_order_relaxed))
+    {
+    }
+
+}
+
+extern "C" void PerfProfiler_Flush(void)
+{
+    if (PerfProfiler_IsEnabled())
+        writeReport();
+}
+
+extern "C" void PerfProfiler_MarkRuntimeReady(void)
+{
+    if (PerfProfiler_IsEnabled())
+        g_runtimeReady.store(true, std::memory_order_release);
+}
+
+extern "C" void PerfProfiler_CacheSkip(const char *)
+{
+    if (PerfProfiler_IsEnabled() && g_runtimeReady.load(std::memory_order_acquire))
+        g_extraStats.cacheSkips.fetch_add(1, std::memory_order_relaxed);
+}
+
+extern "C" void PerfProfiler_TextureQuery(uint32_t pname, int cacheHit)
+{
+    if (!PerfProfiler_IsEnabled() || !g_runtimeReady.load(std::memory_order_acquire))
+        return;
+    TextureQueryStat &stat = g_textureQueryStats[pname % kTextureQueryStatCount];
+    uint32_t unset = 0;
+    stat.pname.compare_exchange_strong(unset, pname, std::memory_order_relaxed,
+                                       std::memory_order_relaxed);
+    stat.calls.fetch_add(1, std::memory_order_relaxed);
+    if (cacheHit)
+        stat.hits.fetch_add(1, std::memory_order_relaxed);
+}
+
+extern "C" void PerfProfiler_FrameSample(uint64_t elapsedTicks)
+{
+    if (!PerfProfiler_IsEnabled() || !g_runtimeReady.load(std::memory_order_acquire))
+        return;
+    const uint64_t index = g_extraStats.frameSamples.fetch_add(1, std::memory_order_relaxed);
+    if (index < kFrameSampleCount)
+        g_extraStats.frameTicks[index].store(elapsedTicks, std::memory_order_relaxed);
+}
+
+void recordFrameBoundary(uint64_t now)
+{
+    const uint64_t start = g_frameBoundaryStart.load(std::memory_order_acquire);
+    const uint64_t elapsed = now > start ? now - start : 0;
+    if (elapsed >= g_frameSpikeThresholdTicks)
+    {
+        FrameSpike spike{};
+        spike.sequence = g_frameSequence.fetch_add(1, std::memory_order_relaxed);
+        spike.totalTicks = elapsed;
+        spike.glTicks = g_frameAccumulator.glTicks.exchange(0, std::memory_order_relaxed);
+        spike.pthreadTicks = g_frameAccumulator.pthreadTicks.exchange(0, std::memory_order_relaxed);
+        spike.presentTicks = g_frameAccumulator.presentTicks.exchange(0, std::memory_order_relaxed);
+        spike.glxTicks = g_frameAccumulator.glxTicks.exchange(0, std::memory_order_relaxed);
+        spike.otherTicks = g_frameAccumulator.otherTicks.exchange(0, std::memory_order_relaxed);
+        spike.glCalls = g_frameAccumulator.glCalls.exchange(0, std::memory_order_relaxed);
+        spike.pthreadCalls = g_frameAccumulator.pthreadCalls.exchange(0, std::memory_order_relaxed);
+        spike.presentCalls = g_frameAccumulator.presentCalls.exchange(0, std::memory_order_relaxed);
+        spike.glxCalls = g_frameAccumulator.glxCalls.exchange(0, std::memory_order_relaxed);
+
+        std::lock_guard<std::mutex> lock(g_frameSpikeLock);
+        if (g_frameSpikeCount < kFrameSpikeCount)
+            g_frameSpikes[g_frameSpikeCount++] = spike;
+    }
+    else
+    {
+        resetFrameAccumulator();
+    }
+}
+
+extern "C" void PerfProfiler_FrameBoundaryStart(void)
+{
+    if (!PerfProfiler_IsEnabled() ||
+        !g_runtimeReady.load(std::memory_order_acquire))
+        return;
+
+    bool expected = false;
+    if (g_frameBoundaryActive.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel,
+            std::memory_order_relaxed))
+    {
+        g_frameBoundaryStart.store(nowTicks(), std::memory_order_release);
+        resetFrameAccumulator();
+    }
+}
+
+extern "C" void PerfProfiler_FrameBoundaryEnd(void)
+{
+    if (!PerfProfiler_IsEnabled() ||
+        !g_runtimeReady.load(std::memory_order_acquire))
+        return;
+
+    bool expected = true;
+    if (g_frameBoundaryActive.compare_exchange_strong(
+            expected, false, std::memory_order_acq_rel,
+            std::memory_order_relaxed))
+        recordFrameBoundary(nowTicks());
+}
+
+extern "C" void PerfProfiler_FrameBoundaryEndAndStart(void)
+{
+    PerfProfiler_FrameBoundaryEnd();
+    PerfProfiler_FrameBoundaryStart();
+}
+
+extern "C" uint64_t PerfProfiler_NowTicks(void)
+{
+    if (!PerfProfiler_IsEnabled())
+        return 0;
+    return nowTicks();
+}
+
+extern "C" void PerfProfiler_PresentTransaction(const char *source,
+                                                  uint64_t totalTicks,
+                                                  uint64_t eventTicks,
+                                                  uint64_t pacingTicks,
+                                                  uint64_t swapTicks)
+{
+    if (!PerfProfiler_IsEnabled() ||
+        !g_runtimeReady.load(std::memory_order_acquire) ||
+        totalTicks < g_frameSpikeThresholdTicks)
+        return;
+
+    PresentSpike spike{};
+    if (source)
+        std::strncpy(spike.source, source, sizeof(spike.source) - 1);
+    spike.sequence = static_cast<uint64_t>(g_presentSpikeCount);
+    spike.totalTicks = totalTicks;
+    spike.eventTicks = eventTicks;
+    spike.pacingTicks = pacingTicks;
+    spike.swapTicks = swapTicks;
+
+    std::lock_guard<std::mutex> lock(g_presentSpikeLock);
+    if (g_presentSpikeCount < kPresentSpikeCount)
+        g_presentSpikes[g_presentSpikeCount++] = spike;
+}
+
+extern "C" void PerfProfiler_GLBufferEvent(const char *operation, uintptr_t caller,
+                                            uintptr_t context, uint32_t target,
+                                            uint32_t usage, uint64_t size,
+                                            uint32_t buffer)
+{
+    if (!g_bufferTraceEnabled || !g_runtimeReady.load(std::memory_order_acquire))
+        return;
+
+    BufferOperation bufferOperation;
+    if (operation && std::strcmp(operation, "gen") == 0)
+        bufferOperation = BufferOperation::Gen;
+    else if (operation && std::strcmp(operation, "data") == 0)
+        bufferOperation = BufferOperation::Data;
+    else if (operation && std::strcmp(operation, "delete") == 0)
+        bufferOperation = BufferOperation::Delete;
+    else if (operation && std::strcmp(operation, "bind") == 0)
+        bufferOperation = BufferOperation::Bind;
+    else
+        return;
+
+    std::lock_guard<std::mutex> lock(g_bufferTraceLock);
+
+    BufferSiteEntry *site = findBufferSite(bufferOperation, caller, context,
+                                           target, usage,
+                                           bufferOperation == BufferOperation::Data ? size : 0);
+    if (site)
+    {
+        ++site->calls;
+        if (bufferOperation == BufferOperation::Data)
+            site->bytes += size;
+    }
+
+    if (buffer == 0)
+        return;
+
+    BufferObjectEntry *object = findBufferObject(context, buffer, true);
+    if (!object)
+        return;
+
+    if (bufferOperation == BufferOperation::Gen)
+    {
+        if (object->everDeleted)
+        {
+            if (BufferPatternEntry *pattern = findBufferPattern(
+                    object->context, object->target, object->usage, object->size))
+                ++pattern->reusedNames;
+        }
+        object->active = true;
+        object->everDeleted = false;
+        object->target = 0;
+        object->usage = 0;
+        object->size = 0;
+        object->dataCalls = 0;
+        object->bindCalls = 0;
+        return;
+    }
+
+    if (bufferOperation == BufferOperation::Data)
+    {
+        object->active = true;
+        object->target = target;
+        object->usage = usage;
+        object->size = size;
+        ++object->dataCalls;
+
+        if (BufferPatternEntry *pattern = findBufferPattern(context, target, usage, size))
+            ++pattern->dataCalls;
+        return;
+    }
+
+    if (bufferOperation == BufferOperation::Bind)
+    {
+        object->active = true;
+        ++object->bindCalls;
+        return;
+    }
+
+    if (object->active && object->dataCalls > 0)
+    {
+        if (BufferPatternEntry *pattern = findBufferPattern(
+                object->context, object->target, object->usage, object->size))
+        {
+            ++pattern->deletedObjects;
+            ++pattern->objectsWithData;
+            pattern->bindCalls += object->bindCalls;
+            if (object->bindCalls > 0)
+                ++pattern->objectsWithBinds;
+        }
+    }
+    object->active = false;
+    object->everDeleted = true;
+}
+
+#else
+
+extern "C" int PerfProfiler_IsEnabled(void) { return 0; }
+extern "C" uint64_t PerfProfiler_Begin(const char *, const char *) { return 0; }
+extern "C" void PerfProfiler_End(const char *, const char *, uint64_t, uint64_t) {}
+extern "C" void PerfProfiler_Flush(void) {}
+extern "C" void PerfProfiler_MarkRuntimeReady(void) {}
+extern "C" void PerfProfiler_CacheSkip(const char *) {}
+extern "C" void PerfProfiler_TextureQuery(uint32_t, int) {}
+extern "C" void PerfProfiler_FrameSample(uint64_t) {}
+extern "C" void PerfProfiler_FrameBoundaryEndAndStart(void) {}
+extern "C" void PerfProfiler_FrameBoundaryStart(void) {}
+extern "C" void PerfProfiler_FrameBoundaryEnd(void) {}
+extern "C" uint64_t PerfProfiler_NowTicks(void) { return 0; }
+extern "C" void PerfProfiler_PresentTransaction(const char *, uint64_t, uint64_t,
+                                                 uint64_t, uint64_t) {}
+extern "C" void PerfProfiler_GLBufferEvent(const char *, uintptr_t, uintptr_t,
+                                            uint32_t, uint32_t, uint64_t, uint32_t) {}
+
+#endif

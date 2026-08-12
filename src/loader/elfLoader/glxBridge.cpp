@@ -8,6 +8,7 @@
 #include "../log/log.h"
 #include "symbolResolver.hpp"
 #include "glHooks.hpp"
+#include "../diagnostics/perfProfiler.hpp"
 
 #include <SDL3/SDL.h>
 #include <windows.h>
@@ -191,6 +192,7 @@ extern "C" void bridgeGlxDestroyContext(void *display, void *context)
 extern "C" int bridgeGlxMakeCurrent(void *display, unsigned long drawable,
                                      void *context)
 {
+    PERF_PROFILE_SCOPE("GLX");
     (void)display;
     bool success = false;
 
@@ -200,6 +202,8 @@ extern "C" int bridgeGlxMakeCurrent(void *display, unsigned long drawable,
         success = makeSDLCurrent(getSDLWindow(), static_cast<SDL_GLContext>(context));
 
     const char *failure = success ? "ok" : SDL_GetError();
+    if (success)
+        GLHooks_NotifyContextCurrent(context);
 
     log_debug("ES1 GLX: glXMakeCurrent tid=%lu drawable=%lu context=%p -> %d (%s)",
               static_cast<unsigned long>(GetCurrentThreadId()), drawable, context,
@@ -270,14 +274,40 @@ extern "C" int bridgeGlxWaitGL()
 
 extern "C" void bridgeGlxSwapBuffers(void *display, unsigned long drawable)
 {
+    PERF_PROFILE_SCOPE("GLX");
     (void)display;
     log_debug("ES1 GLX: glXSwapBuffers drawable=%lu", drawable);
     if (getSDLWindow())
     {
+        const uint64_t transactionStart = PerfProfiler_NowTicks();
+        uint64_t eventTicks = 0;
+        uint64_t pacingTicks = 0;
+        uint64_t swapTicks = 0;
+        uint64_t segmentStart = PerfProfiler_NowTicks();
         pollEvents();
+        const uint64_t afterEvents = PerfProfiler_NowTicks();
+        if (afterEvents > segmentStart)
+            eventTicks = afterEvents - segmentStart;
         if (getConfig()->fpsLimiter)
+        {
+            segmentStart = PerfProfiler_NowTicks();
             frameTiming();
+            const uint64_t afterPacing = PerfProfiler_NowTicks();
+            if (afterPacing > segmentStart)
+                pacingTicks = afterPacing - segmentStart;
+        }
+        const uint64_t swapStart = PerfProfiler_Begin("Present", "SDL_GL_SwapWindow");
+        segmentStart = PerfProfiler_NowTicks();
         SDL_GL_SwapWindow(getSDLWindow());
+        const uint64_t afterSwap = PerfProfiler_NowTicks();
+        if (afterSwap > segmentStart)
+            swapTicks = afterSwap - segmentStart;
+        PerfProfiler_End("Present", "SDL_GL_SwapWindow", swapStart, 0);
+        PerfProfiler_MarkRuntimeReady();
+        const uint64_t transactionEnd = PerfProfiler_NowTicks();
+        if (transactionStart && transactionEnd > transactionStart)
+            PerfProfiler_PresentTransaction("GLX", transactionEnd - transactionStart,
+                                            eventTicks, pacingTicks, swapTicks);
     }
 }
 
@@ -305,14 +335,22 @@ extern "C" int bridgeGlxGetVideoSyncSGI(unsigned int *count)
 extern "C" int bridgeGlxWaitVideoSyncSGI(int divisor, int remainder,
                                            unsigned int *count)
 {
-    if (divisor <= 0)
-        divisor = 1;
-    remainder = remainder < 0 ? 0 : remainder % divisor;
+    /* Exclude the intentional retrace wait from the measured render interval.
+     * The interval ends when the next wait begins and starts when this wait
+     * returns, so only work between retraces is attributed to the frame. */
+    PerfProfiler_FrameBoundaryEnd();
+    {
+        PERF_PROFILE_SCOPE("GLX");
+        if (divisor <= 0)
+            divisor = 1;
+        remainder = remainder < 0 ? 0 : remainder % divisor;
 
-    uint64_t target = videoSyncCount() + 1;
-    while ((target % (uint64_t)divisor) != (uint64_t)remainder)
-        ++target;
-    waitVideoSync(target);
+        uint64_t target = videoSyncCount() + 1;
+        while ((target % (uint64_t)divisor) != (uint64_t)remainder)
+            ++target;
+        waitVideoSync(target);
+    }
+    PerfProfiler_FrameBoundaryStart();
 
     if (count)
         *count = (unsigned int)videoSyncCount();

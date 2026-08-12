@@ -29,6 +29,7 @@ extern void bridgeX11PumpInput(void);
 #endif
 #include "../log/log.h"
 #include "sdlCalls.h"
+#include "../diagnostics/perfProfiler.hpp"
 
 extern uint32_t gId;
 extern int gGrp;
@@ -360,31 +361,59 @@ bool runOnSDLMainThread(SDL_MainThreadCallback callback, void *userdata, bool wa
 
 int presentSDLFrame(const SDLFramePresentOptions *options)
 {
+    uint64_t profileStart = PerfProfiler_Begin("Frame", "presentSDLFrame");
+    uint64_t transactionStart = PerfProfiler_NowTicks();
+    uint64_t eventTicks = 0;
+    uint64_t pacingTicks = 0;
+    uint64_t swapTicks = 0;
     if (!options)
+    {
+        PerfProfiler_End("Frame", "presentSDLFrame", profileStart, 0);
         return 0;
+    }
 
 
+    uint64_t segmentStart = PerfProfiler_NowTicks();
     if (options->beforeEvents)
         options->beforeEvents(options->userdata);
 
     if (options->processEvents)
         pollEvents();
+    uint64_t afterEvents = PerfProfiler_NowTicks();
+    if (afterEvents > segmentStart)
+        eventTicks = afterEvents - segmentStart;
 
     if (options->beforeSwap)
         options->beforeSwap(options->userdata);
 
     SDL_Window *window = getSDLWindow();
     if (!window)
+    {
+        PerfProfiler_End("Frame", "presentSDLFrame", profileStart, 0);
         return 0;
+    }
 
     // Present only completed WMMT frames.
     if (gGrp == GROUP_WMMT3 && n2WmmtShouldBlit())
         blitStretch();
 
     if (getConfig()->fpsLimiter)
+    {
+        segmentStart = PerfProfiler_NowTicks();
         frameTiming();
+        uint64_t afterPacing = PerfProfiler_NowTicks();
+        if (afterPacing > segmentStart)
+            pacingTicks = afterPacing - segmentStart;
+    }
 
+    uint64_t swapStart = PerfProfiler_Begin("Present", "SDL_GL_SwapWindow");
+    segmentStart = PerfProfiler_NowTicks();
     SDL_GL_SwapWindow(window);
+    uint64_t afterSwap = PerfProfiler_NowTicks();
+    if (afterSwap > segmentStart)
+        swapTicks = afterSwap - segmentStart;
+    PerfProfiler_End("Present", "SDL_GL_SwapWindow", swapStart, 0);
+    PerfProfiler_MarkRuntimeReady();
 
     if (options->title)
         showFpsInWindowTitle(options->title);
@@ -392,6 +421,12 @@ int presentSDLFrame(const SDLFramePresentOptions *options)
     if (options->afterPresent)
         options->afterPresent(options->userdata);
 
+    PerfProfiler_End("Frame", "presentSDLFrame", profileStart, 0);
+    uint64_t transactionEnd = PerfProfiler_NowTicks();
+    if (transactionStart && transactionEnd > transactionStart)
+        PerfProfiler_PresentTransaction("SDL", transactionEnd - transactionStart,
+                                        eventTicks, pacingTicks, swapTicks);
+    PerfProfiler_FrameBoundaryEndAndStart();
     return 1;
 }
 
@@ -413,12 +448,14 @@ void sdlQuit()
         SDL_DestroyWindow(g_SdlWindow);
         g_SdlWindow = NULL;
     }
+    PerfProfiler_Flush();
     SDL_Quit();
     exit(0);
 }
 
 void pollEvents()
 {
+    uint64_t profileStart = PerfProfiler_Begin("SDL", "pollEvents");
     SDL_Event event;
     /* Only count this as a pump when it ran on the owning thread and really
      * drained the queue; otherwise it throttles out the pump that matters. */
@@ -525,6 +562,7 @@ void pollEvents()
         updateCombinedAxes();
         processChangedActions();
     }
+    PerfProfiler_End("SDL", "pollEvents", profileStart, 0);
 }
 
 void showFpsInWindowTitle(const char *name)

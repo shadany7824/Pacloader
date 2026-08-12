@@ -101,9 +101,11 @@ void answerRequest(const uint8_t *frame, size_t length)
 
 void consumeRequests()
 {
+    std::vector<uint8_t> frame;
+    frame.reserve(JVS_MAX_PACKET_SIZE + 2);
     for (;;)
     {
-        std::vector<uint8_t> frame;
+        frame.clear();
         bool complete = false;
         {
             std::lock_guard<std::mutex> lock(bufferMutex);
@@ -171,8 +173,7 @@ extern "C" int es1JvsSerialRead(int fd, void *buffer, size_t count)
 
     const size_t taken = std::min(count, replyBytes.size());
     auto *out = static_cast<uint8_t *>(buffer);
-    for (size_t i = 0; i < taken; ++i)
-        out[i] = replyBytes[i];
+    std::copy_n(replyBytes.begin(), taken, out);
     replyBytes.erase(replyBytes.begin(), replyBytes.begin() + taken);
     return static_cast<int>(taken);
 }

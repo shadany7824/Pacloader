@@ -13,6 +13,7 @@
 
 #include "../config/config.h"
 #include "fpsLimiter.h"
+#include "../diagnostics/perfProfiler.hpp"
 
 double lastTime = 0.0;
 int frameCount = 0;
@@ -25,8 +26,11 @@ static double g_targetFps = 60.0;
 static LARGE_INTEGER g_qpcFrequency;
 static LONGLONG g_qpcStart = 0;
 
-/* Keep the video-sync result per thread; WMMT4 waits and presents on different threads. */
-static __thread int g_videoSyncWaited = 0;
+/* WMMT4 waits for retrace on one thread and presents on another. A TLS flag
+ * cannot reach the presentation thread, so it performs a second 60 Hz wait.
+ * Keep one cross-thread token for the single render/present pipeline. */
+static volatile LONG g_videoSyncWaited = 0;
+static volatile LONGLONG g_lastVideoSyncWait = 0;
 
 static LONGLONG qpcNow(void)
 {
@@ -46,7 +50,8 @@ static LONGLONG qpcDeadline(uint64_t frameIndex)
 }
 
 /* Sleep through the frame and spin only during the final timing window. */
-#define SpinMarginMicroseconds 500
+#define DefaultSpinMarginMicroseconds 100
+static LONGLONG g_spinMarginMicroseconds = DefaultSpinMarginMicroseconds;
 
 /* Optional late-present window; disabled unless LL_PACE_GRACE_MS is set. */
 static LONGLONG paceGraceTicks(void)
@@ -93,7 +98,7 @@ static HANDLE waitTimer(void)
 static void waitUntilQpc(LONGLONG deadline)
 {
     const LONGLONG spinMargin =
-        (LONGLONG)(((long double)g_qpcFrequency.QuadPart * SpinMarginMicroseconds) /
+        (LONGLONG)(((long double)g_qpcFrequency.QuadPart * g_spinMarginMicroseconds) /
                    1000000.0L);
     HANDLE timer = waitTimer();
 
@@ -138,12 +143,22 @@ void initFpsLimiter(void)
     lastTime = 0.0;
     frameCount = 0;
     fps = 0.0;
-    g_videoSyncWaited = 0;
+    InterlockedExchange(&g_videoSyncWaited, 0);
+    InterlockedExchange64(&g_lastVideoSyncWait, 0);
 
     if (!g_fpsLimiterEnabled)
         return;
 
 #if defined(_WIN32) || defined(__MINGW32__)
+    g_spinMarginMicroseconds = DefaultSpinMarginMicroseconds;
+    const char *setting = getenv("LL_PACE_SPIN_US");
+    if (setting)
+    {
+        const long value = strtol(setting, NULL, 10);
+        if (value >= 0 && value <= 2000)
+            g_spinMarginMicroseconds = (LONGLONG)value;
+    }
+
     QueryPerformanceFrequency(&g_qpcFrequency);
     g_qpcStart = qpcNow();
 
@@ -240,39 +255,79 @@ void waitVideoSync(uint64_t index)
     if (g_qpcFrequency.QuadPart == 0)
         return;
     waitUntilQpc(qpcDeadline(index));
-    g_videoSyncWaited = 1;
+    InterlockedExchange64(&g_lastVideoSyncWait, qpcNow());
+    InterlockedExchange(&g_videoSyncWaited, 1);
 #else
     (void)index;
     g_videoSyncWaited = 1;
 #endif
 }
 
+int guestVideoSyncRecentlyActive(void)
+{
+#if defined(_WIN32) || defined(__MINGW32__)
+    const LONGLONG last = InterlockedCompareExchange64(&g_lastVideoSyncWait, 0, 0);
+    if (last == 0 || g_qpcFrequency.QuadPart == 0)
+        return 0;
+    return qpcNow() - last <= g_qpcFrequency.QuadPart / 4;
+#else
+    return 0;
+#endif
+}
+
 int consumeVideoSyncWait(void)
 {
-    const int waited = g_videoSyncWaited;
-    g_videoSyncWaited = 0;
-    return waited;
+    return InterlockedExchange(&g_videoSyncWaited, 0) != 0;
 }
 
 void frameTiming(void)
 {
+    uint64_t profileStart = PerfProfiler_Begin("Frame", "frameTiming");
     if (!g_fpsLimiterEnabled)
+    {
+        PerfProfiler_End("Frame", "frameTiming", profileStart, 0);
         return;
+    }
 
 #if defined(_WIN32) || defined(__MINGW32__)
+    /* WMMT4 has its own retrace wait on the render thread. Once that path is
+     * active, pacing the presentation thread again only creates intermittent
+     * 5-12 ms bubbles when the cross-thread token arrives late. */
+    if (guestVideoSyncRecentlyActive())
+    {
+        consumeVideoSyncWait();
+        PerfProfiler_End("Frame", "frameTiming", profileStart, 0);
+        return;
+    }
     /* A thread that already waited for its slot can present immediately. */
     if (consumeVideoSyncWait())
+    {
+        PerfProfiler_End("Frame", "frameTiming", profileStart, 0);
         return;
+    }
 
     /* Pace against the same absolute grid reported by videoSyncCount(). */
     const uint64_t passed = videoSyncCount();
     if (qpcNow() - qpcDeadline(passed) <= paceGraceTicks())
+    {
+        PerfProfiler_End("Frame", "frameTiming", profileStart, 0);
         return;
+    }
 
     waitUntilQpc(qpcDeadline(passed + 1));
+    PerfProfiler_End("Frame", "frameTiming", profileStart, 0);
 #else
-    if (consumeVideoSyncWait())
+    if (guestVideoSyncRecentlyActive())
+    {
+        consumeVideoSyncWait();
+        PerfProfiler_End("Frame", "frameTiming", profileStart, 0);
         return;
+    }
+    if (consumeVideoSyncWait())
+    {
+        PerfProfiler_End("Frame", "frameTiming", profileStart, 0);
+        return;
+    }
 
     const int64_t targetMicroseconds = (int64_t)(1000000.0 / g_targetFps);
     static int64_t nextDeadline = 0;
@@ -293,6 +348,7 @@ void frameTiming(void)
 
     if (clockNow() > nextDeadline + targetMicroseconds)
         nextDeadline = clockNow();
+    PerfProfiler_End("Frame", "frameTiming", profileStart, 0);
 #endif
 }
 

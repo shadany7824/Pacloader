@@ -30,6 +30,9 @@
 ActionState gActionStates[MAX_ENTITIES][NUM_LOGICAL_ACTIONS];
 JVSActionMapping gJvsMap[MAX_ENTITIES][NUM_LOGICAL_ACTIONS];
 ChangedAction gChangedActions[NUM_LOGICAL_ACTIONS * MAX_ENTITIES];
+static bool gChangedActionFlags[MAX_ENTITIES][NUM_LOGICAL_ACTIONS];
+static ChangedAction gCombinedAxes[MAX_PLAYERS * NUM_LOGICAL_ACTIONS];
+static int gNumCombinedAxes = 0;
 LogicalActionProperties gActionProperties[MAX_ENTITIES][NUM_LOGICAL_ACTIONS];
 int gNumChangedActions = 0;
 SDLControllers sdlJoysticks;
@@ -1495,11 +1498,10 @@ void loadGlobalConfig(const IniConfig *ini)
  * cost one update rather than several. */
 void addActionToDirtyList(JVSPlayer player, LogicalAction action)
 {
-    for (int i = 0; i < gNumChangedActions; i++)
-    {
-        if (gChangedActions[i].player == player && gChangedActions[i].action == action)
-            return; // Already dirty
-    }
+    if (gChangedActionFlags[player][action])
+        return; // Already dirty
+
+    gChangedActionFlags[player][action] = true;
     gChangedActions[gNumChangedActions++] = (ChangedAction){player, action};
 }
 
@@ -1590,6 +1592,32 @@ bool isActionActiveOrRecentlyPressed(JVSPlayer player, LogicalAction action,
         return false;
 
     return SDL_GetTicks() - state->lastActivatedAt < minimumPulseMs;
+}
+
+/*
+ * Continuous analog sources can produce many events between two presents.
+ * Their state is already retained in gActionStates, so flushing JVS for every
+ * one only repeats work that the frame-end pass will do again.  Keep the
+ * immediate path for edge-triggered inputs such as buttons and TEST.
+ */
+static bool eventIsContinuousAnalog(const SDL_Event *e)
+{
+    if (!e)
+        return false;
+
+    switch (e->type)
+    {
+        case SDL_EVENT_MOUSE_MOTION:
+        case SDL_EVENT_JOYSTICK_AXIS_MOTION:
+        case SDL_EVENT_GAMEPAD_AXIS_MOTION:
+            return true;
+#ifdef __linux__
+        case SDL_WIIMOTION_EVENT:
+            return true;
+#endif
+        default:
+            return false;
+    }
 }
 
 /* Main event handler: maps one SDL event onto the logical action it drives. */
@@ -2062,7 +2090,7 @@ void processSdlEvent(const SDL_Event *e)
     /* Apply digital transitions at once: the frame-end flush would collapse a
      * press and release queued in the same frame into nothing, which cabinet
      * switches such as ES1's TEST would then never see. */
-    if (sdlInputInitialized && gNumChangedActions > 0)
+    if (sdlInputInitialized && gNumChangedActions > 0 && !eventIsContinuousAnalog(e))
         processChangedActions();
 }
 
@@ -2097,6 +2125,13 @@ static void scan_axis_bindings(BindingPair *pair, bool hasFullAxis[], bool hasHa
  * full axis and a half-axis, which cannot work. */
 void detectCombinedAxes()
 {
+    gNumCombinedAxes = 0;
+    for (int p = 0; p < MAX_ENTITIES; p++)
+    {
+        for (int i = 0; i < NUM_LOGICAL_ACTIONS; i++)
+            gActionProperties[p][i].isCombinedAxis = false;
+    }
+
     // --- Use local variables for detection ---
     bool hasFullAxis[NUM_LOGICAL_ACTIONS] = {false};
     bool hasHalfAxis[NUM_LOGICAL_ACTIONS] = {false};
@@ -2136,13 +2171,15 @@ void detectCombinedAxes()
     }
 
     // --- Pass 3: Flag actions that are correctly combined ---
-    for (int p = 0; p < MAX_ENTITIES; p++)
+    for (int p = PLAYER_1; p <= MAX_PLAYERS; p++)
     {
         for (int i = 0; i < NUM_LOGICAL_ACTIONS; i++)
         {
             if (hasPositive[p][i] && hasNegative[p][i])
             {
                 gActionProperties[p][i].isCombinedAxis = true;
+                gCombinedAxes[gNumCombinedAxes++] =
+                    (ChangedAction){(JVSPlayer)p, (LogicalAction)i};
             }
         }
     }
@@ -2151,25 +2188,21 @@ void detectCombinedAxes()
 /* Combines the two half-axis contributions of a combined axis into one value. */
 void updateCombinedAxes()
 {
-    for (int p = PLAYER_1; p <= MAX_PLAYERS; p++)
+    for (int i = 0; i < gNumCombinedAxes; i++)
     {
-        for (int i = 0; i < NUM_LOGICAL_ACTIONS; i++)
+        const JVSPlayer player = gCombinedAxes[i].player;
+        const LogicalAction action = gCombinedAxes[i].action;
+        ActionState *state = &gActionStates[player][action];
+        // Combine the two halves into a single -1 to 1 value, represented as 0.0 to 1.0
+        float finalVal = 0.5f + (state->positiveContribution * 0.5f) - (state->negativeContribution * 0.5f);
+        if (finalVal > 1.0f)
+            finalVal = 1.0f;
+        if (finalVal < 0.0f)
+            finalVal = 0.0f;
+        if (fabs(state->analogValue - finalVal) > 0.001f)
         {
-            if (gActionProperties[p][i].isCombinedAxis)
-            {
-                ActionState *state = &gActionStates[p][i];
-                // Combine the two halves into a single -1 to 1 value, represented as 0.0 to 1.0
-                float finalVal = 0.5f + (state->positiveContribution * 0.5f) - (state->negativeContribution * 0.5f);
-                if (finalVal > 1.0f)
-                    finalVal = 1.0f;
-                if (finalVal < 0.0f)
-                    finalVal = 0.0f;
-                if (fabs(state->analogValue - finalVal) > 0.001f)
-                {
-                    state->analogValue = finalVal;
-                    addActionToDirtyList((JVSPlayer)p, (LogicalAction)i);
-                }
-            }
+            state->analogValue = finalVal;
+            addActionToDirtyList(player, action);
         }
     }
 }
@@ -2287,6 +2320,12 @@ void processChangedActions()
             case JVS_CALL_NONE:
                 break;
         }
+    }
+    for (int i = 0; i < gNumChangedActions; i++)
+    {
+        const JVSPlayer player = gChangedActions[i].player;
+        const LogicalAction action = gChangedActions[i].action;
+        gChangedActionFlags[player][action] = false;
     }
     gNumChangedActions = 0; // Clear the list for the next frame
 }

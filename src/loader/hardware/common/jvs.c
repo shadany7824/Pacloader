@@ -293,9 +293,10 @@ JVSStatus processPacket(int *packetSize)
         case CMD_REQUEST_ID:
         {
             // printf("CMD_REQUEST_ID\n");
+            const size_t nameLength = strlen(io.capabilities.name) + 1;
             outputPacket.data[outputPacket.length] = REPORT_SUCCESS;
-            memcpy(&outputPacket.data[outputPacket.length + 1], io.capabilities.name, strlen(io.capabilities.name) + 1);
-            outputPacket.length += strlen(io.capabilities.name) + 2;
+            memcpy(&outputPacket.data[outputPacket.length + 1], io.capabilities.name, nameLength);
+            outputPacket.length += nameLength + 1;
         }
         break;
 

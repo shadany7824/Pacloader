@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <vector>
 #include <windows.h>
@@ -140,8 +141,10 @@ struct Slot
     int fd = -1;
     Kind kind = Kind::Serial;
     bool used = false;
-    std::vector<unsigned char> input;
-    std::vector<unsigned char> output;
+    /* JVS traffic is consumed from the front.  deque avoids moving the whole
+     * pending stream on every byte/frame. */
+    std::deque<unsigned char> input;
+    std::deque<unsigned char> output;
     unsigned char joystickAxis = 0;
     unsigned char joystickButton = 0;
     bool joystickInitialized = false;
@@ -244,10 +247,10 @@ bool extractJvsFrame(Slot &slot, std::vector<unsigned char> &frame)
     if (slot.input.size() < 3)
         return false;
 
-    std::vector<unsigned char> decoded;
-    decoded.reserve(JVS_MAX_PACKET_SIZE);
     bool escaped = false;
     size_t consumed = 1;
+    size_t decodedSize = 0;
+    unsigned char decodedLength = 0;
     for (size_t i = 1; i < slot.input.size(); ++i)
     {
         unsigned char value = slot.input[i];
@@ -262,17 +265,18 @@ bool extractJvsFrame(Slot &slot, std::vector<unsigned char> &frame)
             value = static_cast<unsigned char>(value + 1);
             escaped = false;
         }
-        decoded.push_back(value);
-        if (decoded.size() == 2)
+        ++decodedSize;
+        if (decodedSize == 2)
         {
-            const size_t expected = 2 + decoded[1];
+            decodedLength = value;
+            const size_t expected = 2 + decodedLength;
             if (expected > JVS_MAX_PACKET_SIZE + 2)
             {
                 slot.input.erase(slot.input.begin());
                 return false;
             }
         }
-        if (decoded.size() >= 2 && decoded.size() == static_cast<size_t>(2 + decoded[1]))
+        if (decodedSize >= 2 && decodedSize == static_cast<size_t>(2 + decodedLength))
         {
             frame.assign(slot.input.begin(), slot.input.begin() + consumed);
             slot.input.erase(slot.input.begin(), slot.input.begin() + consumed);
@@ -315,7 +319,8 @@ int readDevice(int fd, void *buffer, size_t count)
             return -1;
         }
         const size_t amount = std::min(count, slot->output.size());
-        std::memcpy(buffer, slot->output.data(), amount);
+        std::copy_n(slot->output.begin(), amount,
+                    static_cast<unsigned char *>(buffer));
         slot->output.erase(slot->output.begin(), slot->output.begin() + amount);
         return static_cast<int>(amount);
     }

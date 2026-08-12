@@ -3,6 +3,7 @@
 // ============================================================
 
 #include "pthreadInternal.hpp"
+#include "../../diagnostics/perfProfiler.hpp"
 #include <unordered_map>
 
 // ============================================================
@@ -17,9 +18,39 @@ namespace {
 /* Shard pthread object tables by guest pointer to reduce lookup contention. */
 constexpr size_t kShardCount = 64;
 
-/* Cache repeated pthread object lookups per thread. */
-constexpr size_t kCacheEntries = 4;
+/* Cache repeated pthread object lookups per thread. A direct-mapped four-entry
+ * cache was too easy to thrash because WMMT touches several mutexes in a tight
+ * loop. Keep the cache small, but use 16 sets with four ways so unrelated
+ * guest addresses do not evict each other immediately. */
+constexpr size_t kCacheSets = 16;
+constexpr size_t kCacheWays = 4;
+constexpr size_t kCacheEntries = kCacheSets * kCacheWays;
 volatile LONG g_tableGeneration = 1;
+
+struct MutexFastEntry
+{
+    LONG generation = 0;
+    void *key = nullptr;
+    PthreadMutexInternal *value = nullptr;
+};
+
+/* The mutex path dominates the mapper traffic. Keep a tiny last-use cache in
+ * front of the generic table cache; it avoids the template/cache bookkeeping
+ * for the common lock/unlock pair on the same guest mutex. */
+thread_local MutexFastEntry g_mutexFastCache[4]{};
+
+static PthreadMutexInternal *fastMutexLookup(void *key)
+{
+    const size_t slot = (reinterpret_cast<uintptr_t>(key) >> 4) & 3u;
+    MutexFastEntry &entry = g_mutexFastCache[slot];
+    return entry.generation == g_tableGeneration && entry.key == key ? entry.value : nullptr;
+}
+
+static void rememberFastMutex(void *key, PthreadMutexInternal *value)
+{
+    const size_t slot = (reinterpret_cast<uintptr_t>(key) >> 4) & 3u;
+    g_mutexFastCache[slot] = {g_tableGeneration, key, value};
+}
 
 template <typename T>
 struct ShardedTable {
@@ -34,6 +65,7 @@ struct ShardedTable {
         LONG generation;
         void* keys[kCacheEntries];
         T* values[kCacheEntries];
+        unsigned char nextWay[kCacheSets];
     };
 
     static Cache& threadCache() {
@@ -42,7 +74,7 @@ struct ShardedTable {
     }
 
     static size_t cacheSlot(void* key) {
-        return (reinterpret_cast<uintptr_t>(key) >> 4) % kCacheEntries;
+        return ((reinterpret_cast<uintptr_t>(key) >> 4) % kCacheSets) * kCacheWays;
     }
 
     T* cached(void* key) {
@@ -53,13 +85,21 @@ struct ShardedTable {
             cache.generation = generation;
             return nullptr;
         }
-        const size_t slot = cacheSlot(key);
-        return cache.keys[slot] == key ? cache.values[slot] : nullptr;
+        const size_t first = cacheSlot(key);
+        for (size_t way = 0; way < kCacheWays; ++way)
+        {
+            const size_t slot = first + way;
+            if (cache.keys[slot] == key)
+                return cache.values[slot];
+        }
+        return nullptr;
     }
 
     void remember(void* key, T* value) {
         Cache& cache = threadCache();
-        const size_t slot = cacheSlot(key);
+        const size_t first = cacheSlot(key);
+        const size_t way = cache.nextWay[first / kCacheWays]++ % kCacheWays;
+        const size_t slot = first + way;
         cache.keys[slot] = key;
         cache.values[slot] = value;
     }
@@ -94,6 +134,7 @@ struct ShardedTable {
         if (it != shard.map.end() && it->second->initialized == magic) {
             T* existing = it->second;
             ReleaseSRWLockExclusive(&shard.lock);
+            remember(key, existing);
             return existing;
         }
 
@@ -182,6 +223,8 @@ static volatile uint32_t s_next_thread_id = 1000;
 // ============================================================
 
 void PthreadMapper::Initialize() {
+    PERF_PROFILE_SCOPE("PthreadMap");
+
     if (s_initialized) return;
     
     InitializeSRWLock(&s_lock);
@@ -202,6 +245,8 @@ void PthreadMapper::Initialize() {
 }
 
 void PthreadMapper::Shutdown() {
+    PERF_PROFILE_SCOPE("PthreadMap");
+
     if (!s_initialized) return;
     
     s_mutex_table.Clear([](PthreadMutexInternal* mutex) { DeleteCriticalSection(&mutex->cs); });
@@ -236,7 +281,12 @@ void PthreadMapper::Shutdown() {
 // ============================================================
 
 PthreadMutexInternal* PthreadMapper::GetOrCreateMutex(void* linux_mutex) {
-    return s_mutex_table.GetOrCreate(linux_mutex, MUTEX_INIT_MAGIC, [] {
+    PERF_PROFILE_SCOPE("PthreadMap");
+
+    if (PthreadMutexInternal *cached = fastMutexLookup(linux_mutex))
+        return cached;
+
+    PthreadMutexInternal *result = s_mutex_table.GetOrCreate(linux_mutex, MUTEX_INIT_MAGIC, [] {
         PthreadMutexInternal* mutex = new PthreadMutexInternal;
         InitializeCriticalSection(&mutex->cs);
         mutex->type = LINUX_PTHREAD_MUTEX_DEFAULT;
@@ -245,13 +295,27 @@ PthreadMutexInternal* PthreadMapper::GetOrCreateMutex(void* linux_mutex) {
         mutex->initialized = MUTEX_INIT_MAGIC;
         return mutex;
     });
+    rememberFastMutex(linux_mutex, result);
+    return result;
 }
 
 PthreadMutexInternal* PthreadMapper::FindMutex(void* linux_mutex) {
-    return s_mutex_table.Find(linux_mutex, MUTEX_INIT_MAGIC);
+    PERF_PROFILE_SCOPE("PthreadMap");
+
+    if (PthreadMutexInternal *cached = fastMutexLookup(linux_mutex))
+        return cached;
+
+    PthreadMutexInternal *result = s_mutex_table.Find(linux_mutex, MUTEX_INIT_MAGIC);
+    if (result)
+        rememberFastMutex(linux_mutex, result);
+    return result;
 }
 
 void PthreadMapper::DestroyMutex(void* linux_mutex) {
+    PERF_PROFILE_SCOPE("PthreadMap");
+
+    rememberFastMutex(linux_mutex, nullptr);
+
     s_mutex_table.Destroy(linux_mutex,
                           [](PthreadMutexInternal* mutex) { DeleteCriticalSection(&mutex->cs); });
 }
@@ -261,6 +325,8 @@ void PthreadMapper::DestroyMutex(void* linux_mutex) {
 // ============================================================
 
 PthreadCondInternal* PthreadMapper::GetOrCreateCond(void* linux_cond) {
+    PERF_PROFILE_SCOPE("PthreadMap");
+
     return s_cond_table.GetOrCreate(linux_cond, COND_INIT_MAGIC, [] {
         PthreadCondInternal* cond = new PthreadCondInternal;
         InitializeConditionVariable(&cond->cv);
@@ -271,10 +337,14 @@ PthreadCondInternal* PthreadMapper::GetOrCreateCond(void* linux_cond) {
 }
 
 PthreadCondInternal* PthreadMapper::FindCond(void* linux_cond) {
+    PERF_PROFILE_SCOPE("PthreadMap");
+
     return s_cond_table.Find(linux_cond, COND_INIT_MAGIC);
 }
 
 void PthreadMapper::DestroyCond(void* linux_cond) {
+    PERF_PROFILE_SCOPE("PthreadMap");
+
     s_cond_table.Destroy(linux_cond, [](PthreadCondInternal*) {});
 }
 
@@ -283,6 +353,8 @@ void PthreadMapper::DestroyCond(void* linux_cond) {
 // ============================================================
 
 PthreadRwlockInternal* PthreadMapper::GetOrCreateRwlock(void* linux_rwlock) {
+    PERF_PROFILE_SCOPE("PthreadMap");
+
     return s_rwlock_table.GetOrCreate(linux_rwlock, RWLOCK_INIT_MAGIC, [] {
         PthreadRwlockInternal* rwlock = new PthreadRwlockInternal;
         InitializeSRWLock(&rwlock->srw);
@@ -292,10 +364,14 @@ PthreadRwlockInternal* PthreadMapper::GetOrCreateRwlock(void* linux_rwlock) {
 }
 
 PthreadRwlockInternal* PthreadMapper::FindRwlock(void* linux_rwlock) {
+    PERF_PROFILE_SCOPE("PthreadMap");
+
     return s_rwlock_table.Find(linux_rwlock, RWLOCK_INIT_MAGIC);
 }
 
 void PthreadMapper::DestroyRwlock(void* linux_rwlock) {
+    PERF_PROFILE_SCOPE("PthreadMap");
+
     s_rwlock_table.Destroy(linux_rwlock, [](PthreadRwlockInternal*) {});
 }
 
@@ -304,6 +380,8 @@ void PthreadMapper::DestroyRwlock(void* linux_rwlock) {
 // ============================================================
 
 PthreadBarrierInternal* PthreadMapper::GetOrCreateBarrier(void* linux_barrier, unsigned int count) {
+    PERF_PROFILE_SCOPE("PthreadMap");
+
     return s_barrier_table.GetOrCreate(linux_barrier, BARRIER_INIT_MAGIC, [count] {
         PthreadBarrierInternal* barrier = new PthreadBarrierInternal;
         InitializeCriticalSection(&barrier->cs);
@@ -317,10 +395,14 @@ PthreadBarrierInternal* PthreadMapper::GetOrCreateBarrier(void* linux_barrier, u
 }
 
 PthreadBarrierInternal* PthreadMapper::FindBarrier(void* linux_barrier) {
+    PERF_PROFILE_SCOPE("PthreadMap");
+
     return s_barrier_table.Find(linux_barrier, BARRIER_INIT_MAGIC);
 }
 
 void PthreadMapper::DestroyBarrier(void* linux_barrier) {
+    PERF_PROFILE_SCOPE("PthreadMap");
+
     s_barrier_table.Destroy(linux_barrier,
                             [](PthreadBarrierInternal* barrier) { DeleteCriticalSection(&barrier->cs); });
 }
@@ -330,6 +412,8 @@ void PthreadMapper::DestroyBarrier(void* linux_barrier) {
 // ============================================================
 
 PthreadSpinInternal* PthreadMapper::GetOrCreateSpin(void* linux_spin) {
+    PERF_PROFILE_SCOPE("PthreadMap");
+
     return s_spin_table.GetOrCreate(linux_spin, SPIN_INIT_MAGIC, [] {
         PthreadSpinInternal* spin = new PthreadSpinInternal;
         spin->lock = 0;
@@ -339,10 +423,14 @@ PthreadSpinInternal* PthreadMapper::GetOrCreateSpin(void* linux_spin) {
 }
 
 PthreadSpinInternal* PthreadMapper::FindSpin(void* linux_spin) {
+    PERF_PROFILE_SCOPE("PthreadMap");
+
     return s_spin_table.Find(linux_spin, SPIN_INIT_MAGIC);
 }
 
 void PthreadMapper::DestroySpin(void* linux_spin) {
+    PERF_PROFILE_SCOPE("PthreadMap");
+
     s_spin_table.Destroy(linux_spin, [](PthreadSpinInternal*) {});
 }
 
@@ -351,6 +439,8 @@ void PthreadMapper::DestroySpin(void* linux_spin) {
 // ============================================================
 
 PthreadThreadInternal* PthreadMapper::CreateThread(uint32_t* out_linux_tid) {
+    PERF_PROFILE_SCOPE("PthreadMap");
+
     AcquireSRWLockExclusive(&s_lock);
     
     uint32_t tid = InterlockedIncrement((volatile LONG*)&s_next_thread_id);
@@ -370,6 +460,8 @@ PthreadThreadInternal* PthreadMapper::CreateThread(uint32_t* out_linux_tid) {
 }
 
 void PthreadMapper::RegisterThread(uint32_t linux_tid, DWORD win_tid) {
+    PERF_PROFILE_SCOPE("PthreadMap");
+
     AcquireSRWLockExclusive(&s_lock);
 
     auto it = s_thread_map.find(linux_tid);
@@ -382,6 +474,8 @@ void PthreadMapper::RegisterThread(uint32_t linux_tid, DWORD win_tid) {
 }
 
 PthreadThreadInternal* PthreadMapper::FindThread(uint32_t linux_tid) {
+    PERF_PROFILE_SCOPE("PthreadMap");
+
     AcquireSRWLockShared(&s_lock);
     
     auto it = s_thread_map.find(linux_tid);
@@ -392,6 +486,8 @@ PthreadThreadInternal* PthreadMapper::FindThread(uint32_t linux_tid) {
 }
 
 PthreadThreadInternal* PthreadMapper::FindThreadByWinId(DWORD win_tid) {
+    PERF_PROFILE_SCOPE("PthreadMap");
+
     AcquireSRWLockShared(&s_lock);
     
     PthreadThreadInternal* result = nullptr;
@@ -408,6 +504,8 @@ PthreadThreadInternal* PthreadMapper::FindThreadByWinId(DWORD win_tid) {
 }
 
 void PthreadMapper::DestroyThread(uint32_t linux_tid) {
+    PERF_PROFILE_SCOPE("PthreadMap");
+
     AcquireSRWLockExclusive(&s_lock);
     
     auto it = s_thread_map.find(linux_tid);
@@ -430,6 +528,8 @@ void PthreadMapper::DestroyThread(uint32_t linux_tid) {
 }
 
 uint32_t PthreadMapper::GetCurrentLinuxTid() {
+    PERF_PROFILE_SCOPE("PthreadMap");
+
     DWORD win_tid = GetCurrentThreadId();
     
     AcquireSRWLockShared(&s_lock);
