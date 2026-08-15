@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../../../config/config.h"
+#include "../../../platform/platformBackend.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -30,6 +31,12 @@ typedef struct N2TitleQuirks
      * rather than a synthesised address.
      */
     int reportsHostIPv4;
+
+    /* The card is a reader command rather than a persistent JVS switch. */
+    int cardInsertIsCommand;
+
+    /* Which control panel the input layer should map; see CabinetPanel. */
+    int cabinetPanel;
 } N2TitleQuirks;
 
 /*
@@ -40,6 +47,8 @@ typedef struct N2TitleQuirks
 typedef struct N2Title
 {
     const char *id;
+    /* controls.ini section for this cabinet, or NULL to use the game type. */
+    const char *controlsProfileName;
     const char *shortTitle;
     const char *title;
     const char *releaseYear;

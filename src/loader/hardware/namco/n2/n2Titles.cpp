@@ -19,33 +19,33 @@ namespace
  */
 const N2Title Titles[] = {
     {
-        N2_TITLE_ID_WMMT3, "WMMT3", "Wangan Midnight Maximum Tune 3", "", "640x480",
+        N2_TITLE_ID_WMMT3, "WMMT", "WMMT3", "Wangan Midnight Maximum Tune 3", "", "640x480",
         GROUP_WMMT3, DRIVING, 640, 480, n2Wmmt3Detect, n2Wmmt3InstallHooks, n2Wmmt3HandleSystemCommand,
-        nullptr, n2Wmmt3ShouldBlit, {1, 1, 1},
+        nullptr, n2Wmmt3ShouldBlit, {1, 1, 1, 1, CABINET_PANEL_WANGAN_N2},
     },
     {
-        N2_TITLE_ID_WMMT3DX_PLUS, "WMMT3DX+", "Wangan Midnight Maximum Tune 3DX+", "2010", "640x480",
+        N2_TITLE_ID_WMMT3DX_PLUS, "WMMT", "WMMT3DX+", "Wangan Midnight Maximum Tune 3DX+", "2010", "640x480",
         GROUP_WMMT3, DRIVING, 640, 480, n2Wmmt3dxPlusDetect, n2Wmmt3InstallHooks, n2Wmmt3HandleSystemCommand,
-        nullptr, n2Wmmt3ShouldBlit, {1, 1, 1},
+        nullptr, n2Wmmt3ShouldBlit, {1, 1, 1, 1, CABINET_PANEL_WANGAN_N2},
     },
     {
-        N2_TITLE_ID_WMMT3DX, "WMMT3DX", "Wangan Midnight Maximum Tune 3DX", "", "640x480",
+        N2_TITLE_ID_WMMT3DX, "WMMT", "WMMT3DX", "Wangan Midnight Maximum Tune 3DX", "", "640x480",
         GROUP_WMMT3, DRIVING, 640, 480, n2Wmmt3dxDetect, n2Wmmt3InstallHooks, n2Wmmt3HandleSystemCommand,
-        nullptr, n2Wmmt3ShouldBlit, {1, 1, 1},
+        nullptr, n2Wmmt3ShouldBlit, {1, 1, 1, 1, CABINET_PANEL_WANGAN_N2},
     },
     {
-        N2_TITLE_ID_WMMT3_FAMILY, "WMMT3 series", "Wangan Midnight Maximum Tune 3 series", "", "640x480",
+        N2_TITLE_ID_WMMT3_FAMILY, "WMMT", "WMMT3 series", "Wangan Midnight Maximum Tune 3 series", "", "640x480",
         GROUP_WMMT3, DRIVING, 640, 480, n2Wmmt3FamilyDetect, n2Wmmt3InstallHooks, n2Wmmt3HandleSystemCommand,
-        nullptr, n2Wmmt3ShouldBlit, {1, 1, 1},
+        nullptr, n2Wmmt3ShouldBlit, {1, 1, 1, 1, CABINET_PANEL_WANGAN_N2},
     },
     {
-        N2_TITLE_ID_CSNEO, "CSNeo", "Counter-Strike Neo", "2005", "1024x768",
+        N2_TITLE_ID_CSNEO, nullptr, "CSNeo", "Counter-Strike Neo", "2005", "1024x768",
         GROUP_UNKNOWN, SHOOTING, 1024, 768, n2CsNeoDetect, n2CsNeoInstallHooks, nullptr,
-        n2CsNeoHandleHostKey, nullptr, {0, 0, 0},
+        n2CsNeoHandleHostKey, nullptr, {0, 0, 0, 0, CABINET_PANEL_GENERIC},
     },
 };
 
-constexpr N2TitleQuirks NeutralQuirks = {0, 0, 0};
+constexpr N2TitleQuirks NeutralQuirks = {0, 0, 0, 0, CABINET_PANEL_GENERIC};
 
 const N2Title *g_current = nullptr;
 std::string g_revision;

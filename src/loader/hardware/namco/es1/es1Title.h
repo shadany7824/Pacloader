@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../../../config/config.h"
+#include "../../../platform/platformBackend.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -34,6 +35,50 @@ typedef struct Es1TitleQuirks
     int readdirEndOfDirectoryIsError;
 
     /*
+     * The cabinet's screen is a fixed panel, so the window neither resizes nor
+     * takes the legacy resize nudge, and it is centred when it is not
+     * fullscreen.
+     */
+    int fixedWindowSize;
+
+    /*
+     * The cabinet has an H-pattern shifter whose gears each close two JVS
+     * switch bits, so the input layer applies it as a unit each frame.
+     */
+    int hasHPatternShifter;
+
+    /* The card is a reader command rather than a persistent JVS switch. */
+    int cardInsertIsCommand;
+
+    /* The cabinet's TEST switch latches, so holding a key is not how it works. */
+    int testSwitchIsLatching;
+
+    /*
+     * The title pumps SDL from two paths, so an axis event can be consumed by
+     * one before the other flushes it; the bound axis is polled every frame as
+     * a second source of truth.
+     */
+    int pollsSteeringAxisEachFrame;
+
+    /* The guest is told it runs windowed through __NU_SCREEN_WINDOWED. */
+    int reportsWindowedScreen;
+
+    /*
+     * The pedals are reported over JVS shifted left six bits, so the value the
+     * title displays matches the cabinet. 0 uses the generic maximum.
+     */
+    int jvsPedalMaximum;
+
+    /* Which control panel the input layer should map; see CabinetPanel. */
+    int cabinetPanel;
+
+    /*
+     * The steering board volunteers its state instead of waiting to be asked,
+     * so the emulated one offers motor and self-check replies unprompted.
+     */
+    int steeringBoardReportsUnprompted;
+
+    /*
      * What the loader's JVS board calls itself, or NULL for the ES1 default.
      * A title's JVIO master checks this before it will talk to the board: WMMT4
      * requires the string to contain "NA-JV".
@@ -49,6 +94,8 @@ typedef struct Es1TitleQuirks
 typedef struct Es1Title
 {
     const char *id;
+    /* controls.ini section for this cabinet, or NULL to use the game type. */
+    const char *controlsProfileName;
     const char *shortTitle;
     const char *title;
     const char *revision;

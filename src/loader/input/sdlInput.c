@@ -1,3 +1,4 @@
+#include "../platform/platformBackend.h"
 #include <GL/gl.h>
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_events.h>
@@ -95,10 +96,11 @@ int jvsAnalogueCenterValue;
  * as the raw JVS value (which would be displayed as 5). */
 static int jvsAnalogueMaxForAction(LogicalAction action)
 {
-    if (gGrp == GROUP_WMMT4_ES1 &&
+    const int cabinetMaximum = platformJvsPedalMaximum();
+    if (cabinetMaximum > 0 &&
         (action == LA_Gas || action == LA_Gas_Digital ||
          action == LA_Brake || action == LA_Brake_Digital))
-        return 320 << 6;
+        return cabinetMaximum;
 
     return jvsAnalogueMaxValue;
 }
@@ -310,13 +312,11 @@ int initSdlInput(const char *controlsPath)
         printf("Found controls.ini, loading custom configuration...\n");
         loadGlobalConfig(ini);
         loadProfileFromIni(iniGetSection(ini, "Common"));
-        // Namco N2 reports itself as a driving game but has its own panel.
-        if (gGrp == GROUP_WMMT3)
-            isProfileLoaded = loadProfileFromIni(iniGetSection(ini, "WMMT"));
-        else if (gGrp == GROUP_WMMT4_ES1)
-            isProfileLoaded = loadProfileFromIni(iniGetSection(ini, "WMMT4"));
-        else if (gGrp == GROUP_MAXIMUM_HEAT_3D)
-            isProfileLoaded = loadProfileFromIni(iniGetSection(ini, "MaximumHeat3D"));
+        /* A cabinet names its own section; these titles report themselves as
+         * driving games but have their own panel. */
+        const char *profileName = platformControlsProfileName();
+        if (profileName)
+            isProfileLoaded = loadProfileFromIni(iniGetSection(ini, profileName));
         else if (gameType == DRIVING)
             isProfileLoaded = loadProfileFromIni(iniGetSection(ini, "Driving"));
         else if (gameType == DIGITAL)
@@ -633,7 +633,7 @@ void remapPerGame()
          * shifter, and WMMT3 reads its card through /dev/ttyM2 anyway. */
         gJvsMap[PLAYER_1][LA_CardInsert] = (JVSActionMapping){JVS_CALL_NONE, NONE};
     }
-    else if (gGrp == GROUP_WMMT4_ES1)
+    else if (platformCabinetPanel() == CABINET_PANEL_WANGAN_ES1)
     {
         /* The switch bits the cabinet's JVS board reports.  The shifter is an H
          * pattern whose gears each close two of them, so it is applied by
@@ -650,7 +650,7 @@ void remapPerGame()
         /* The card goes through the reader on ttyS1, not a panel switch. */
         gJvsMap[PLAYER_1][LA_CardInsert] = (JVSActionMapping){JVS_CALL_NONE, NONE};
     }
-    else if (gGrp == GROUP_MAXIMUM_HEAT_3D)
+    else if (platformCabinetPanel() == CABINET_PANEL_MAXIMUM_HEAT_3D)
     {
         /* Maximum Heat 3D's ES1 Jamma panel: clInputDeviceJamma::update()
          * translates only these switch bits.  VIEW CHANGE doubles as "decide"
@@ -749,7 +749,7 @@ void initActionProperties()
         gActionProperties[p][LA_CardInsert].isToggle = true;
         gActionProperties[p][LA_Card1Insert].isToggle = true;
         gActionProperties[p][LA_Card2Insert].isToggle = true;
-        if (gGrp == GROUP_WMMT3 || gGrp == GROUP_WMMT4_ES1)
+        if (platformCardInsertIsCommand())
         {
             // YaCardEmu controls are commands, not persistent JVS switches.
             gActionProperties[p][LA_CardInsert].isToggle = false;
@@ -757,7 +757,7 @@ void initActionProperties()
     }
     /* The cabinet's TEST switch is a latching one, so holding a key down is not
      * how it is operated; controls.ini can still override this with TestToggle. */
-    if (gGrp == GROUP_WMMT4_ES1)
+    if (platformTestSwitchIsLatching())
         gActionProperties[SYSTEM][LA_Test].isToggle = true;
 
     gActionProperties[PLAYER_1][LA_Flying_X].isCentering = true;
@@ -963,12 +963,12 @@ void setDefaultMappings()
         game_bindings = gDefaultWmmtBindings;
         bindingsCount = gDefaultWmmtBindingsSize;
     }
-    else if (gGrp == GROUP_WMMT4_ES1)
+    else if (platformCabinetPanel() == CABINET_PANEL_WANGAN_ES1)
     {
         game_bindings = gDefaultWmmt4Bindings;
         bindingsCount = gDefaultWmmt4BindingsSize;
     }
-    else if (gGrp == GROUP_MAXIMUM_HEAT_3D)
+    else if (platformCabinetPanel() == CABINET_PANEL_MAXIMUM_HEAT_3D)
     {
         game_bindings = gDefaultMaximumHeat3dBindings;
         bindingsCount = gDefaultMaximumHeat3dBindingsSize;
@@ -2220,13 +2220,13 @@ void updateCombinedAxes()
     }
 }
 
-/* WMMT4 can pump SDL from both its X11 compatibility path and the normal
- * present path.  If one path consumes an axis event before the other path
- * flushes the dirty list, the event-driven steering update can be missed.
- * Poll the bound raw joystick axis as a second source of truth each frame. */
-static void refreshWmmt4SteeringAxis(void)
+/* Some cabinets pump SDL from both an X11 compatibility path and the normal
+ * present path.  If one consumes an axis event before the other flushes the
+ * dirty list, the event-driven steering update is missed, so the bound raw
+ * axis is polled as a second source of truth each frame. */
+static void refreshCabinetSteeringAxis(void)
 {
-    if (gGrp != GROUP_WMMT4_ES1 || !sdlJoysticks.joysticks[0])
+    if (!platformPollsSteeringAxisEachFrame() || !sdlJoysticks.joysticks[0])
         return;
 
     for (int axis = 0; axis < MAX_JOY_AXES; axis++)
@@ -2261,7 +2261,7 @@ static void refreshWmmt4SteeringAxis(void)
 /* Sends every action queued since the last frame to the JVS I/O board. */
 void processChangedActions()
 {
-    refreshWmmt4SteeringAxis();
+    refreshCabinetSteeringAxis();
 
     for (int i = 0; i < gNumChangedActions; i++)
     {

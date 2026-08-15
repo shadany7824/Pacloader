@@ -283,8 +283,8 @@ void startSDL()
     if (gId == QUIZ_AXA_SBMS || gId == QUIZ_AXA_SBUR_LIVE)
         SDL_SetWindowPosition(g_SdlWindow, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
 
-    /* Set WMMT4's windowed position before showing the hidden window. */
-    if (gGrp == GROUP_WMMT4_ES1 && !getConfig()->fullscreen)
+    /* A fixed cabinet panel is centred before the hidden window is shown. */
+    if (platformWindowIsFixedSize() && !getConfig()->fullscreen)
         SDL_SetWindowPosition(g_SdlWindow, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
 
     if (getConfig()->fullscreen)
@@ -296,7 +296,7 @@ void startSDL()
 
     initBlitting();
 
-    if (gId != PRIMEVAL_HUNT_SBPP && gGrp != GROUP_LGJ && gGrp != GROUP_WMMT4_ES1)
+    if (gId != PRIMEVAL_HUNT_SBPP && gGrp != GROUP_LGJ && !platformWindowIsFixedSize())
         SDL_SetWindowResizable(g_SdlWindow, true);
 
     SDL_ShowWindow(g_SdlWindow);
@@ -304,7 +304,7 @@ void startSDL()
     publishDrawableSize();
     setVideoSyncWindow(SDL_GetPointerProperty(SDL_GetWindowProperties(g_SdlWindow),
                                               SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL));
-    if (gGrp == GROUP_WMMT4_ES1 && !getConfig()->fullscreen)
+    if (platformWindowIsFixedSize() && !getConfig()->fullscreen)
     {
         void *nativeWindow = SDL_GetPointerProperty(
             SDL_GetWindowProperties(g_SdlWindow),
@@ -559,8 +559,8 @@ void pollEvents()
                 break;
             case SDL_EVENT_WINDOW_RESTORED:
             {
-                /* Keep the legacy resize nudge away from fixed-size ES1 windows. */
-                if (gGrp != GROUP_WMMT4_ES1)
+                /* Keep the legacy resize nudge away from fixed cabinet panels. */
+                if (!platformWindowIsFixedSize())
                 {
                     if (((long long)gWidth * 3 == (long long)gHeight * 4) || gGrp == GROUP_HUMMER)
                         SDL_SetWindowSize(g_SdlWindow, gWidth + 1, gHeight);
@@ -581,7 +581,7 @@ void pollEvents()
     {
         if (gGrp == GROUP_HOD4 || gGrp == GROUP_HOD4_TEST)
             updateGunShake();
-        if (gGrp == GROUP_WMMT4_ES1)
+        if (platformHasHPatternShifter())
             updateWmmtEs1Shifter();
         updateCombinedAxes();
         processChangedActions();

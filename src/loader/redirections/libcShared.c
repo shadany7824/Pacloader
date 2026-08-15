@@ -1,3 +1,4 @@
+#include "../platform/platformBackend.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -157,7 +158,7 @@ char *sharedGetenv(const char *name)
     {
         return "";
     }
-    if (strcmp(name, "__NU_SCREEN_WINDOWED") == 0 && gGrp == GROUP_WMMT4_ES1)
+    if (strcmp(name, "__NU_SCREEN_WINDOWED") == 0 && platformReportsWindowedScreen())
     {
         return "1";
     }

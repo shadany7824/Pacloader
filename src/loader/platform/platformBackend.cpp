@@ -2,6 +2,8 @@
 
 #include "../config/config.h"
 #include "../hardware/namco/es1/es1.h"
+#include "../hardware/namco/es1/es1Title.h"
+#include "../hardware/namco/n2/n2Title.h"
 #include "../hardware/namco/n2/n2.h"
 #include "../hardware/namco/n2/n2CardReader.h"
 #include "../hardware/namco/es1/es1VirtualDevices.h"
@@ -182,6 +184,69 @@ extern "C" void platformRegisterCardControl(void)
 {
     if (platformIsN2())
         n2CardReaderRegisterCardControl();
+}
+
+extern "C" int platformWindowIsFixedSize(void)
+{
+    return platformIsES1() ? es1TitleQuirks()->fixedWindowSize : 0;
+}
+
+extern "C" int platformHasHPatternShifter(void)
+{
+    return platformIsES1() ? es1TitleQuirks()->hasHPatternShifter : 0;
+}
+
+extern "C" int platformCardInsertIsCommand(void)
+{
+    if (platformIsES1())
+        return es1TitleQuirks()->cardInsertIsCommand;
+    if (platformIsN2())
+        return n2TitleQuirks()->cardInsertIsCommand;
+    return 0;
+}
+
+extern "C" int platformTestSwitchIsLatching(void)
+{
+    return platformIsES1() ? es1TitleQuirks()->testSwitchIsLatching : 0;
+}
+
+extern "C" int platformPollsSteeringAxisEachFrame(void)
+{
+    return platformIsES1() ? es1TitleQuirks()->pollsSteeringAxisEachFrame : 0;
+}
+
+extern "C" int platformReportsWindowedScreen(void)
+{
+    return platformIsES1() ? es1TitleQuirks()->reportsWindowedScreen : 0;
+}
+
+extern "C" int platformJvsPedalMaximum(void)
+{
+    return platformIsES1() ? es1TitleQuirks()->jvsPedalMaximum : 0;
+}
+
+extern "C" const char *platformControlsProfileName(void)
+{
+    if (platformIsES1())
+    {
+        const Es1Title *title = es1CurrentTitle();
+        return title ? title->controlsProfileName : NULL;
+    }
+    if (platformIsN2())
+    {
+        const N2Title *title = n2CurrentTitle();
+        return title ? title->controlsProfileName : NULL;
+    }
+    return NULL;
+}
+
+extern "C" int platformCabinetPanel(void)
+{
+    if (platformIsES1())
+        return es1TitleQuirks()->cabinetPanel;
+    if (platformIsN2())
+        return n2TitleQuirks()->cabinetPanel;
+    return CABINET_PANEL_GENERIC;
 }
 
 extern "C" int platformRaiseNativeWindow(void *nativeWindow)

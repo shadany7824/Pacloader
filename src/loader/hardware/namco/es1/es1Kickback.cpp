@@ -56,7 +56,7 @@ constexpr unsigned int RunningReports = 1;
 
 bool boardReportsUnprompted(void)
 {
-    return es1TitleIs("WMMT4");
+    return es1TitleQuirks()->steeringBoardReportsUnprompted != 0;
 }
 
 /* Advance the steering-board state machine; caller holds boardMutex. */

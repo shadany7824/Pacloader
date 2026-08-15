@@ -17,6 +17,7 @@ constexpr Es1Title Titles[] = {
     {
         "WMMT4",
         "WMMT4",
+        "WMMT4",
         "Wangan Midnight Maximum Tune 4",
         "WMN4r",
         "2011",
@@ -31,12 +32,26 @@ constexpr Es1Title Titles[] = {
              * /dev/ttyS0 at 19200, which the title calls "Str2". */
             "/dev/ttyS0",
             1,
+            /* Fixed cabinet panel, and an H-pattern shifter on the JVS bits. */
+            1,
+            1,
+            /* Card is a reader command, TEST latches, the axis is polled, and
+             * the guest is told it runs windowed. Pedals are reported shifted. */
+            1,
+            1,
+            1,
+            1,
+            320 << 6,
+            CABINET_PANEL_WANGAN_ES1,
+            /* The steering board volunteers its state. */
+            1,
             /* The JVIO master will not talk to a board whose name lacks this. */
             "namco ltd.;NA-JV;Ver1.00;JPN,Multipurpose",
         },
     },
     {
         "MHEAT3D",
+        "MaximumHeat3D",
         "Maximum Heat 3D",
         "Maximum Heat 3D",
         "8807",
@@ -50,12 +65,23 @@ constexpr Es1Title Titles[] = {
             {0, 0, 0, 0},
             "/dev/ttyS1",
             0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            CABINET_PANEL_MAXIMUM_HEAT_3D,
+            0,
             nullptr,
         },
     },
 };
 
-constexpr Es1TitleQuirks NeutralQuirks = {{0, 0, 0, 0}, {0, 0, 0, 0}, nullptr, 0, nullptr};
+constexpr Es1TitleQuirks NeutralQuirks = {{0, 0, 0, 0}, {0, 0, 0, 0}, nullptr, 0,
+                                          0, 0, 0, 0, 0, 0, 0,
+                                          CABINET_PANEL_GENERIC, 0, nullptr};
 
 const Es1Title *g_current = nullptr;
 std::string g_revision;
