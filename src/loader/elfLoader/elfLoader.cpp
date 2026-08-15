@@ -188,7 +188,7 @@ bool ElfLoader::Load(const std::string &path, const std::function<bool()> &befor
      * return addresses (notably for C++ unwinding). */
     if (!GuestTls::InstallForCurrentThread())
     {
-        log_error("ES1 TLS: could not install guest GS before relocations");
+        log_error("Guest TLS: could not install guest GS before relocations");
         return false;
     }
     GuestTls::EnterHostCall();
@@ -603,7 +603,7 @@ bool ElfLoader::ProcessRelocations()
                             moduleName != "UNRESOLVED_STUB" && moduleName != "WEAK_SYMBOL" &&
                             moduleName != "libgcc_s_dw2-1.dll")
                         {
-                            log_debug("ES1 TLS: wrapping %s from %s at %p", symbolName.c_str(),
+                            log_debug("Guest TLS: wrapping %s from %s at %p", symbolName.c_str(),
                                       moduleName.c_str(), resolvedFunc);
                             resolvedFunc = GuestTls::WrapHostFunction(resolvedFunc);
                         }
@@ -1005,7 +1005,7 @@ bool ElfLoader::Execute(int argc, char **argv, char **envp)
 
     if (!GuestTls::InstallForCurrentThread())
     {
-        log_error("ES1 TLS: could not install guest GS for the main thread");
+        log_error("Guest TLS: could not install guest GS for the main thread");
         return false;
     }
 

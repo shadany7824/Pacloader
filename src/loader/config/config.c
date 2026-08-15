@@ -253,7 +253,7 @@ void setDefaultValues(EmulatorConfig *cfg)
     cfg->GPUVendor = AUTO_DETECT_GPU;
     cfg->fpsLimiter = 1;
     cfg->fpsTarget = 60.0f;
-    cfg->vsync = 1;
+    cfg->vsync = 0;
     cfg->phScreenMode = 2;
     cfg->phTestScreenSingle = 1;
     cfg->disableBuiltinFont = 0;

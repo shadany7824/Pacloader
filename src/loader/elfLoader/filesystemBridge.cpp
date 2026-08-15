@@ -80,6 +80,9 @@ namespace FileSystemBridge
 
     static ssize_t bridgeWriteDescriptor(int fd, const void *buffer, size_t count)
     {
+        /* The guest's C++ streams reach the console as write() on 1 and 2. */
+        if ((fd == 1 || fd == 2) && !logIsEnabled(LOG_GAME))
+            return static_cast<ssize_t>(count);
         if (Es1CompatBridge::isEventfd(fd))
             return Es1CompatBridge::writeEventfd(fd, buffer, count);
         if (const auto *device = VirtualDeviceRegistry::find(fd))
@@ -215,9 +218,18 @@ namespace FileSystemBridge
         MAP("__lxstat64", bridgeLxstat64);
     }
 
+    /* Same reason as the printf bridges: the guest's console output ignored the
+     * log level. A real file still gets its bytes; only stdout and stderr are
+     * quietened, and LL_LOG_LEVEL=game brings them back. */
+    bool guestConsoleIsQuiet(FILE *stream)
+    {
+        return (stream == stdout || stream == stderr) && !logIsEnabled(LOG_GAME);
+    }
+
     size_t bridgeFwrite(const void *ptr, size_t size, size_t count, FILE *stream)
     {
-        log_trace("Intercepted fwrite: %p %zu %zu %p", ptr, size, count, stream);
+        if (guestConsoleIsQuiet(stream))
+            return count;
         return fwrite(ptr, size, count, stream);
     }
 
@@ -861,6 +873,8 @@ extern "C"
     {
         if (!stream)
             return EOF;
+        if (FileSystemBridge::guestConsoleIsQuiet(stream))
+            return c;
 
         int ret = EOF;
         ret = fputc(c, stream);
@@ -876,6 +890,8 @@ extern "C"
     {
         if (!stream)
             return EOF;
+        if (FileSystemBridge::guestConsoleIsQuiet(stream))
+            return 0;
 
         int ret = EOF;
         ret = fputs(str, stream);

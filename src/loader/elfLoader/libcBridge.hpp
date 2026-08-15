@@ -132,6 +132,8 @@ namespace LibcBridge
      * loader through the unresolved-symbol stub. */
     void bridgeStackChkFail(void);
     int bridgePutcUnlocked(int character, FILE *stream);
+    int bridgePutchar(int character);
+    int bridgePutc(int character, FILE *stream);
     int bridgeNice(int increment);
     int bridgeGetrlimit(int resource, void *limit);
     int bridgeGetrusage(int who, void *usage);

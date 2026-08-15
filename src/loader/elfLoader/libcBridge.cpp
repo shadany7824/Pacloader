@@ -69,6 +69,8 @@ namespace LibcBridge
         // printf family
         MAP("printf", bridgePrintf);
         MAP("puts", bridgePuts);
+        MAP("putchar", bridgePutchar);
+        MAP("putc", bridgePutc);
         MAP("fprintf", bridgeFprintf);
         MAP("sprintf", bridgeSprintf);
         MAP("snprintf", bridgeSnprintf);
@@ -737,21 +739,50 @@ namespace LibcBridge
         return const_cast<char *>(msgid);
     }
 
+    /*
+     * The guest's own stdout - model loads, texture swaps, a line per frame -
+     * used to go straight to the console and so ignored the log level entirely.
+     * It is the bulk of what fills the terminal: 20,493 of one WMMT3 run's
+     * 22,539 lines. LOG_GAME exists for it, so LL_LOG_LEVEL=game brings it back.
+     * The text is still formatted when suppressed, because callers use the
+     * returned length.
+     */
+    int guestConsoleVprintf(void *stream, const char *format, va_list args)
+    {
+        char text[2048];
+        const int length = ::vsnprintf(text, sizeof(text), format ? format : "", args);
+        if (length <= 0)
+            return length;
+        if (logIsEnabled(LOG_GAME))
+        {
+            FILE *target = stream ? (FILE *)stream : stdout;
+            const size_t written = static_cast<size_t>(length) < sizeof(text)
+                                       ? static_cast<size_t>(length)
+                                       : sizeof(text) - 1;
+            ::fwrite(text, 1, written, target);
+        }
+        return length;
+    }
+
+    /* Only the console is quietened; a real file still gets its bytes. */
+    bool isGuestConsole(void *stream)
+    {
+        return stream == nullptr || stream == stdout || stream == stderr;
+    }
+
     int bridgePrintf(const char *format, ...)
     {
         va_list args;
         va_start(args, format);
-
-        log_trace("Intercepted printf");
-        int ret = ::vprintf(format, args);
-
+        const int ret = guestConsoleVprintf(nullptr, format, args);
         va_end(args);
         return ret;
     }
 
     int bridgePuts(const char *str)
     {
-        log_trace("Intercepted puts");
+        if (!logIsEnabled(LOG_GAME))
+            return 0;
         return ::puts(str);
     }
 
@@ -759,10 +790,9 @@ namespace LibcBridge
     {
         va_list args;
         va_start(args, format);
-
-        log_trace("Intercepted fprintf");
-        int ret = ::vfprintf((FILE *)stream, format, args);
-
+        const int ret = isGuestConsole(stream)
+                            ? guestConsoleVprintf(stream, format, args)
+                            : ::vfprintf((FILE *)stream, format, args);
         va_end(args);
         return ret;
     }
@@ -771,7 +801,6 @@ namespace LibcBridge
     {
         va_list args;
         va_start(args, format);
-        log_trace("Intercepted sprintf");
         int ret = ::vsprintf(buffer, format, args);
         va_end(args);
         return ret;
@@ -781,7 +810,6 @@ namespace LibcBridge
     {
         va_list args;
         va_start(args, format);
-        log_trace("Intercepted snprintf");
         if (format == NULL)
             return 0;
         int ret = _vsnprintf(buffer, count, format, args);
@@ -791,29 +819,23 @@ namespace LibcBridge
 
     int bridgeVprintf(const char *format, va_list args)
     {
-        log_trace("Intercepted vprintf");
-        return ::vprintf(format, args);
+        return guestConsoleVprintf(nullptr, format, args);
     }
 
     int bridgeVfprintf(void *stream, const char *format, va_list args)
     {
-        log_trace("Intercepted vfprintf");
-        if (stream == nullptr)
-        {
-            stream = stdout;
-        }
+        if (isGuestConsole(stream))
+            return guestConsoleVprintf(stream, format, args);
         return ::vfprintf((FILE *)stream, format, args);
     }
 
     int bridgeVsprintf(char *buffer, const char *format, va_list args)
     {
-        log_trace("Intercepted vsprintf");
         return ::vsprintf(buffer, format, args);
     }
 
     int bridgeVsnprintf(char *buffer, size_t count, const char *format, va_list args)
     {
-        log_trace("Intercepted vsnprintf");
         return ::vsnprintf(buffer, count, format, args);
     }
 
@@ -824,7 +846,7 @@ namespace LibcBridge
     {
         va_list args;
         va_start(args, format);
-        const int result = ::vprintf(format, args);
+        const int result = guestConsoleVprintf(nullptr, format, args);
         va_end(args);
         return result;
     }
@@ -868,12 +890,14 @@ namespace LibcBridge
 
     int bridgeVprintfChk(int, const char *format, va_list args)
     {
-        return ::vprintf(format, args);
+        return guestConsoleVprintf(nullptr, format, args);
     }
 
     int bridgeVfprintfChk(void *stream, int, const char *format, va_list args)
     {
-        return ::vfprintf(stream ? (FILE *)stream : stdout, format, args);
+        if (isGuestConsole(stream))
+            return guestConsoleVprintf(stream, format, args);
+        return ::vfprintf((FILE *)stream, format, args);
     }
 
     int bridgeVsprintfChk(char *buffer, int, size_t destinationSize, const char *format,
@@ -1171,7 +1195,25 @@ namespace LibcBridge
 
     int bridgePutcUnlocked(int character, FILE *stream)
     {
+        if (isGuestConsole(stream) && !logIsEnabled(LOG_GAME))
+            return character;
         return fputc(character, stream);
+    }
+
+    /* The guest writes its lines with fputs and their newline with putchar, so
+     * leaving these ungated printed a blank line for every suppressed line. */
+    int bridgePutchar(int character)
+    {
+        if (!logIsEnabled(LOG_GAME))
+            return character;
+        return ::putchar(character);
+    }
+
+    int bridgePutc(int character, FILE *stream)
+    {
+        if (isGuestConsole(stream) && !logIsEnabled(LOG_GAME))
+            return character;
+        return ::putc(character, stream);
     }
 
     int bridgeNice(int increment)

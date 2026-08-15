@@ -151,9 +151,8 @@ SymbolResolver::SymbolResolver()
     m_VTables["strncasecmp"] = reinterpret_cast<void *>(strncasecmp);
 
     m_VTables["mblen"] = reinterpret_cast<void *>(mblen); // mblen is multi-byte character length, doesn't use wchar_t
-    m_VTables["putc"] = reinterpret_cast<void *>(putc);
-    m_VTables["putchar"] = reinterpret_cast<void *>(putchar);
-    m_VTables["fputc"] = reinterpret_cast<void *>(fputc);
+    /* putc, putchar and fputc are not registered here: they reach the console,
+     * and LibcBridge owns that so the log level can quieten it. */
 }
 
 void SymbolResolver::InitSearchPaths(const std::string &libraryPathParam, const std::string &gameElfPath)

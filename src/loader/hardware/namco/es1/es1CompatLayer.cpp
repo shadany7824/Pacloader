@@ -96,6 +96,28 @@ bool addressIsMapped(uintptr_t address)
 
 }
 
+bool es1VerifyGuestCode(uintptr_t address, const uint8_t *signature, size_t length,
+                        const char *name, const char *title)
+{
+    if (!signature || length == 0)
+        return true;
+    if (!addressIsMapped(address))
+    {
+        log_warn("System ES1 %s: %s at %p is not mapped", title, name,
+                 reinterpret_cast<void *>(address));
+        return false;
+    }
+    if (std::memcmp(reinterpret_cast<const void *>(address), signature, length) == 0)
+        return true;
+
+    const uint8_t *found = reinterpret_cast<const uint8_t *>(address);
+    log_error("System ES1 %s: %s at %p does not match this build "
+              "(expected %02x %02x %02x %02x, found %02x %02x %02x %02x)",
+              title, name, reinterpret_cast<void *>(address), signature[0], signature[1],
+              signature[2], signature[3], found[0], found[1], found[2], found[3]);
+    return false;
+}
+
 int es1InstallHookTable(const Es1HookSpec *hooks, size_t count, const char *title)
 {
     if (!hooks)
@@ -111,6 +133,12 @@ int es1InstallHookTable(const Es1HookSpec *hooks, size_t count, const char *titl
                      hook.name, reinterpret_cast<void *>(hook.address));
             continue;
         }
+
+        /* Hooking the wrong function corrupts the guest in ways that surface far
+         * from here, so a mismatch declines the hook rather than taking it. */
+        if (!es1VerifyGuestCode(hook.address, hook.signature, hook.signatureLength,
+                                hook.name, title))
+            continue;
 
         const MH_STATUS status = MH_CreateHook(reinterpret_cast<void *>(hook.address),
                                                hook.replacement, hook.original);

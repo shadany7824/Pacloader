@@ -36,7 +36,11 @@ namespace
 constexpr char DriveHaspSerial[] = "267610069420";
 constexpr char TerminalHaspSerial[] = "267611069420";
 
+/* Opening bytes at each address, so a build these were not taken from is refused
+ * rather than silently hooked; see Es1HookSpec. From WMN4r Rev 1.10.18. */
 constexpr uintptr_t JvioMonitorAddress = 0x8390ba0;
+constexpr uint8_t JvioMonitorSignature[] = {0x55, 0x89, 0xe5, 0x57, 0x56, 0x53, 0x83, 0xec,
+                                            0x3c, 0x0f, 0xb6, 0x45, 0x08, 0x8b, 0x55, 0x0c};
 constexpr uintptr_t HaspLoginAddress = 0x8921fd0;
 constexpr uintptr_t HaspLogoutAddress = 0x89281f4;
 constexpr uintptr_t HaspDecryptAddress = 0x8922248;
@@ -334,18 +338,12 @@ extern "C" void wmmt4SystemLog(int type, const char *format, ...)
     std::vsnprintf(message, sizeof(message), format ? format : "", args);
     va_end(args);
 
-    switch (type)
-    {
-    case 2:
-        log_warn("WMMT4: %s", message);
-        break;
-    case 4:
-        log_error("WMMT4: %s", message);
-        break;
-    default:
-        log_info("WMMT4: %s", message);
-        break;
-    }
+    /* The title's own severity says nothing useful - it logs "Loading... Meter
+     * ok" and every model it entries at type 4 - so taking it at face value put
+     * thousands of ERROR lines on the console. It is all game chatter;
+     * LL_LOG_LEVEL=game brings it back. */
+    (void)type;
+    log_game("WMMT4: %s", message);
     std::fflush(stdout);
 }
 
@@ -729,7 +727,8 @@ extern "C" int es1Wmmt4InstallHooks(void)
         /* The JVIO subsystem is left unhooked: the title runs a real JVS master
          * the virtual board answers. Replacing JvioControl_Update also skipped the
          * output acknowledgement, reported as "Gout Update Timeout". */
-        {JvioMonitorAddress, reinterpret_cast<void *>(wmmt4JvioMonitor), "JvioMonitor"},
+        {JvioMonitorAddress, reinterpret_cast<void *>(wmmt4JvioMonitor), "JvioMonitor",
+         nullptr, JvioMonitorSignature, sizeof(JvioMonitorSignature)},
         {HaspLoginAddress, reinterpret_cast<void *>(wmmt4HaspLogin), "hasp_login"},
         {HaspLogoutAddress, reinterpret_cast<void *>(wmmt4HaspLogout), "hasp_logout"},
         {HaspDecryptAddress, reinterpret_cast<void *>(wmmt4HaspDecrypt), "hasp_decrypt"},

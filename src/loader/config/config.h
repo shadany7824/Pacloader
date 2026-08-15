@@ -440,8 +440,10 @@ typedef struct
     int keepAspectRatio;
     int fpsLimiter;
     float fpsTarget;
-    /* Present on the display's refresh instead of the limiter's QPC grid.
-     * Off means the grid alone decides when to present, which tears. */
+    /* Present on the display's refresh instead of the limiter's QPC grid, which
+     * stops tearing. Off by default: it also stops the limiter pacing, so every
+     * present blocks for a blank - which crawls through the loads a title does
+     * while presenting. Worth it on WMMT4, measured a regression on WMMT3. */
     int vsync;
     int lgjRenderWithMesa;
     int ramboGunsSwitch;

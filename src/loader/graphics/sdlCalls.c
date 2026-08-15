@@ -113,10 +113,15 @@ static void disableWindowGhosting(void)
 #endif
 }
 
-/* The GL hooks must never ask SDL for this: they run on the render threads. */
+/* The GL hooks must never ask SDL for this: they run on the render threads.
+ *
+ * ES1 only. The letterbox exists because those titles set a viewport for their
+ * own size and the loader passes it through, which leaves the picture in a
+ * corner of a larger drawable. N2 titles scale themselves through blitStretch(),
+ * so letterboxing them as well drew nothing at all in fullscreen. */
 void publishDrawableSize(void)
 {
-    if (!g_SdlWindow)
+    if (!g_SdlWindow || !platformIsES1())
         return;
 
     int drawableWidth = 0;

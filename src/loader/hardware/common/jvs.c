@@ -3,6 +3,7 @@
 
 #include "jvs.h"
 #include "../../config/config.h"
+#include "../../log/log.h"
 #if defined(_WIN32) || defined(__MINGW32__)
 #include "../namco/es1/es1Title.h"
 #endif
@@ -554,18 +555,20 @@ JVSStatus processPacket(int *packetSize)
 
         case CMD_CONVEY_ID:
         {
-            ////printf("CMD_CONVEY_ID\n");
             size = 1;
             outputPacket.data[outputPacket.length++] = REPORT_SUCCESS;
             char idData[100] = {0};
             for (int i = 1; i < 100; i++)
             {
-                idData[i] = (char)inputPacket.data[index + i];
+                /* The payload starts one byte past the command, so it has to land
+                 * at the front: filling from index 1 left a leading NUL and the
+                 * identifier always logged empty. */
+                idData[i - 1] = (char)inputPacket.data[index + i];
                 size++;
                 if (!inputPacket.data[index + i])
                     break;
             }
-            printf("CMD_CONVEY_ID = %s\n", idData);
+            log_debug("JVS: host identifies itself as \"%s\"", idData);
         }
         break;
 
@@ -624,7 +627,7 @@ JVSStatus processPacket(int *packetSize)
 
         default:
         {
-            printf("Error: JVS command not supported [0x%02hhX]\n", inputPacket.data[index]);
+            log_warn("JVS: unsupported command 0x%02hhX", inputPacket.data[index]);
         }
         }
         index += size;

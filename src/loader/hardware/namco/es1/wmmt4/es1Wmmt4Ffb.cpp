@@ -11,20 +11,55 @@
 
 namespace
 {
-/* WMMT4's FFB setters and update entry points. */
-constexpr uintptr_t SetTorqueAddress = 0x8367ae0;   /* float, -1..1 */
-constexpr uintptr_t SetPeriodAddress = 0x8367b10;   /* int */
-constexpr uintptr_t SetSpringAddress = 0x8367b30;   /* float, 0..1 */
-constexpr uintptr_t SetDamperAddress = 0x8367b60;   /* float, 0..1 */
-constexpr uintptr_t SetVibrateAddress = 0x8367b90;  /* float, 0..1 */
+/*
+ * WMMT4's FFB entry points, each with the opening bytes found there. The game
+ * carries no symbols for its own code, so these can only be addresses - but an
+ * address alone cannot say whether it still points at the function it named.
+ * The signature turns a wrong build into a refused hook and a log line instead
+ * of a jump into unrelated code. Taken from WMN4r Rev 1.10.18.
+ */
+struct FfbTarget
+{
+    uintptr_t address;
+    uint8_t signature[16];
+};
+
+constexpr FfbTarget SetTorqueTarget = /* float, -1..1 */
+    {0x8367ae0, {0x55, 0x89, 0xe5, 0x8b, 0x45, 0x08, 0xd9, 0x45,
+                 0x0c, 0xd9, 0xe8, 0xd9, 0xe0, 0xdb, 0xe9, 0xc6}};
+constexpr FfbTarget SetPeriodTarget = /* int */
+    {0x8367b10, {0x55, 0x89, 0xe5, 0x8b, 0x45, 0x08, 0x8b, 0x55,
+                 0x0c, 0xc6, 0x40, 0x21, 0x01, 0x89, 0x50, 0x2c}};
+constexpr FfbTarget SetSpringTarget = /* float, 0..1 */
+    {0x8367b30, {0x55, 0x89, 0xe5, 0x8b, 0x45, 0x08, 0xd9, 0x45,
+                 0x0c, 0xd9, 0xee, 0xdb, 0xe9, 0xc6, 0x40, 0x22}};
+constexpr FfbTarget SetDamperTarget = /* float, 0..1 */
+    {0x8367b60, {0x55, 0x89, 0xe5, 0x8b, 0x45, 0x08, 0xd9, 0x45,
+                 0x0c, 0xd9, 0xee, 0xdb, 0xe9, 0xc6, 0x40, 0x23}};
+constexpr FfbTarget SetVibrateTarget = /* float, 0..1 */
+    {0x8367b90, {0x55, 0x89, 0xe5, 0x8b, 0x45, 0x08, 0xd9, 0x45,
+                 0x0c, 0xd9, 0xe8, 0xd9, 0xe0, 0xdb, 0xe9, 0xc6}};
 /* Per-frame dispatch: force, spring, damper and vibration floats. */
-constexpr uintptr_t ApplyFfbAddress = 0x8366e30;
+constexpr FfbTarget ApplyFfbTarget =
+    {0x8366e30, {0x55, 0x89, 0xe5, 0x8b, 0x45, 0x08, 0x8b, 0x40,
+                 0x04, 0x89, 0x45, 0x08, 0x5d, 0xe9, 0x8e, 0xfb}};
 /* Wall-hit effects are staged here before the update loop dispatches them. */
-constexpr uintptr_t SetOneShotEffectAddress = 0x8367ce0;
-constexpr uintptr_t PowerOnAddress = 0x8366f80;
-constexpr uintptr_t PowerOffAddress = 0x8366fb0;
-constexpr uintptr_t StartSelfCheckAddress = 0x8367ee0;
-constexpr uintptr_t CompleteDriverSelfCheckAddress = 0x8366230;
+constexpr FfbTarget SetOneShotEffectTarget =
+    {0x8367ce0, {0x55, 0x89, 0xe5, 0x8b, 0x45, 0x08, 0x8b, 0x55,
+                 0x0c, 0xc6, 0x40, 0x3c, 0x01, 0x89, 0x50, 0x40}};
+constexpr FfbTarget PowerOnTarget =
+    {0x8366f80, {0x8b, 0x0d, 0x70, 0x53, 0x1e, 0x09, 0x55, 0x89,
+                 0xe5, 0x8b, 0x55, 0x0c, 0x85, 0xc9, 0x74, 0x1e}};
+constexpr FfbTarget PowerOffTarget =
+    {0x8366fb0, {0xa1, 0x70, 0x53, 0x1e, 0x09, 0x55, 0x89, 0xe5,
+                 0x8b, 0x55, 0x0c, 0x85, 0xc0, 0x74, 0x1a, 0x8b}};
+constexpr FfbTarget StartSelfCheckTarget =
+    {0x8367ee0, {0x55, 0x89, 0xe5, 0x83, 0xec, 0x08, 0x8b, 0x45,
+                 0x08, 0xc6, 0x40, 0x50, 0x01, 0x8b, 0x40, 0x04}};
+/* Called directly rather than hooked, so it is verified at the call site. */
+constexpr FfbTarget CompleteDriverSelfCheckTarget =
+    {0x8366230, {0x55, 0x89, 0xe5, 0x8b, 0x45, 0x08, 0xc6, 0x40,
+                 0x40, 0x00, 0xc7, 0x40, 0x08, 0x70, 0x61, 0x36}};
 
 /* Field offsets in that object, in the order the setters write them. */
 constexpr size_t TorqueOffset = 0x28;
@@ -61,9 +96,16 @@ void completeVirtualSelfCheck(void *object)
     if (!driver)
         return;
 
-    /* Complete the title-side self-check and clear its pending flag. */
+    /* Complete the title-side self-check and clear its pending flag. Verified
+     * here because this one is called, not hooked, so nothing else checks it. */
+    if (!es1VerifyGuestCode(CompleteDriverSelfCheckTarget.address,
+                            CompleteDriverSelfCheckTarget.signature,
+                            sizeof(CompleteDriverSelfCheckTarget.signature),
+                            "FFB complete driver self check", "WMMT4"))
+        return;
+
     GuestTls::EnterGuestCode();
-    reinterpret_cast<CompleteDriverSelfCheck>(CompleteDriverSelfCheckAddress)(driver);
+    reinterpret_cast<CompleteDriverSelfCheck>(CompleteDriverSelfCheckTarget.address)(driver);
     GuestTls::EnterHostCall();
     static_cast<uint8_t *>(object)[0x50] = 0;
 }
@@ -350,27 +392,27 @@ extern "C" int wmmt4InstallFfbHooks(void)
     if (!getConfig()->namcoES1.forceFeedbackEnabled)
         return 0;
 
+#define FFB_HOOK(target, replacement, label, original)                                   \
+    {                                                                                    \
+        (target).address, reinterpret_cast<void *>(replacement), (label),                \
+            reinterpret_cast<void **>(original), (target).signature,                     \
+            sizeof((target).signature)                                                   \
+    }
+
     const Es1HookSpec hooks[] = {
-        {ApplyFfbAddress, reinterpret_cast<void *>(wmmt4FfbApplyOutput), "FFB apply output",
-         reinterpret_cast<void **>(&g_originalApplyFfb)},
-        {SetOneShotEffectAddress, reinterpret_cast<void *>(wmmt4FfbSetOneShotEffect),
-         "FFB one-shot effect", reinterpret_cast<void **>(&g_originalSetOneShotEffect)},
-        {SetTorqueAddress, reinterpret_cast<void *>(wmmt4FfbSetTorque), "FFB setTorque",
-         reinterpret_cast<void **>(&g_originalTorque)},
-        {SetPeriodAddress, reinterpret_cast<void *>(wmmt4FfbSetPeriod), "FFB setPeriod",
-         reinterpret_cast<void **>(&g_originalPeriod)},
-        {SetSpringAddress, reinterpret_cast<void *>(wmmt4FfbSetSpring), "FFB setSpring",
-         reinterpret_cast<void **>(&g_originalSpring)},
-        {SetDamperAddress, reinterpret_cast<void *>(wmmt4FfbSetDamper), "FFB setDamper",
-         reinterpret_cast<void **>(&g_originalDamper)},
-        {SetVibrateAddress, reinterpret_cast<void *>(wmmt4FfbSetVibrate), "FFB setVibrate",
-         reinterpret_cast<void **>(&g_originalVibrate)},
-        {PowerOnAddress, reinterpret_cast<void *>(wmmt4FfbPowerOn), "FFB power on",
-         reinterpret_cast<void **>(&g_originalPowerOn)},
-        {PowerOffAddress, reinterpret_cast<void *>(wmmt4FfbPowerOff), "FFB power off",
-         reinterpret_cast<void **>(&g_originalPowerOff)},
-        {StartSelfCheckAddress, reinterpret_cast<void *>(wmmt4FfbStartSelfCheck),
-         "FFB start self check", reinterpret_cast<void **>(&g_originalStartSelfCheck)},
+        FFB_HOOK(ApplyFfbTarget, wmmt4FfbApplyOutput, "FFB apply output", &g_originalApplyFfb),
+        FFB_HOOK(SetOneShotEffectTarget, wmmt4FfbSetOneShotEffect, "FFB one-shot effect",
+                 &g_originalSetOneShotEffect),
+        FFB_HOOK(SetTorqueTarget, wmmt4FfbSetTorque, "FFB setTorque", &g_originalTorque),
+        FFB_HOOK(SetPeriodTarget, wmmt4FfbSetPeriod, "FFB setPeriod", &g_originalPeriod),
+        FFB_HOOK(SetSpringTarget, wmmt4FfbSetSpring, "FFB setSpring", &g_originalSpring),
+        FFB_HOOK(SetDamperTarget, wmmt4FfbSetDamper, "FFB setDamper", &g_originalDamper),
+        FFB_HOOK(SetVibrateTarget, wmmt4FfbSetVibrate, "FFB setVibrate", &g_originalVibrate),
+        FFB_HOOK(PowerOnTarget, wmmt4FfbPowerOn, "FFB power on", &g_originalPowerOn),
+        FFB_HOOK(PowerOffTarget, wmmt4FfbPowerOff, "FFB power off", &g_originalPowerOff),
+        FFB_HOOK(StartSelfCheckTarget, wmmt4FfbStartSelfCheck, "FFB start self check",
+                 &g_originalStartSelfCheck),
     };
+#undef FFB_HOOK
     return es1InstallHookTable(hooks, sizeof(hooks) / sizeof(hooks[0]), "WMMT4");
 }

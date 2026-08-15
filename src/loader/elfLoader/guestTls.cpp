@@ -108,7 +108,7 @@ extern "C" void pushGuestReturnAndEnterHost(uint32_t address)
                                    sizeof(g_guestReturns.addresses[0]))
         g_guestReturns.addresses[g_guestReturns.depth++] = address;
     else
-        log_fatal("ES1 TLS: host-call trampoline return stack overflow");
+        log_fatal("Guest TLS: host-call trampoline return stack overflow");
 
     if (g_currentState && !g_useFsOverride.load(std::memory_order_relaxed))
         loadGs(g_currentState->hostSelector);
@@ -118,7 +118,7 @@ extern "C" uint32_t popGuestReturnAndEnterGuest()
 {
     if (g_guestReturns.depth == 0)
     {
-        log_fatal("ES1 TLS: host-call trampoline return stack underflow");
+        log_fatal("Guest TLS: host-call trampoline return stack underflow");
         return 0;
     }
 
@@ -231,7 +231,7 @@ LONG CALLBACK emulateGuestGsInstruction(EXCEPTION_POINTERS *exception)
 
             int messageLength = _snprintf(
                 message, sizeof(message) - 1,
-                "ES1 TLS: unhandled AV eip=%08lx (base=%08lx +%08lx) esp=%08lx ebp=%08lx "
+                "Guest TLS: unhandled AV eip=%08lx (base=%08lx +%08lx) esp=%08lx ebp=%08lx "
                 "type=%lu address=%08lx "
                 "eax=%08lx ebx=%08lx ecx=%08lx edx=%08lx esi=%08lx edi=%08lx\r\n",
                 static_cast<unsigned long>(context->Eip),
@@ -393,7 +393,7 @@ LONG CALLBACK emulateGuestGsInstruction(EXCEPTION_POINTERS *exception)
 void installGsExceptionHandler()
 {
     if (!AddVectoredExceptionHandler(1, emulateGuestGsInstruction))
-        log_error("ES1 TLS: failed to install the GS instruction exception handler");
+        log_error("Guest TLS: failed to install the GS instruction exception handler");
 }
 
 bool initializeSoftwareTls(void *allocation, uintptr_t threadPointer)
@@ -458,7 +458,7 @@ bool InstallForCurrentThread()
     std::call_once(g_ntSetLdtEntriesOnce, loadNtSetLdtEntries);
     if (!g_ntSetLdtEntries && !g_ntSetInformationProcess)
     {
-        log_error("ES1 TLS: NtSetLdtEntries is unavailable; guest GS cannot be installed");
+        log_error("Guest TLS: NtSetLdtEntries is unavailable; guest GS cannot be installed");
         return false;
     }
 
@@ -473,7 +473,7 @@ bool InstallForCurrentThread()
                                     MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
     if (!allocation)
     {
-        log_error("ES1 TLS: failed to allocate guest TLS block (error %lu)",
+        log_error("Guest TLS: failed to allocate guest TLS block (error %lu)",
                   static_cast<unsigned long>(GetLastError()));
         return false;
     }
@@ -486,7 +486,7 @@ bool InstallForCurrentThread()
     const unsigned int index = g_nextLdtIndex.fetch_add(1);
     if (index > 0x1fff)
     {
-        log_error("ES1 TLS: exhausted LDT selectors");
+        log_error("Guest TLS: exhausted LDT selectors");
         VirtualFree(allocation, 0, MEM_RELEASE);
         return false;
     }
@@ -501,12 +501,14 @@ bool InstallForCurrentThread()
         MEMORY_BASIC_INFORMATION memoryInfo{};
         VirtualQuery(reinterpret_cast<void *>(getHostTeb() - 0x1000),
                      &memoryInfo, sizeof(memoryInfo));
-        log_error("ES1 TLS: NtSetLdtEntries failed for selector 0x%04x (status 0x%08lx)",
+        /* WOW64 exposes no writable LDT, so this is the ordinary path on any
+         * 64-bit host rather than a failure; only the fallback failing is one. */
+        log_debug("Guest TLS: NtSetLdtEntries refused selector 0x%04x (status 0x%08lx)",
                   selector, static_cast<unsigned long>(status));
-        log_info("ES1 TLS: host FS selector=0x%04x TEB=%p preceding region=%p size=0x%lx state=0x%lx",
-                 getHostFsSelector(), reinterpret_cast<void *>(getHostTeb()),
-                 memoryInfo.BaseAddress, static_cast<unsigned long>(memoryInfo.RegionSize),
-                 static_cast<unsigned long>(memoryInfo.State));
+        log_debug("Guest TLS: host FS selector=0x%04x TEB=%p preceding region=%p size=0x%lx state=0x%lx",
+                  getHostFsSelector(), reinterpret_cast<void *>(getHostTeb()),
+                  memoryInfo.BaseAddress, static_cast<unsigned long>(memoryInfo.RegionSize),
+                  static_cast<unsigned long>(memoryInfo.State));
         /* Current WOW64 does not expose a writable LDT and silently refuses
          * to retain FS as GS.  Keep the private TLS allocation and execute a
          * GS-prefixed instruction from a per-thread scratch buffer, with its
@@ -516,17 +518,19 @@ bool InstallForCurrentThread()
             g_useFsOverride.store(true, std::memory_order_relaxed);
             if (initializeSoftwareTls(allocation, threadPointer))
             {
-                log_warn("ES1 TLS: using per-thread WOW64 GS instruction emulation");
+                log_debug("Guest TLS: using per-thread WOW64 GS instruction emulation");
                 return true;
             }
         }
+        log_error("Guest TLS: the host offers neither an LDT selector nor GS "
+                  "emulation; the guest cannot be given thread-local storage");
         VirtualFree(allocation, 0, MEM_RELEASE);
         return false;
     }
 
     g_currentState = new GuestTlsState{
         allocation, threadPointer, selector, getHostGsSelector()};
-    log_info("ES1 TLS: installed GS selector 0x%04x at %p", selector,
+    log_info("Guest TLS: installed GS selector 0x%04x at %p", selector,
              reinterpret_cast<void *>(threadPointer));
     loadGs(selector);
     return true;
