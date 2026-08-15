@@ -70,6 +70,12 @@ int es1TitleIs(const char *id);
 /* Walks the title table and records the first match; es1DetectGame() calls it. */
 const Es1Title *es1SelectTitle(const char *elfPath);
 
+/* The build the detected package reports, or "" when it carries none. The
+ * address tables in the title modules only hold for one build, so it is worth
+ * recording what was actually found. */
+void es1SetDetectedRevision(const char *revision);
+const char *es1DetectedRevision(void);
+
 /* Never NULL: falls back to neutral defaults when no title is detected. */
 const Es1TitleQuirks *es1TitleQuirks(void);
 

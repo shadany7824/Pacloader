@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstring>
+#include <string>
 
 namespace
 {
@@ -57,7 +58,18 @@ constexpr Es1Title Titles[] = {
 constexpr Es1TitleQuirks NeutralQuirks = {{0, 0, 0, 0}, {0, 0, 0, 0}, nullptr, 0, nullptr};
 
 const Es1Title *g_current = nullptr;
+std::string g_revision;
 } // namespace
+
+extern "C" void es1SetDetectedRevision(const char *revision)
+{
+    g_revision.assign(revision ? revision : "");
+}
+
+extern "C" const char *es1DetectedRevision(void)
+{
+    return g_revision.c_str();
+}
 
 extern "C" const Es1Title *es1CurrentTitle(void)
 {
@@ -77,6 +89,7 @@ extern "C" const Es1TitleQuirks *es1TitleQuirks(void)
 extern "C" const Es1Title *es1SelectTitle(const char *elfPath)
 {
     g_current = nullptr;
+    g_revision.clear();
     if (!elfPath || !*elfPath)
         return nullptr;
 
@@ -85,7 +98,11 @@ extern "C" const Es1Title *es1SelectTitle(const char *elfPath)
         if (title.detect && title.detect(elfPath))
         {
             g_current = &title;
-            log_info("Detected Namco System ES1 title: %s", title.title);
+            if (g_revision.empty())
+                log_info("Detected Namco System ES1 title: %s", title.title);
+            else
+                log_info("Detected Namco System ES1 title: %s, revision %s", title.title,
+                         g_revision.c_str());
             return g_current;
         }
     }

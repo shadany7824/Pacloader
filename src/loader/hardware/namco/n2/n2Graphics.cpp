@@ -121,14 +121,18 @@ int admSwapInterval(int interval)
     static bool announced = false;
     static int applied = 0;
 
-    if (getConfig()->fpsLimiter && interval != 0)
+    /* The loader owns the presentation rate while the limiter is on, so
+     * [Graphics] VSYNC decides this rather than the guest. */
+    if (getConfig()->fpsLimiter)
     {
-        if (!announced)
+        const int wanted = getConfig()->vsync ? 1 : 0;
+        if (!announced && interval != wanted)
         {
-            log_info("Namco N2: vsync suppressed; [Graphics] FPS_TARGET drives the frame rate");
+            log_info("Namco N2: guest asked for swap interval %d; [Graphics] VSYNC gives %d",
+                     interval, wanted);
             announced = true;
         }
-        interval = 0;
+        interval = wanted;
     }
 
     if (haveApplied && applied == interval)

@@ -1,5 +1,7 @@
 #include "n2Wmmt3.hpp"
 
+#include <elfio.hpp>
+
 #if defined(_WIN32) || defined(__MINGW32__)
 
 #include "../n2.h"
@@ -144,16 +146,73 @@ void traceSetString(void *self, const char *text, bool flag)
 
 namespace
 {
+/*
+ * The same field, read out of the ELF on disk. Detection also runs before
+ * anything is loaded - writing a configuration file names the game without
+ * launching it - and then no symbol can be resolved.
+ */
+const char *revisionFromElfFile(const char *elfPath)
+{
+    static char revision[sizeof(RomInfo::revisionName)];
+    if (!elfPath || !*elfPath)
+        return nullptr;
+
+    ELFIO::elfio reader;
+    if (!reader.load(elfPath))
+        return nullptr;
+
+    for (const auto &section : reader.sections)
+    {
+        if (section->get_type() != ELFIO::SHT_DYNSYM &&
+            section->get_type() != ELFIO::SHT_SYMTAB)
+            continue;
+
+        const ELFIO::symbol_section_accessor symbols(reader, section.get());
+        for (ELFIO::Elf_Xword i = 0; i < symbols.get_symbols_num(); ++i)
+        {
+            std::string name;
+            ELFIO::Elf64_Addr value = 0;
+            ELFIO::Elf_Xword size = 0;
+            unsigned char bind = 0, type = 0, other = 0;
+            ELFIO::Elf_Half sectionIndex = 0;
+            if (!symbols.get_symbol(i, name, value, size, bind, type, sectionIndex, other))
+                continue;
+            if (name != "gRomInfo" || size < sizeof(RomInfo))
+                continue;
+
+            /* Map the symbol's address back through the loadable segments. */
+            for (const auto &segment : reader.segments)
+            {
+                if (segment->get_type() != ELFIO::PT_LOAD)
+                    continue;
+                const ELFIO::Elf64_Addr base = segment->get_virtual_address();
+                if (value < base || value - base >= segment->get_file_size())
+                    continue;
+                const char *data = segment->get_data();
+                if (!data)
+                    continue;
+                const RomInfo *romInfo =
+                    reinterpret_cast<const RomInfo *>(data + (value - base));
+                if (!isPrintableString(romInfo->revisionName, sizeof(romInfo->revisionName)))
+                    return nullptr;
+                std::snprintf(revision, sizeof(revision), "%s", romInfo->revisionName);
+                return revision;
+            }
+        }
+    }
+    return nullptr;
+}
+
 /* The Wangan titles all carry gRomInfo and clSystemN2 and differ only in the
  * revision string, so each table row tests its own prefix against this. */
-const char *wanganRevision()
+const char *wanganRevision(const char *elfPath)
 {
     RomInfo *romInfo = static_cast<RomInfo *>(n2ResolveSymbol("gRomInfo"));
     void *systemMarker = n2ResolveSymbol("_ZN10clSystemN212initSystemN2Ev");
-    if (!romInfo || !systemMarker ||
-        !isPrintableString(romInfo->revisionName, sizeof(romInfo->revisionName)))
-        return nullptr;
-    return romInfo->revisionName;
+    if (romInfo && systemMarker &&
+        isPrintableString(romInfo->revisionName, sizeof(romInfo->revisionName)))
+        return romInfo->revisionName;
+    return revisionFromElfFile(elfPath);
 }
 
 int acceptRevision(const char *revision)
@@ -163,27 +222,27 @@ int acceptRevision(const char *revision)
 }
 } // namespace
 
-extern "C" int n2Wmmt3Detect(const char *)
+extern "C" int n2Wmmt3Detect(const char *elfPath)
 {
-    const char *revision = wanganRevision();
+    const char *revision = wanganRevision(elfPath);
     return revision && std::strstr(revision, "WM3100") ? acceptRevision(revision) : 0;
 }
 
-extern "C" int n2Wmmt3dxPlusDetect(const char *)
+extern "C" int n2Wmmt3dxPlusDetect(const char *elfPath)
 {
-    const char *revision = wanganRevision();
+    const char *revision = wanganRevision(elfPath);
     return revision && std::strncmp(revision, "W3P", 3) == 0 ? acceptRevision(revision) : 0;
 }
 
-extern "C" int n2Wmmt3dxDetect(const char *)
+extern "C" int n2Wmmt3dxDetect(const char *elfPath)
 {
-    const char *revision = wanganRevision();
+    const char *revision = wanganRevision(elfPath);
     return revision && std::strncmp(revision, "W3X", 3) == 0 ? acceptRevision(revision) : 0;
 }
 
-extern "C" int n2Wmmt3FamilyDetect(const char *)
+extern "C" int n2Wmmt3FamilyDetect(const char *elfPath)
 {
-    const char *revision = wanganRevision();
+    const char *revision = wanganRevision(elfPath);
     return revision ? acceptRevision(revision) : 0;
 }
 

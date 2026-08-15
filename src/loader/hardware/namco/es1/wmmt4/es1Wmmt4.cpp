@@ -1,4 +1,5 @@
 #include "es1Wmmt4.h"
+#include "../es1Title.h"
 #include "../es1CompatLayer.h"
 #include "../es1Network.h"
 #include "es1Wmmt4Card.hpp"
@@ -20,8 +21,10 @@
 #include <cstdio>
 #include <cstddef>
 #include <cstdint>
+#include <cctype>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <vector>
 
 #include <windows.h>
@@ -701,14 +704,26 @@ extern "C" int es1Wmmt4Detect(const char *elfPath)
     /* Pacloader supplies the complete WMMT4 HASP image internally, so a clean
      * game folder needs no mt4hasp.so patch or wm4_hasp.bin marker to be
      * recognised. */
-    return elf.filename() == "WMN4r" &&
-           std::filesystem::exists(gameDir / "wangan4_exec") &&
-           std::filesystem::exists(gameDir / "wangan4_storage") &&
-           std::filesystem::exists(gameDir / "data") &&
-           (std::filesystem::exists(gameDir / "ll-deps") ||
-            std::filesystem::exists(gameDir / "libso"))
-               ? 1
-               : 0;
+    if (elf.filename() != "WMN4r" ||
+        !std::filesystem::exists(gameDir / "wangan4_exec") ||
+        !std::filesystem::exists(gameDir / "wangan4_storage") ||
+        !std::filesystem::exists(gameDir / "data") ||
+        (!std::filesystem::exists(gameDir / "ll-deps") &&
+         !std::filesystem::exists(gameDir / "libso")))
+        return 0;
+
+    /* The package names its build in `info`, and this module's address tables
+     * only hold for one of them, so record what is actually there. */
+    std::ifstream info(gameDir / "info");
+    std::string revision;
+    if (info && std::getline(info, revision))
+    {
+        while (!revision.empty() &&
+               std::isspace(static_cast<unsigned char>(revision.back())))
+            revision.pop_back();
+        es1SetDetectedRevision(revision.c_str());
+    }
+    return 1;
 }
 
 extern "C" int es1Wmmt4InstallHooks(void)

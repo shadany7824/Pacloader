@@ -49,6 +49,7 @@ char *games[] = {"a.elf",    "abc",     "apacheM.elf",   "chopperM.elf", "drive.
                  "dsr",      "gsevo",   "hod4M.elf",     "hodexRI.elf",  "hummer_Master.elf",
                  "id4.elf",  "id5.elf", "Jennifer",      "lgj_final",    "lgjsp_app",
                  "main",     "main.exe", "mj4",          "q2satl_lind",  "ramboM.elf", "vf5",
+                 "WMN4r",
                  "vsg",      "vt3",     "vt3_Lindbergh", "END"};
 
 /**

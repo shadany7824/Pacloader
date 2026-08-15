@@ -190,66 +190,6 @@ typedef enum
     NAMCO_ES1_TYPE
 } JVSIOType;
 
-typedef struct
-{
-    // Test button
-    char test[INPUT_STRING_LENGTH];
-
-    // Exit game
-    char exit_game[INPUT_STRING_LENGTH];
-
-    // Player 1 controls
-    char player1_button_start[INPUT_STRING_LENGTH];
-    char player1_button_service[INPUT_STRING_LENGTH];
-    char player1_button_up[INPUT_STRING_LENGTH];
-    char player1_button_down[INPUT_STRING_LENGTH];
-    char player1_button_left[INPUT_STRING_LENGTH];
-    char player1_button_right[INPUT_STRING_LENGTH];
-    char player1_button_1[INPUT_STRING_LENGTH];
-    char player1_button_2[INPUT_STRING_LENGTH];
-    char player1_button_3[INPUT_STRING_LENGTH];
-    char player1_button_4[INPUT_STRING_LENGTH];
-    char player1_button_5[INPUT_STRING_LENGTH];
-    char player1_button_6[INPUT_STRING_LENGTH];
-    char player1_button_7[INPUT_STRING_LENGTH];
-    char player1_button_8[INPUT_STRING_LENGTH];
-    char player1_button_9[INPUT_STRING_LENGTH];
-    char player1_button_10[INPUT_STRING_LENGTH];
-    char player1_coin[INPUT_STRING_LENGTH];
-
-    // Player 2 controls
-    char player2_button_start[INPUT_STRING_LENGTH];
-    char player2_button_service[INPUT_STRING_LENGTH];
-    char player2_button_up[INPUT_STRING_LENGTH];
-    char player2_button_down[INPUT_STRING_LENGTH];
-    char player2_button_left[INPUT_STRING_LENGTH];
-    char player2_button_right[INPUT_STRING_LENGTH];
-    char player2_button_1[INPUT_STRING_LENGTH];
-    char player2_button_2[INPUT_STRING_LENGTH];
-    char player2_button_3[INPUT_STRING_LENGTH];
-    char player2_button_4[INPUT_STRING_LENGTH];
-    char player2_button_5[INPUT_STRING_LENGTH];
-    char player2_button_6[INPUT_STRING_LENGTH];
-    char player2_button_7[INPUT_STRING_LENGTH];
-    char player2_button_8[INPUT_STRING_LENGTH];
-    char player2_button_9[INPUT_STRING_LENGTH];
-    char player2_button_10[INPUT_STRING_LENGTH];
-    char player2_coin[INPUT_STRING_LENGTH];
-
-    // Analogue inputs
-    char analogue_1[INPUT_STRING_LENGTH];
-    char analogue_2[INPUT_STRING_LENGTH];
-    char analogue_3[INPUT_STRING_LENGTH];
-    char analogue_4[INPUT_STRING_LENGTH];
-    char analogue_5[INPUT_STRING_LENGTH];
-    char analogue_6[INPUT_STRING_LENGTH];
-    char analogue_7[INPUT_STRING_LENGTH];
-    char analogue_8[INPUT_STRING_LENGTH];
-
-    int analogue_deadzone_start[8];
-    int analogue_deadzone_middle[8];
-    int analogue_deadzone_end[8];
-} ArcadeInputs;
 
 typedef struct
 {
@@ -401,19 +341,9 @@ typedef struct
     int emulateMotionboard;
     int emulateHW210CardReader;
     int emulateIDCardReader;
-    int idCardFileAutoload;
     int emulateTouchscreen;
-    char cardFile1[MAX_PATH_LENGTH];
-    char cardFile2[MAX_PATH_LENGTH];
-    char idCardFolder[MAX_PATH_LENGTH];
     int emulateJVS;
     int fullscreen;
-    char eepromPath[MAX_PATH_LENGTH];
-    char sramPath[MAX_PATH_LENGTH];
-    char libCgPath[MAX_PATH_LENGTH];
-    char jvsPath[MAX_PATH_LENGTH];
-    char serial1Path[MAX_PATH_LENGTH];
-    char serial2Path[MAX_PATH_LENGTH];
     int width;
     int height;
     int boostRenderRes;
@@ -435,7 +365,6 @@ typedef struct
     GpuType GPUVendor;
     char *GPUVendorString;
     JVSIOType jvsIOType;
-    int outrunLensGlareEnabled;
     int hummerFlickerFix;
     int keepAspectRatio;
     int fpsLimiter;
@@ -446,32 +375,12 @@ typedef struct
      * while presenting. Worth it on WMMT4, measured a regression on WMMT3. */
     int vsync;
     int lgjRenderWithMesa;
-    int ramboGunsSwitch;
-    int id5ChineseLanguage;
     float idSteeringPercentageReduction;
-    int phScreenMode;
-    int phTestScreenSingle;
     int disableBuiltinFont;
     int disableBuiltinLogos;
     int hideCursor;
     int mj4EnabledAtT;
-    int enableNetworkPatches;
-    char idIpSeat1[16];
-    char idIpSeat2[16];
-    char nicName[20];
-    char or2IP[16];
-    char or2Netmask[16];
-    char IpCab1[16];
-    char IpCab2[16];
-    char IpCab3[16];
-    char IpCab4[16];
-    char tooSpicyIpCab1[16];
-    char tooSpicyIpCab2[16];
-    char srtvIP[16];
-    float cpuFreqGhz;
-    ArcadeInputs arcadeInputs;
     int inputMode; // 0 = both, 1 = SDL, 2 = EVDEV only
-    int skipOutrunCabinetCheck;
     float whiteBorderPercentage;
     float blackBorderPercentage;
     int borderEnabled;

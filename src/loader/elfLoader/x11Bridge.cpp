@@ -430,6 +430,7 @@ extern "C" int bridgeXPutImage(void *display, ...)
 extern "C" int bridgeXRaiseWindow(void *display, ...)
 {
     (void)display;
+    log_debug("X11: XRaiseWindow");
     raiseSDLWindow();
     return 0;
 }

@@ -216,19 +216,9 @@ void setDefaultValues(EmulatorConfig *cfg)
     cfg->emulateMotionboard = 0;
     cfg->emulateHW210CardReader = 0;
     cfg->emulateIDCardReader = 0;
-    cfg->idCardFileAutoload = 1;
     cfg->emulateTouchscreen = 0;
-    strcpy(cfg->cardFile1, "Card_01.crd");
-    strcpy(cfg->cardFile2, "Card_02.crd");
-    strcpy(cfg->idCardFolder, "");
     cfg->emulateJVS = 1;
     cfg->fullscreen = 0;
-    strcpy(cfg->eepromPath, "eeprom.bin");
-    strcpy(cfg->sramPath, "sram.bin");
-    strcpy(cfg->libCgPath, "");
-    strcpy(cfg->jvsPath, "/dev/ttyUSB0");
-    strcpy(cfg->serial1Path, "/dev/ttyS0");
-    strcpy(cfg->serial2Path, "/dev/ttyS1");
     cfg->width = 640;
     cfg->height = 480;
     cfg->boostRenderRes = 1;
@@ -238,9 +228,6 @@ void setDefaultValues(EmulatorConfig *cfg)
     cfg->useAltJvsPassthrough = 0;
     cfg->hummerFlickerFix = 0;
     cfg->keepAspectRatio = 1;
-    cfg->outrunLensGlareEnabled = 1;
-    cfg->ramboGunsSwitch = 0;
-    cfg->id5ChineseLanguage = 0;
     cfg->idSteeringPercentageReduction = 0.0f;
     cfg->lgjRenderWithMesa = 1;
     cfg->gameTitle = "Unknown game";
@@ -254,30 +241,12 @@ void setDefaultValues(EmulatorConfig *cfg)
     cfg->fpsLimiter = 1;
     cfg->fpsTarget = 60.0f;
     cfg->vsync = 0;
-    cfg->phScreenMode = 2;
-    cfg->phTestScreenSingle = 1;
     cfg->disableBuiltinFont = 0;
     cfg->disableBuiltinLogos = 0;
     cfg->hideCursor = 1;
     cfg->mj4EnabledAtT = 0;
-    cfg->enableNetworkPatches = 1;
-    strcpy(cfg->idIpSeat1, "");
-    strcpy(cfg->idIpSeat2, "");
-    strcpy(cfg->nicName, "");
-    strcpy(cfg->or2IP, "");
-    strcpy(cfg->or2Netmask, "");
-    strcpy(cfg->IpCab1, "");
-    strcpy(cfg->IpCab2, "");
-    strcpy(cfg->IpCab3, "");
-    strcpy(cfg->IpCab4, "");
-    strcpy(cfg->tooSpicyIpCab1, "");
-    strcpy(cfg->tooSpicyIpCab2, "");
-    strcpy(cfg->srtvIP, "");
-    cfg->cpuFreqGhz = 0.0f;
-    memset(&cfg->arcadeInputs, 0, sizeof(cfg->arcadeInputs));
     cfg->crc32 = 0;
     cfg->gameGroup = GROUP_UNKNOWN;
-    cfg->skipOutrunCabinetCheck = 0;
     cfg->borderEnabled = 0;
     cfg->whiteBorderPercentage = 0.02f;
     cfg->blackBorderPercentage = 0.0f;
@@ -581,7 +550,6 @@ void applyIniConfig(EmulatorConfig *config, const IniConfig *ini)
     config->keepAspectRatio = getInt(ini, "Display", "KEEP_ASPECT_RATIO", config->keepAspectRatio);
     config->hideCursor = getInt(ini, "Display", "HIDE_CURSOR", config->hideCursor);
 
-    // [Input]
     config->inputMode = getInt(ini, "Input", "INPUT_MODE", config->inputMode);
 
     // [Emulation]
@@ -606,19 +574,7 @@ void applyIniConfig(EmulatorConfig *config, const IniConfig *ini)
     config->emulateIDCardReader = getInt(ini, "Emulation", "EMULATE_ID_CARDREADER", config->emulateIDCardReader);
     config->emulateTouchscreen = getInt(ini, "Emulation", "EMULATE_TOUCHSCREEN", config->emulateTouchscreen);
 
-    // [Cards]
-    config->idCardFileAutoload = getInt(ini, "Cards", "ID_CARDFILE_AUTOLOAD", config->idCardFileAutoload);
-    getString(ini, "Cards", "CARDFILE_01", config->cardFile1, MAX_PATH_LENGTH);
-    getString(ini, "Cards", "CARDFILE_02", config->cardFile2, MAX_PATH_LENGTH);
-    getString(ini, "Cards", "ID_CARDFOLDER", config->idCardFolder, MAX_PATH_LENGTH);
 
-    // [Paths]
-    getString(ini, "Paths", "JVS_PATH", config->jvsPath, MAX_PATH_LENGTH);
-    getString(ini, "Paths", "SERIAL_1_PATH", config->serial1Path, MAX_PATH_LENGTH);
-    getString(ini, "Paths", "SERIAL_2_PATH", config->serial2Path, MAX_PATH_LENGTH);
-    getString(ini, "Paths", "SRAM_PATH", config->sramPath, MAX_PATH_LENGTH);
-    getString(ini, "Paths", "EEPROM_PATH", config->eepromPath, MAX_PATH_LENGTH);
-    getString(ini, "Paths", "LIBCG_PATH", config->libCgPath, MAX_PATH_LENGTH);
 
     // [Graphics]
     config->hummerFlickerFix = getInt(ini, "Graphics", "HUMMER_FLICKER_FIX", config->hummerFlickerFix);
@@ -629,94 +585,15 @@ void applyIniConfig(EmulatorConfig *config, const IniConfig *ini)
     config->disableBuiltinFont = getInt(ini, "Graphics", "DISABLE_BUILTIN_FONT", config->disableBuiltinFont);
     config->disableBuiltinLogos = getInt(ini, "Graphics", "DISABLE_BUILTIN_LOGOS", config->disableBuiltinLogos);
 
-    // [GameSpecific]
-    config->phScreenMode = getInt(ini, "GameSpecific", "PRIMEVAL_HUNT_SCREEN_MODE", config->phScreenMode);
-    config->phTestScreenSingle = getInt(ini, "GameSpecific", "PRIMEVAL_HUNT_TEST_SCREEN_SINGLE", config->phTestScreenSingle);
-    config->skipOutrunCabinetCheck = getInt(ini, "GameSpecific", "SKIP_OUTRUN_CABINET_CHECK", config->skipOutrunCabinetCheck);
     config->mj4EnabledAtT = getInt(ini, "GameSpecific", "MJ4_ENABLED_ALL_THE_TIME", config->mj4EnabledAtT);
-    config->cpuFreqGhz = getFloat(ini, "GameSpecific", "CPU_FREQ_GHZ", config->cpuFreqGhz);
-    config->ramboGunsSwitch = getInt(ini, "GameSpecific", "RAMBO_GUNS_SWITCH", config->ramboGunsSwitch);
-    config->id5ChineseLanguage = getInt(ini, "GameSpecific", "ID5_CHINESE_LANGUAGE", config->id5ChineseLanguage);
     config->idSteeringPercentageReduction =
         getFloat(ini, "GameSpecific", "ID_STEERING_REDUCTION_PERCENTAGE", config->idSteeringPercentageReduction);
-    config->outrunLensGlareEnabled = getInt(ini, "GameSpecific", "OUTRUN_LENS_GLARE_ENABLED", config->outrunLensGlareEnabled);
 
     config->showDebugMessages = getInt(ini, "System", "DEBUG_MSGS", config->showDebugMessages);
     config->useAltJvsPassthrough = getInt(ini, "System", "USE_ALT_JVS_PASSTHROUGH", config->useAltJvsPassthrough);
-    // [Network]
-    config->enableNetworkPatches = getInt(ini, "Network", "ENABLE_NETWORK_PATCHES", config->enableNetworkPatches);
-    getString(ini, "Network", "ID_IP_SEAT_1", config->idIpSeat1, 16);
-    getString(ini, "Network", "ID_IP_SEAT_2", config->idIpSeat2, 16);
-    getString(ini, "Network", "NIC_NAME", config->nicName, 20);
-    getString(ini, "Network", "OR2_IPADDRESS", config->or2IP, 16);
-    getString(ini, "Network", "OR2_NETMASK", config->or2Netmask, 16);
-    getString(ini, "Network", "IP_CAB1", config->IpCab1, 16);
-    getString(ini, "Network", "IP_CAB2", config->IpCab2, 16);
-    getString(ini, "Network", "IP_CAB3", config->IpCab3, 16);
-    getString(ini, "Network", "IP_CAB4", config->IpCab4, 16);
-    getString(ini, "Network", "2SPICY_IP_CAB1", config->tooSpicyIpCab1, 16);
-    getString(ini, "Network", "2SPICY_IP_CAB2", config->tooSpicyIpCab2, 16);
-    getString(ini, "Network", "SRTV_IPADDRESS", config->srtvIP, 16);
 
-    // [EVDEV]
-    getString(ini, "EVDEV", "TEST_BUTTON", config->arcadeInputs.test, INPUT_STRING_LENGTH);
-    getString(ini, "EVDEV", "EXIT_GAME", config->arcadeInputs.exit_game, INPUT_STRING_LENGTH);
-    getString(ini, "EVDEV", "PLAYER_1_COIN", config->arcadeInputs.player1_coin, INPUT_STRING_LENGTH);
-    getString(ini, "EVDEV", "PLAYER_1_BUTTON_START", config->arcadeInputs.player1_button_start, INPUT_STRING_LENGTH);
-    getString(ini, "EVDEV", "PLAYER_1_BUTTON_SERVICE", config->arcadeInputs.player1_button_service, INPUT_STRING_LENGTH);
-    getString(ini, "EVDEV", "PLAYER_1_BUTTON_UP", config->arcadeInputs.player1_button_up, INPUT_STRING_LENGTH);
-    getString(ini, "EVDEV", "PLAYER_1_BUTTON_DOWN", config->arcadeInputs.player1_button_down, INPUT_STRING_LENGTH);
-    getString(ini, "EVDEV", "PLAYER_1_BUTTON_LEFT", config->arcadeInputs.player1_button_left, INPUT_STRING_LENGTH);
-    getString(ini, "EVDEV", "PLAYER_1_BUTTON_RIGHT", config->arcadeInputs.player1_button_right, INPUT_STRING_LENGTH);
-    getString(ini, "EVDEV", "PLAYER_1_BUTTON_1", config->arcadeInputs.player1_button_1, INPUT_STRING_LENGTH);
-    getString(ini, "EVDEV", "PLAYER_1_BUTTON_2", config->arcadeInputs.player1_button_2, INPUT_STRING_LENGTH);
-    getString(ini, "EVDEV", "PLAYER_1_BUTTON_3", config->arcadeInputs.player1_button_3, INPUT_STRING_LENGTH);
-    getString(ini, "EVDEV", "PLAYER_1_BUTTON_4", config->arcadeInputs.player1_button_4, INPUT_STRING_LENGTH);
-    getString(ini, "EVDEV", "PLAYER_1_BUTTON_5", config->arcadeInputs.player1_button_5, INPUT_STRING_LENGTH);
-    getString(ini, "EVDEV", "PLAYER_1_BUTTON_6", config->arcadeInputs.player1_button_6, INPUT_STRING_LENGTH);
-    getString(ini, "EVDEV", "PLAYER_1_BUTTON_7", config->arcadeInputs.player1_button_7, INPUT_STRING_LENGTH);
-    getString(ini, "EVDEV", "PLAYER_1_BUTTON_8", config->arcadeInputs.player1_button_8, INPUT_STRING_LENGTH);
-    getString(ini, "EVDEV", "PLAYER_2_COIN", config->arcadeInputs.player2_coin, INPUT_STRING_LENGTH);
-    getString(ini, "EVDEV", "PLAYER_2_BUTTON_START", config->arcadeInputs.player2_button_start, INPUT_STRING_LENGTH);
-    getString(ini, "EVDEV", "PLAYER_2_BUTTON_SERVICE", config->arcadeInputs.player2_button_service, INPUT_STRING_LENGTH);
-    getString(ini, "EVDEV", "PLAYER_2_BUTTON_UP", config->arcadeInputs.player2_button_up, INPUT_STRING_LENGTH);
-    getString(ini, "EVDEV", "PLAYER_2_BUTTON_DOWN", config->arcadeInputs.player2_button_down, INPUT_STRING_LENGTH);
-    getString(ini, "EVDEV", "PLAYER_2_BUTTON_LEFT", config->arcadeInputs.player2_button_left, INPUT_STRING_LENGTH);
-    getString(ini, "EVDEV", "PLAYER_2_BUTTON_RIGHT", config->arcadeInputs.player2_button_right, INPUT_STRING_LENGTH);
-    getString(ini, "EVDEV", "PLAYER_2_BUTTON_1", config->arcadeInputs.player2_button_1, INPUT_STRING_LENGTH);
-    getString(ini, "EVDEV", "PLAYER_2_BUTTON_2", config->arcadeInputs.player2_button_2, INPUT_STRING_LENGTH);
-    getString(ini, "EVDEV", "PLAYER_2_BUTTON_3", config->arcadeInputs.player2_button_3, INPUT_STRING_LENGTH);
-    getString(ini, "EVDEV", "PLAYER_2_BUTTON_4", config->arcadeInputs.player2_button_4, INPUT_STRING_LENGTH);
-    getString(ini, "EVDEV", "PLAYER_2_BUTTON_5", config->arcadeInputs.player2_button_5, INPUT_STRING_LENGTH);
-    getString(ini, "EVDEV", "PLAYER_2_BUTTON_6", config->arcadeInputs.player2_button_6, INPUT_STRING_LENGTH);
-    getString(ini, "EVDEV", "PLAYER_2_BUTTON_7", config->arcadeInputs.player2_button_7, INPUT_STRING_LENGTH);
-    getString(ini, "EVDEV", "PLAYER_2_BUTTON_8", config->arcadeInputs.player2_button_8, INPUT_STRING_LENGTH);
 
-    getString(ini, "EVDEV", "ANALOGUE_1", config->arcadeInputs.analogue_1, INPUT_STRING_LENGTH);
-    getString(ini, "EVDEV", "ANALOGUE_2", config->arcadeInputs.analogue_2, INPUT_STRING_LENGTH);
-    getString(ini, "EVDEV", "ANALOGUE_3", config->arcadeInputs.analogue_3, INPUT_STRING_LENGTH);
-    getString(ini, "EVDEV", "ANALOGUE_4", config->arcadeInputs.analogue_4, INPUT_STRING_LENGTH);
-    getString(ini, "EVDEV", "ANALOGUE_5", config->arcadeInputs.analogue_5, INPUT_STRING_LENGTH);
-    getString(ini, "EVDEV", "ANALOGUE_6", config->arcadeInputs.analogue_6, INPUT_STRING_LENGTH);
-    getString(ini, "EVDEV", "ANALOGUE_7", config->arcadeInputs.analogue_7, INPUT_STRING_LENGTH);
-    getString(ini, "EVDEV", "ANALOGUE_8", config->arcadeInputs.analogue_8, INPUT_STRING_LENGTH);
 
-    for (int i = 0; i < 8; i++)
-    {
-        char key[32];
-        sprintf(key, "ANALOGUE_DEADZONE_%d", i + 1);
-        const char *rawDz = getValue(ini, "EVDEV", key);
-        if (rawDz)
-        {
-            char cleanBuffer[64];
-            char *dzStr = cleanValue(rawDz, cleanBuffer, sizeof(cleanBuffer));
-            if (dzStr)
-            {
-                sscanf(dzStr, "%d %d %d", &config->arcadeInputs.analogue_deadzone_start[i],
-                       &config->arcadeInputs.analogue_deadzone_middle[i], &config->arcadeInputs.analogue_deadzone_end[i]);
-            }
-        }
-    }
 }
 
 int initConfig(const char *configFilePath)
