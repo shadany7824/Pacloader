@@ -1,5 +1,6 @@
 #include <stdint.h>
 #include <stdlib.h>
+#include <math.h>
 
 #if defined(_WIN32) || defined(__MINGW32__)
 #include <windows.h>
@@ -12,6 +13,7 @@
 #endif
 
 #include "../config/config.h"
+#include "../log/log.h"
 #include "fpsLimiter.h"
 #include "../diagnostics/perfProfiler.hpp"
 
@@ -21,16 +23,16 @@ double fps = 0.0;
 
 static int g_fpsLimiterEnabled = 0;
 static double g_targetFps = 60.0;
+/* The display paces the swap, so the limiter must not pace it as well. */
+static int g_vsyncPresents = 0;
 
 #if defined(_WIN32) || defined(__MINGW32__)
 static LARGE_INTEGER g_qpcFrequency;
 static LONGLONG g_qpcStart = 0;
 
-/* WMMT4 waits for retrace on one thread and presents on another. A TLS flag
- * cannot reach the presentation thread, so it performs a second 60 Hz wait.
- * Keep one cross-thread token for the single render/present pipeline. */
-static volatile LONG g_videoSyncWaited = 0;
-static volatile LONGLONG g_lastVideoSyncWait = 0;
+/* Per-thread: WMMT4 waits for retrace on one thread and presents on another, and
+ * a shared token let the first excuse the second from pacing altogether. */
+static __thread int t_videoSyncWaited = 0;
 
 static LONGLONG qpcNow(void)
 {
@@ -38,6 +40,147 @@ static LONGLONG qpcNow(void)
     QueryPerformanceCounter(&now);
     return now.QuadPart;
 }
+
+/* The retrace clock the cabinet had: a thread counts real vertical blanks, so the
+ * guest's simulation and the scanout share one clock instead of beating. */
+typedef struct
+{
+    UINT hAdapter;
+    UINT hDevice;
+    UINT vidPnSourceId;
+} LlVerticalBlankRequest;
+
+typedef struct
+{
+    WCHAR deviceName[32];
+    UINT hAdapter;
+    LUID adapterLuid;
+    UINT vidPnSourceId;
+} LlOpenAdapterRequest;
+
+typedef LONG(WINAPI *LlOpenAdapterFn)(LlOpenAdapterRequest *);
+typedef LONG(WINAPI *LlWaitForVerticalBlankFn)(const LlVerticalBlankRequest *);
+
+static CRITICAL_SECTION g_vblankLock;
+static CONDITION_VARIABLE g_vblankSignal;
+static uint64_t g_vblankCount = 0;
+static int g_vblankClockActive = 0;
+static volatile LONG g_vblankStop = 0;
+static HANDLE g_vblankThread = NULL;
+static void *g_vblankWindow = NULL;
+static LlWaitForVerticalBlankFn g_waitForVerticalBlank = NULL;
+static LlVerticalBlankRequest g_vblankRequest;
+static unsigned g_vblankDivisor = 1;
+
+static DWORD WINAPI vblankThreadProc(void *unused)
+{
+    (void)unused;
+    unsigned raw = 0;
+    while (!InterlockedCompareExchange(&g_vblankStop, 0, 0))
+    {
+        /* Failure is permanent in practice; stop counting and let waiters fall back. */
+        if (g_waitForVerticalBlank(&g_vblankRequest) < 0)
+            break;
+
+        if (++raw < g_vblankDivisor)
+            continue;
+        raw = 0;
+
+        EnterCriticalSection(&g_vblankLock);
+        ++g_vblankCount;
+        LeaveCriticalSection(&g_vblankLock);
+        WakeAllConditionVariable(&g_vblankSignal);
+    }
+
+    EnterCriticalSection(&g_vblankLock);
+    g_vblankClockActive = 0;
+    LeaveCriticalSection(&g_vblankLock);
+    WakeAllConditionVariable(&g_vblankSignal);
+    return 0;
+}
+
+static int startVerticalBlankClock(void);
+
+void setVideoSyncWindow(void *window)
+{
+    g_vblankWindow = window;
+    /* Starts here, not in initFpsLimiter(): it needs the window's monitor. */
+    if (g_vsyncPresents && !g_vblankClockActive)
+        startVerticalBlankClock();
+}
+
+/* Returns non-zero when the display clock took over from the grid. */
+static int startVerticalBlankClock(void)
+{
+    if (!g_vblankWindow)
+        return 0;
+
+    HMODULE gdi = GetModuleHandleW(L"gdi32.dll");
+    if (!gdi)
+        return 0;
+
+    LlOpenAdapterFn openAdapter =
+        (LlOpenAdapterFn)(void *)GetProcAddress(gdi, "D3DKMTOpenAdapterFromGdiDisplayName");
+    g_waitForVerticalBlank =
+        (LlWaitForVerticalBlankFn)(void *)GetProcAddress(gdi, "D3DKMTWaitForVerticalBlankEvent");
+    if (!openAdapter || !g_waitForVerticalBlank)
+        return 0;
+
+    /* The window's monitor, not the primary: they can run at different rates. */
+    HMONITOR monitor = MonitorFromWindow((HWND)g_vblankWindow, MONITOR_DEFAULTTOPRIMARY);
+    MONITORINFOEXW monitorInfo;
+    ZeroMemory(&monitorInfo, sizeof(monitorInfo));
+    monitorInfo.cbSize = sizeof(monitorInfo);
+    if (!GetMonitorInfoW(monitor, (LPMONITORINFO)&monitorInfo))
+        return 0;
+
+    DEVMODEW mode;
+    ZeroMemory(&mode, sizeof(mode));
+    mode.dmSize = sizeof(mode);
+    if (!EnumDisplaySettingsW(monitorInfo.szDevice, ENUM_CURRENT_SETTINGS, &mode) ||
+        mode.dmDisplayFrequency == 0)
+        return 0;
+
+    const double refresh = (double)mode.dmDisplayFrequency;
+    const long divisor = lround(refresh / g_targetFps);
+    if (divisor < 1 || fabs(refresh / (double)divisor - g_targetFps) > 1.0)
+    {
+        log_warn("Vertical blank clock: %ls runs at %.0f Hz, which is not a multiple of "
+                 "the %.2f Hz target; keeping the QPC grid",
+                 monitorInfo.szDevice, refresh, g_targetFps);
+        return 0;
+    }
+    g_vblankDivisor = (unsigned)divisor;
+
+    LlOpenAdapterRequest request;
+    ZeroMemory(&request, sizeof(request));
+    wcsncpy(request.deviceName, monitorInfo.szDevice,
+            sizeof(request.deviceName) / sizeof(request.deviceName[0]) - 1);
+    if (openAdapter(&request) < 0)
+        return 0;
+
+    ZeroMemory(&g_vblankRequest, sizeof(g_vblankRequest));
+    g_vblankRequest.hAdapter = request.hAdapter;
+    g_vblankRequest.vidPnSourceId = request.vidPnSourceId;
+
+    InterlockedExchange(&g_vblankStop, 0);
+    g_vblankCount = 0;
+    g_vblankClockActive = 1;
+    g_vblankThread = CreateThread(NULL, 0, vblankThreadProc, NULL, 0, NULL);
+    if (!g_vblankThread)
+    {
+        g_vblankClockActive = 0;
+        return 0;
+    }
+
+    log_warn("Vertical blank clock: %ls at %.0f Hz, %.2f Hz target, counting every %u blank",
+             monitorInfo.szDevice, refresh, g_targetFps, g_vblankDivisor);
+    return 1;
+}
+
+/* Do not infer vertical blanks from completed swaps: a present-driven counter
+ * deadlocks on loading screens, and patching that with QPC extrapolation
+ * measured 2.6 presents a second against 48.9. Count real blanks above. */
 
 static LONGLONG qpcDeadline(uint64_t frameIndex)
 {
@@ -53,7 +196,9 @@ static LONGLONG qpcDeadline(uint64_t frameIndex)
 #define DefaultSpinMarginMicroseconds 100
 static LONGLONG g_spinMarginMicroseconds = DefaultSpinMarginMicroseconds;
 
-/* Optional late-present window; disabled unless LL_PACE_GRACE_MS is set. */
+/* How late a frame may still present. Measured worse than holding to the grid -
+ * a released present keeps its shifted phase and the error accumulates. */
+#define DefaultPaceGraceMilliseconds 0.0
 static LONGLONG paceGraceTicks(void)
 {
     static int resolved = 0;
@@ -62,12 +207,12 @@ static LONGLONG paceGraceTicks(void)
     if (!resolved)
     {
         resolved = 1;
-        long milliseconds = 0;
+        double milliseconds = DefaultPaceGraceMilliseconds;
         const char *setting = getenv("LL_PACE_GRACE_MS");
         if (setting && *setting)
         {
-            const long value = strtol(setting, NULL, 10);
-            if (value >= 0)
+            const double value = strtod(setting, NULL);
+            if (value >= 0.0)
                 milliseconds = value;
         }
         ticks = (LONGLONG)(((long double)g_qpcFrequency.QuadPart * milliseconds) / 1000.0L);
@@ -139,12 +284,12 @@ static void waitUntilQpc(LONGLONG deadline)
 void initFpsLimiter(void)
 {
     g_fpsLimiterEnabled = getConfig()->fpsLimiter == 1;
+    g_vsyncPresents = g_fpsLimiterEnabled && getConfig()->vsync != 0;
     g_targetFps = getConfig()->fpsTarget > 0.0f ? getConfig()->fpsTarget : 60.0;
     lastTime = 0.0;
     frameCount = 0;
     fps = 0.0;
-    InterlockedExchange(&g_videoSyncWaited, 0);
-    InterlockedExchange64(&g_lastVideoSyncWait, 0);
+    t_videoSyncWaited = 0;
 
     if (!g_fpsLimiterEnabled)
         return;
@@ -161,6 +306,14 @@ void initFpsLimiter(void)
 
     QueryPerformanceFrequency(&g_qpcFrequency);
     g_qpcStart = qpcNow();
+
+    static int vblankLockReady = 0;
+    if (!vblankLockReady)
+    {
+        vblankLockReady = 1;
+        InitializeCriticalSection(&g_vblankLock);
+        InitializeConditionVariable(&g_vblankSignal);
+    }
 
     /* Use the high-resolution wait when the host provides it. */
     if (!g_coarseSleepIsTimer)
@@ -180,11 +333,6 @@ void initFpsLimiter(void)
         }
     }
 #endif
-}
-
-double getTimeInMilliseconds(void)
-{
-    return (double)clockNow() / 1000.0;
 }
 
 double getTimeInSeconds(void)
@@ -239,6 +387,15 @@ uint64_t videoSyncCount(void)
 #if defined(_WIN32) || defined(__MINGW32__)
     if (g_qpcFrequency.QuadPart == 0)
         return 0;
+
+    if (g_vblankClockActive)
+    {
+        EnterCriticalSection(&g_vblankLock);
+        const uint64_t count = g_vblankCount;
+        LeaveCriticalSection(&g_vblankLock);
+        return count;
+    }
+
     const LONGLONG elapsed = qpcNow() - g_qpcStart;
     if (elapsed <= 0)
         return 0;
@@ -254,31 +411,38 @@ void waitVideoSync(uint64_t index)
 #if defined(_WIN32) || defined(__MINGW32__)
     if (g_qpcFrequency.QuadPart == 0)
         return;
+
+    if (g_vblankClockActive)
+    {
+        EnterCriticalSection(&g_vblankLock);
+        /* Timed: a clock that stops must cost a late frame, not a hung guest. */
+        while (g_vblankClockActive && g_vblankCount < index)
+            SleepConditionVariableCS(&g_vblankSignal, &g_vblankLock, 50);
+        const int served = g_vblankClockActive;
+        LeaveCriticalSection(&g_vblankLock);
+        if (served)
+        {
+            t_videoSyncWaited = 1;
+            return;
+        }
+    }
+
     waitUntilQpc(qpcDeadline(index));
-    InterlockedExchange64(&g_lastVideoSyncWait, qpcNow());
-    InterlockedExchange(&g_videoSyncWaited, 1);
 #else
     (void)index;
-    g_videoSyncWaited = 1;
 #endif
-}
-
-int guestVideoSyncRecentlyActive(void)
-{
-#if defined(_WIN32) || defined(__MINGW32__)
-    const LONGLONG last = InterlockedCompareExchange64(&g_lastVideoSyncWait, 0, 0);
-    if (last == 0 || g_qpcFrequency.QuadPart == 0)
-        return 0;
-    return qpcNow() - last <= g_qpcFrequency.QuadPart / 4;
-#else
-    return 0;
-#endif
+    t_videoSyncWaited = 1;
 }
 
 int consumeVideoSyncWait(void)
 {
-    return InterlockedExchange(&g_videoSyncWaited, 0) != 0;
+    const int waited = t_videoSyncWaited;
+    t_videoSyncWaited = 0;
+    return waited;
 }
+
+/* Subtracting the swap cost from the deadline so the swap finishes on the slot
+ * was measured worse (p95 18.5 -> 20.1 ms): it unpins the present from the grid. */
 
 void frameTiming(void)
 {
@@ -290,16 +454,15 @@ void frameTiming(void)
     }
 
 #if defined(_WIN32) || defined(__MINGW32__)
-    /* WMMT4 has its own retrace wait on the render thread. Once that path is
-     * active, pacing the presentation thread again only creates intermittent
-     * 5-12 ms bubbles when the cross-thread token arrives late. */
-    if (guestVideoSyncRecentlyActive())
+    /* The swap already blocks on the scanout; pacing here too stacks two waits. */
+    if (g_vsyncPresents)
     {
         consumeVideoSyncWait();
         PerfProfiler_End("Frame", "frameTiming", profileStart, 0);
         return;
     }
-    /* A thread that already waited for its slot can present immediately. */
+
+    /* Any thread that did not wait for its own slot still has to be paced. */
     if (consumeVideoSyncWait())
     {
         PerfProfiler_End("Frame", "frameTiming", profileStart, 0);
@@ -317,12 +480,6 @@ void frameTiming(void)
     waitUntilQpc(qpcDeadline(passed + 1));
     PerfProfiler_End("Frame", "frameTiming", profileStart, 0);
 #else
-    if (guestVideoSyncRecentlyActive())
-    {
-        consumeVideoSyncWait();
-        PerfProfiler_End("Frame", "frameTiming", profileStart, 0);
-        return;
-    }
     if (consumeVideoSyncWait())
     {
         PerfProfiler_End("Frame", "frameTiming", profileStart, 0);
@@ -352,10 +509,3 @@ void frameTiming(void)
 #endif
 }
 
-/* Kept as a compatibility entry point for existing callers. The new limiter
- * is deadline-based, so per-frame state is maintained internally. */
-void fpsLimiter(FpsLimit *stats)
-{
-    (void)stats;
-    frameTiming();
-}

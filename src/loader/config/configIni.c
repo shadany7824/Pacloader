@@ -128,8 +128,9 @@ int createDefaultIni(const char *filePath)
     fprintf(file, "HIDE_CURSOR = %s\n\n", defaults.hideCursor ? "true" : "false");
 
     fprintf(file, "[Emulation]\nREGION = JP\nFREEPLAY = none\nEMULATE_JVS = true\nEMULATE_TOUCHSCREEN = false\n\n");
-    fprintf(file, "[Graphics]\nFPS_LIMITER_ENABLED = %s\nFPS_TARGET = %.1f\n\n",
-            defaults.fpsLimiter ? "true" : "false", defaults.fpsTarget);
+    fprintf(file, "[Graphics]\nFPS_LIMITER_ENABLED = %s\nFPS_TARGET = %.1f\nVSYNC = %s\n\n",
+            defaults.fpsLimiter ? "true" : "false", defaults.fpsTarget,
+            defaults.vsync ? "true" : "false");
     fprintf(file, "[System]\nDEBUG_MSGS = %s\n",
             defaults.showDebugMessages ? "true" : "false");
 

@@ -253,6 +253,7 @@ void setDefaultValues(EmulatorConfig *cfg)
     cfg->GPUVendor = AUTO_DETECT_GPU;
     cfg->fpsLimiter = 1;
     cfg->fpsTarget = 60.0f;
+    cfg->vsync = 1;
     cfg->phScreenMode = 2;
     cfg->phTestScreenSingle = 1;
     cfg->disableBuiltinFont = 0;
@@ -623,6 +624,7 @@ void applyIniConfig(EmulatorConfig *config, const IniConfig *ini)
     config->hummerFlickerFix = getInt(ini, "Graphics", "HUMMER_FLICKER_FIX", config->hummerFlickerFix);
     config->fpsLimiter = getInt(ini, "Graphics", "FPS_LIMITER_ENABLED", config->fpsLimiter);
     config->fpsTarget = getFloat(ini, "Graphics", "FPS_TARGET", config->fpsTarget);
+    config->vsync = getInt(ini, "Graphics", "VSYNC", config->vsync);
     config->lgjRenderWithMesa = getInt(ini, "Graphics", "LGJ_RENDER_WITH_MESA", config->lgjRenderWithMesa);
     config->disableBuiltinFont = getInt(ini, "Graphics", "DISABLE_BUILTIN_FONT", config->disableBuiltinFont);
     config->disableBuiltinLogos = getInt(ini, "Graphics", "DISABLE_BUILTIN_LOGOS", config->disableBuiltinLogos);

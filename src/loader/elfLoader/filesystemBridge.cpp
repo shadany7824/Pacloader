@@ -34,8 +34,6 @@ void forgetDescriptor(int fd);
 
 #define MAP(name, func) SymbolResolver::GetInstance().RegisterVTable(name, reinterpret_cast<void *>(func))
 
-static char g_dlErrorBuf[256];
-
 namespace FileSystemBridge
 {
     static int bridgeOpenDescriptor(const char *path, int flags, ...)

@@ -440,6 +440,9 @@ typedef struct
     int keepAspectRatio;
     int fpsLimiter;
     float fpsTarget;
+    /* Present on the display's refresh instead of the limiter's QPC grid.
+     * Off means the grid alone decides when to present, which tears. */
+    int vsync;
     int lgjRenderWithMesa;
     int ramboGunsSwitch;
     int id5ChineseLanguage;

@@ -29,6 +29,7 @@ extern void bridgeX11PumpInput(void);
 #endif
 #include "../log/log.h"
 #include "sdlCalls.h"
+#include "../elfLoader/glHooks.hpp"
 #include "../diagnostics/perfProfiler.hpp"
 
 extern uint32_t gId;
@@ -110,6 +111,18 @@ static void disableWindowGhosting(void)
     if (disableGhosting)
         disableGhosting();
 #endif
+}
+
+/* The GL hooks must never ask SDL for this: they run on the render threads. */
+void publishDrawableSize(void)
+{
+    if (!g_SdlWindow)
+        return;
+
+    int drawableWidth = 0;
+    int drawableHeight = 0;
+    SDL_GetWindowSizeInPixels(g_SdlWindow, &drawableWidth, &drawableHeight);
+    GLHooks_SetDrawableSize(drawableWidth, drawableHeight);
 }
 
 void keepWindowResponsive(void)
@@ -233,10 +246,11 @@ void startSDL()
         exit(EXIT_FAILURE);
     }
 
-    /* The QPC limiter below is the presentation clock when enabled. Do not
-     * let SDL's swap interval add a second, refresh-driven wait. */
-    if (getConfig()->fpsLimiter && !SDL_GL_SetSwapInterval(0))
-        log_warn("Failed to disable OpenGL VSync while FPS limiter is enabled: %s", SDL_GetError());
+    /* Off: the QPC grid alone decides when to present, which tears. On: the
+     * display paces the swap and the limiter stands aside, see frameTiming(). */
+    if (getConfig()->fpsLimiter && !setSDLSwapInterval(getConfig()->vsync ? 1 : 0))
+        log_warn("Failed to set OpenGL swap interval to %d: %s",
+                 getConfig()->vsync ? 1 : 0, SDL_GetError());
 
     if (!gladLoadGL((GLADloadfunc)SDL_GL_GetProcAddress))
     {
@@ -282,6 +296,9 @@ void startSDL()
 
     SDL_ShowWindow(g_SdlWindow);
     raiseSDLWindow();
+    publishDrawableSize();
+    setVideoSyncWindow(SDL_GetPointerProperty(SDL_GetWindowProperties(g_SdlWindow),
+                                              SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL));
     if (gGrp == GROUP_WMMT4_ES1 && !getConfig()->fullscreen)
     {
         void *nativeWindow = SDL_GetPointerProperty(
@@ -496,6 +513,7 @@ void pollEvents()
                                 isFullScreen = false;
                                 if (getConfig()->fullscreen)
                                     SDL_SetWindowBordered(g_SdlWindow, true);
+                                publishDrawableSize();
                             }
                         }
                         else
@@ -507,6 +525,7 @@ void pollEvents()
                             else
                             {
                                 isFullScreen = true;
+                                publishDrawableSize();
                             }
                         }
                         break;

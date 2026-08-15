@@ -2,30 +2,20 @@
 
 #include <stdint.h>
 
-/* Retained for source compatibility with older callers. Frame pacing state
- * is now kept internally by fpsLimiter.c and scheduled against QPC deadlines. */
-typedef struct
-{
-    long targetFrameTime;
-    long frameStart;
-    long frameEnd;
-    long sleepTime;
-    long frameOverhead;
-} FpsLimit;
-
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 void initFpsLimiter(void);
 int64_t clockNow(void);
-void fpsLimiter(FpsLimit *stats);
 double calculateFps(void);
 void frameTiming(void);
 uint64_t videoSyncCount(void);
 void waitVideoSync(uint64_t index);
 int consumeVideoSyncWait(void);
-int guestVideoSyncRecentlyActive(void);
+/* The window whose monitor supplies the vertical blank clock. Set before
+ * initFpsLimiter() or the QPC grid is used instead. */
+void setVideoSyncWindow(void *window);
 
 #ifdef __cplusplus
 }

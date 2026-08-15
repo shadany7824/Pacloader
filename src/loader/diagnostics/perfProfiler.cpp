@@ -66,6 +66,9 @@ struct FrameSpike
     uint64_t pthreadCalls = 0;
     uint64_t presentCalls = 0;
     uint64_t glxCalls = 0;
+    uint64_t worstTicks = 0;
+    const char *worstDomain = nullptr;
+    const char *worstName = nullptr;
 };
 
 struct FrameAccumulator
@@ -79,6 +82,11 @@ struct FrameAccumulator
     std::atomic<uint64_t> pthreadCalls{0};
     std::atomic<uint64_t> presentCalls{0};
     std::atomic<uint64_t> glxCalls{0};
+    /* The frame's most expensive call. Racy by design: a diagnostic can afford
+     * that far more than every profiled call can afford a lock. */
+    std::atomic<uint64_t> worstTicks{0};
+    std::atomic<const char *> worstDomain{nullptr};
+    std::atomic<const char *> worstName{nullptr};
 };
 
 struct PresentSpike
@@ -89,7 +97,29 @@ struct PresentSpike
     uint64_t eventTicks = 0;
     uint64_t pacingTicks = 0;
     uint64_t swapTicks = 0;
+    uint64_t intervalTicks = 0;
+    uint64_t gapTicks = 0;
 };
+
+/* The spacing between marks, which is what the display sees. Per-frame work
+ * totals cannot show pacing jitter; the gaps between frames can. */
+constexpr size_t kIntervalSeriesCount = 8;
+constexpr size_t kIntervalSampleCount = 16384;
+constexpr size_t kIntervalBucketCount = 24;
+constexpr uint64_t kIntervalBucketMicroseconds = 2000;
+
+struct IntervalSeries
+{
+    const char *name = nullptr;
+    std::atomic<uint64_t> last{0};
+    std::atomic<uint64_t> count{0};
+    std::atomic<uint64_t> buckets[kIntervalBucketCount]{};
+    std::atomic<uint64_t> samples[kIntervalSampleCount]{};
+};
+
+IntervalSeries g_intervalSeries[kIntervalSeriesCount];
+std::atomic<size_t> g_intervalSeriesCount{0};
+std::mutex g_intervalSeriesLock;
 
 std::once_flag g_initOnce;
 std::atomic<int> g_enabledState{-1};
@@ -97,7 +127,8 @@ bool g_enabled = false;
 LARGE_INTEGER g_frequency{};
 std::mutex g_threadsLock;
 std::mutex g_writeLock;
-constexpr size_t kMaxThreads = 64;
+/* WMMT4 runs well over 64 threads, and a missed thread is absent from the report. */
+constexpr size_t kMaxThreads = 192;
 ThreadData *g_threads[kMaxThreads]{};
 size_t g_threadCount = 0;
 DWORD g_tlsIndex = TLS_OUT_OF_INDEXES;
@@ -119,6 +150,7 @@ uint64_t g_frameSpikeThresholdTicks = 0;
 std::mutex g_presentSpikeLock;
 PresentSpike g_presentSpikes[kPresentSpikeCount]{};
 size_t g_presentSpikeCount = 0;
+std::atomic<uint64_t> g_lastPresentEnd{0};
 
 constexpr size_t kBufferSiteCount = 1024;
 constexpr size_t kBufferPatternCount = 1024;
@@ -338,12 +370,37 @@ void resetFrameAccumulator()
     g_frameAccumulator.pthreadCalls.store(0, std::memory_order_relaxed);
     g_frameAccumulator.presentCalls.store(0, std::memory_order_relaxed);
     g_frameAccumulator.glxCalls.store(0, std::memory_order_relaxed);
+    g_frameAccumulator.worstTicks.store(0, std::memory_order_relaxed);
+    g_frameAccumulator.worstDomain.store(nullptr, std::memory_order_relaxed);
+    g_frameAccumulator.worstName.store(nullptr, std::memory_order_relaxed);
 }
 
-void addFrameEvent(const char *domain, uint64_t elapsed)
+/* These are supposed to take most of a frame; leaving them in the worst-call
+ * search only ever nominates the wait. */
+bool deliberateWait(const char *domain, const char *name)
+{
+    if (!domain || !name)
+        return false;
+    if (std::strcmp(domain, "Frame") == 0)
+        return true;
+    return std::strcmp(domain, "GLX") == 0 &&
+           (std::strcmp(name, "bridgeGlxWaitVideoSyncSGI") == 0 ||
+            std::strcmp(name, "bridgeGlxSwapBuffers") == 0);
+}
+
+void addFrameEvent(const char *domain, const char *name, uint64_t elapsed)
 {
     if (!g_frameBoundaryActive.load(std::memory_order_acquire))
         return;
+
+    if (!deliberateWait(domain, name) &&
+        elapsed > g_frameAccumulator.worstTicks.load(std::memory_order_relaxed))
+    {
+        g_frameAccumulator.worstTicks.store(elapsed, std::memory_order_relaxed);
+        g_frameAccumulator.worstDomain.store(domain, std::memory_order_relaxed);
+        g_frameAccumulator.worstName.store(name, std::memory_order_relaxed);
+    }
+
     if (domain && std::strcmp(domain, "GL") == 0)
     {
         g_frameAccumulator.glTicks.fetch_add(elapsed, std::memory_order_relaxed);
@@ -388,7 +445,9 @@ void writeFrameSpikeReport(const std::function<bool(const char *, size_t)> &writ
         char line[768];
         const int length = std::snprintf(
             line, sizeof(line),
-            "extra,FrameSpike,%llu,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%llu,%llu,%llu,%llu\r\n",
+            "extra,FrameSpike,%llu,total_us,%.3f,gl_us,%.3f,pthread_us,%.3f,present_us,%.3f,"
+            "glx_us,%.3f,other_us,%.3f,gl_calls,%llu,pthread_calls,%llu,present_calls,%llu,"
+            "glx_calls,%llu,worst,%s/%s,worst_us,%.3f\r\n",
             static_cast<unsigned long long>(spike.sequence),
             spike.totalTicks * scale, spike.glTicks * scale,
             spike.pthreadTicks * scale, spike.presentTicks * scale,
@@ -396,7 +455,10 @@ void writeFrameSpikeReport(const std::function<bool(const char *, size_t)> &writ
             static_cast<unsigned long long>(spike.glCalls),
             static_cast<unsigned long long>(spike.pthreadCalls),
             static_cast<unsigned long long>(spike.presentCalls),
-            static_cast<unsigned long long>(spike.glxCalls));
+            static_cast<unsigned long long>(spike.glxCalls),
+            spike.worstDomain ? spike.worstDomain : "-",
+            spike.worstName ? spike.worstName : "-",
+            spike.worstTicks * scale);
         ok = length > 0 && static_cast<size_t>(length) < sizeof(line) &&
              writeText(line, static_cast<size_t>(length));
     }
@@ -424,8 +486,10 @@ void writePresentSpikeReport(const std::function<bool(const char *, size_t)> &wr
         char line[512];
         const int length = std::snprintf(
             line, sizeof(line),
-            "extra,PresentSpike,%s,%llu,%.3f,%.3f,%.3f,%.3f,%.3f\r\n",
+            "extra,PresentSpike,%s,%llu,interval_us,%.3f,gap_us,%.3f,total_us,%.3f,"
+            "event_us,%.3f,pacing_us,%.3f,swap_us,%.3f,other_us,%.3f\r\n",
             spike.source, static_cast<unsigned long long>(spike.sequence),
+            spike.intervalTicks * scale, spike.gapTicks * scale,
             spike.totalTicks * scale, spike.eventTicks * scale,
             spike.pacingTicks * scale, spike.swapTicks * scale,
             other * scale);
@@ -434,11 +498,109 @@ void writePresentSpikeReport(const std::function<bool(const char *, size_t)> &wr
     }
 }
 
+void writeIntervalReport(const std::function<bool(const char *, size_t)> &writeText,
+                         bool &ok)
+{
+    const size_t seriesCount = g_intervalSeriesCount.load(std::memory_order_acquire);
+    const double scale = 1000000.0 / static_cast<double>(g_frequency.QuadPart);
+    static uint64_t sorted[kIntervalSampleCount];
+
+    for (size_t s = 0; ok && s < seriesCount; ++s)
+    {
+        IntervalSeries &series = g_intervalSeries[s];
+        const uint64_t total = series.count.load(std::memory_order_relaxed);
+        if (total == 0)
+            continue;
+        const size_t count = static_cast<size_t>(
+            total > kIntervalSampleCount ? kIntervalSampleCount : total);
+        for (size_t i = 0; i < count; ++i)
+            sorted[i] = series.samples[i].load(std::memory_order_relaxed);
+        for (size_t i = 1; i < count; ++i)
+        {
+            const uint64_t value = sorted[i];
+            size_t j = i;
+            while (j > 0 && sorted[j - 1] > value)
+            {
+                sorted[j] = sorted[j - 1];
+                --j;
+            }
+            sorted[j] = value;
+        }
+
+        char line[512];
+        int length = std::snprintf(
+            line, sizeof(line),
+            "extra,IntervalStats,%s,count,%llu,p50_us,%.3f,p90_us,%.3f,p95_us,%.3f,"
+            "p99_us,%.3f,min_us,%.3f,max_us,%.3f\r\n",
+            series.name ? series.name : "",
+            static_cast<unsigned long long>(total),
+            sorted[(count - 1) * 50 / 100] * scale,
+            sorted[(count - 1) * 90 / 100] * scale,
+            sorted[(count - 1) * 95 / 100] * scale,
+            sorted[(count - 1) * 99 / 100] * scale,
+            sorted[0] * scale, sorted[count - 1] * scale);
+        ok = length > 0 && static_cast<size_t>(length) < sizeof(line) &&
+             writeText(line, static_cast<size_t>(length));
+
+        for (size_t bucket = 0; ok && bucket < kIntervalBucketCount; ++bucket)
+        {
+            const uint64_t hits = series.buckets[bucket].load(std::memory_order_relaxed);
+            if (hits == 0)
+                continue;
+            length = std::snprintf(
+                line, sizeof(line), "extra,IntervalHistogram,%s,ge_us,%llu,count,%llu\r\n",
+                series.name ? series.name : "",
+                static_cast<unsigned long long>(bucket * kIntervalBucketMicroseconds),
+                static_cast<unsigned long long>(hits));
+            ok = length > 0 && static_cast<size_t>(length) < sizeof(line) &&
+                 writeText(line, static_cast<size_t>(length));
+        }
+    }
+}
+
 uint64_t nowTicks()
 {
     LARGE_INTEGER now;
     QueryPerformanceCounter(&now);
     return static_cast<uint64_t>(now.QuadPart);
+}
+
+IntervalSeries *findIntervalSeries(const char *name)
+{
+    const size_t known = g_intervalSeriesCount.load(std::memory_order_acquire);
+    for (size_t i = 0; i < known; ++i)
+    {
+        if (g_intervalSeries[i].name == name ||
+            (g_intervalSeries[i].name && std::strcmp(g_intervalSeries[i].name, name) == 0))
+            return &g_intervalSeries[i];
+    }
+
+    std::lock_guard<std::mutex> lock(g_intervalSeriesLock);
+    const size_t used = g_intervalSeriesCount.load(std::memory_order_relaxed);
+    for (size_t i = 0; i < used; ++i)
+    {
+        if (g_intervalSeries[i].name && std::strcmp(g_intervalSeries[i].name, name) == 0)
+            return &g_intervalSeries[i];
+    }
+    if (used == kIntervalSeriesCount)
+        return nullptr;
+    g_intervalSeries[used].name = name;
+    g_intervalSeriesCount.store(used + 1, std::memory_order_release);
+    return &g_intervalSeries[used];
+}
+
+void recordInterval(IntervalSeries &series, uint64_t interval)
+{
+    /* Wrap, so percentiles describe the last window rather than start-up. */
+    const uint64_t index = series.count.fetch_add(1, std::memory_order_relaxed);
+    series.samples[index % kIntervalSampleCount].store(interval, std::memory_order_relaxed);
+
+    const uint64_t microseconds =
+        interval * 1000000ULL / static_cast<uint64_t>(g_frequency.QuadPart);
+    size_t bucket = static_cast<size_t>(microseconds / kIntervalBucketMicroseconds);
+    if (bucket >= kIntervalBucketCount)
+        bucket = kIntervalBucketCount - 1;
+    series.buckets[bucket].fetch_add(1, std::memory_order_relaxed);
 }
 
 uint64_t hashKey(const char *domain, const char *name)
@@ -610,6 +772,8 @@ void writeReport()
         writeFrameSpikeReport(writeText, ok);
     if (ok)
         writePresentSpikeReport(writeText, ok);
+    if (ok)
+        writeIntervalReport(writeText, ok);
 
     CloseHandle(file);
     g_writing.clear(std::memory_order_release);
@@ -668,13 +832,27 @@ void initialize()
     }
 }
 
+/* Parked in TLS once the table is full, so an over-cap thread stops asking:
+ * without it every profiled call from one allocated and leaked ~49 KB. */
+ThreadData *const kThreadNotTracked = reinterpret_cast<ThreadData *>(-1);
+
 ThreadData *threadData()
 {
     if (g_tlsIndex == TLS_OUT_OF_INDEXES)
         return nullptr;
 
     if (ThreadData *existing = static_cast<ThreadData *>(TlsGetValue(g_tlsIndex)))
-        return existing;
+        return existing == kThreadNotTracked ? nullptr : existing;
+
+    /* Claim the slot before allocating, so a full table costs nothing. */
+    {
+        std::lock_guard<std::mutex> lock(g_threadsLock);
+        if (g_threadCount >= kMaxThreads)
+        {
+            TlsSetValue(g_tlsIndex, kThreadNotTracked);
+            return nullptr;
+        }
+    }
 
     void *memory = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(ThreadData));
     if (!memory)
@@ -682,9 +860,14 @@ ThreadData *threadData()
 
     ThreadData *created = new (memory) ThreadData{};
     created->threadId = GetCurrentThreadId();
+
     std::lock_guard<std::mutex> lock(g_threadsLock);
     if (g_threadCount >= kMaxThreads)
+    {
+        HeapFree(GetProcessHeap(), 0, memory);
+        TlsSetValue(g_tlsIndex, kThreadNotTracked);
         return nullptr;
+    }
     g_threads[g_threadCount++] = created;
     TlsSetValue(g_tlsIndex, created);
     return created;
@@ -746,7 +929,7 @@ extern "C" void PerfProfiler_End(const char *domain, const char *name,
         return;
 
     const uint64_t elapsed = nowTicks() - start;
-    addFrameEvent(domain, elapsed);
+    addFrameEvent(domain, name, elapsed);
     if (domain && name && std::strcmp(domain, "Frame") == 0 &&
         std::strcmp(name, "frameTiming") == 0)
         PerfProfiler_FrameSample(elapsed);
@@ -822,6 +1005,9 @@ void recordFrameBoundary(uint64_t now)
         spike.pthreadCalls = g_frameAccumulator.pthreadCalls.exchange(0, std::memory_order_relaxed);
         spike.presentCalls = g_frameAccumulator.presentCalls.exchange(0, std::memory_order_relaxed);
         spike.glxCalls = g_frameAccumulator.glxCalls.exchange(0, std::memory_order_relaxed);
+        spike.worstTicks = g_frameAccumulator.worstTicks.exchange(0, std::memory_order_relaxed);
+        spike.worstDomain = g_frameAccumulator.worstDomain.exchange(nullptr, std::memory_order_relaxed);
+        spike.worstName = g_frameAccumulator.worstName.exchange(nullptr, std::memory_order_relaxed);
 
         std::lock_guard<std::mutex> lock(g_frameSpikeLock);
         if (g_frameSpikeCount < kFrameSpikeCount)
@@ -882,8 +1068,22 @@ extern "C" void PerfProfiler_PresentTransaction(const char *source,
                                                   uint64_t swapTicks)
 {
     if (!PerfProfiler_IsEnabled() ||
-        !g_runtimeReady.load(std::memory_order_acquire) ||
-        totalTicks < g_frameSpikeThresholdTicks)
+        !g_runtimeReady.load(std::memory_order_acquire))
+        return;
+
+    /* The interval is what the screen shows; `gap` is the part outside this
+     * call, which separates a guest stall from a loader one. */
+    const uint64_t now = nowTicks();
+    const uint64_t previous = g_lastPresentEnd.exchange(now, std::memory_order_relaxed);
+    if (previous == 0 || now <= previous)
+        return;
+
+    const uint64_t interval = now - previous;
+    IntervalSeries *series = findIntervalSeries("present");
+    if (series)
+        recordInterval(*series, interval);
+
+    if (interval < g_frameSpikeThresholdTicks)
         return;
 
     PresentSpike spike{};
@@ -894,10 +1094,29 @@ extern "C" void PerfProfiler_PresentTransaction(const char *source,
     spike.eventTicks = eventTicks;
     spike.pacingTicks = pacingTicks;
     spike.swapTicks = swapTicks;
+    spike.intervalTicks = interval;
+    spike.gapTicks = interval > totalTicks ? interval - totalTicks : 0;
 
     std::lock_guard<std::mutex> lock(g_presentSpikeLock);
     if (g_presentSpikeCount < kPresentSpikeCount)
         g_presentSpikes[g_presentSpikeCount++] = spike;
+}
+
+extern "C" void PerfProfiler_IntervalMark(const char *name)
+{
+    if (!PerfProfiler_IsEnabled() || !name ||
+        !g_runtimeReady.load(std::memory_order_acquire))
+        return;
+
+    IntervalSeries *series = findIntervalSeries(name);
+    if (!series)
+        return;
+
+    const uint64_t now = nowTicks();
+    const uint64_t previous = series->last.exchange(now, std::memory_order_relaxed);
+    if (previous == 0 || now <= previous)
+        return;
+    recordInterval(*series, now - previous);
 }
 
 extern "C" void PerfProfiler_GLBufferEvent(const char *operation, uintptr_t caller,
@@ -1009,6 +1228,7 @@ extern "C" void PerfProfiler_FrameBoundaryEnd(void) {}
 extern "C" uint64_t PerfProfiler_NowTicks(void) { return 0; }
 extern "C" void PerfProfiler_PresentTransaction(const char *, uint64_t, uint64_t,
                                                  uint64_t, uint64_t) {}
+extern "C" void PerfProfiler_IntervalMark(const char *) {}
 extern "C" void PerfProfiler_GLBufferEvent(const char *, uintptr_t, uintptr_t,
                                             uint32_t, uint32_t, uint64_t, uint32_t) {}
 

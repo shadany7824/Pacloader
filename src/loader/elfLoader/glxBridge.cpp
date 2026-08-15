@@ -203,7 +203,16 @@ extern "C" int bridgeGlxMakeCurrent(void *display, unsigned long drawable,
 
     const char *failure = success ? "ok" : SDL_GetError();
     if (success)
+    {
         GLHooks_NotifyContextCurrent(context);
+
+        /* Per-context state: start-up only set it on the one SDL made, and WMMT4
+         * presents from a different one, which kept the driver default. */
+        if (getConfig()->fpsLimiter && context &&
+            !setSDLSwapInterval(getConfig()->vsync ? 1 : 0))
+            log_debug("ES1 GLX: could not set the swap interval for context %p: %s",
+                      context, SDL_GetError());
+    }
 
     log_debug("ES1 GLX: glXMakeCurrent tid=%lu drawable=%lu context=%p -> %d (%s)",
               static_cast<unsigned long>(GetCurrentThreadId()), drawable, context,
@@ -299,7 +308,7 @@ extern "C" void bridgeGlxSwapBuffers(void *display, unsigned long drawable)
         const uint64_t swapStart = PerfProfiler_Begin("Present", "SDL_GL_SwapWindow");
         segmentStart = PerfProfiler_NowTicks();
         SDL_GL_SwapWindow(getSDLWindow());
-        const uint64_t afterSwap = PerfProfiler_NowTicks();
+            const uint64_t afterSwap = PerfProfiler_NowTicks();
         if (afterSwap > segmentStart)
             swapTicks = afterSwap - segmentStart;
         PerfProfiler_End("Present", "SDL_GL_SwapWindow", swapStart, 0);
@@ -308,16 +317,18 @@ extern "C" void bridgeGlxSwapBuffers(void *display, unsigned long drawable)
         if (transactionStart && transactionEnd > transactionStart)
             PerfProfiler_PresentTransaction("GLX", transactionEnd - transactionStart,
                                             eventTicks, pacingTicks, swapTicks);
+        /* Accumulate per-domain work against the present interval, not the retrace. */
+        PerfProfiler_FrameBoundaryEndAndStart();
     }
 }
 
 extern "C" int bridgeGlxSwapIntervalSGI(int interval)
 {
     /* System ES1 requests this legacy GLX entry point during X-system
-     * initialization. When the loader limiter is enabled, disable vsync so
-     * [Graphics] FPS_TARGET remains the single presentation-rate control. */
-    if (getConfig()->fpsLimiter && interval != 0)
-        interval = 0;
+     * initialization. The loader owns the presentation rate while the limiter
+     * is on, so [Graphics] VSYNC decides this, not the guest. */
+    if (getConfig()->fpsLimiter)
+        interval = getConfig()->vsync ? 1 : 0;
 
     return setSDLSwapInterval(interval) ? 0 : 1;
 }
@@ -335,10 +346,7 @@ extern "C" int bridgeGlxGetVideoSyncSGI(unsigned int *count)
 extern "C" int bridgeGlxWaitVideoSyncSGI(int divisor, int remainder,
                                            unsigned int *count)
 {
-    /* Exclude the intentional retrace wait from the measured render interval.
-     * The interval ends when the next wait begins and starts when this wait
-     * returns, so only work between retraces is attributed to the frame. */
-    PerfProfiler_FrameBoundaryEnd();
+    PerfProfiler_IntervalMark("retrace");
     {
         PERF_PROFILE_SCOPE("GLX");
         if (divisor <= 0)
@@ -350,7 +358,6 @@ extern "C" int bridgeGlxWaitVideoSyncSGI(int divisor, int remainder,
             ++target;
         waitVideoSync(target);
     }
-    PerfProfiler_FrameBoundaryStart();
 
     if (count)
         *count = (unsigned int)videoSyncCount();

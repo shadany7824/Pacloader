@@ -2,6 +2,7 @@
 #include <SDL3/SDL.h>
 #include <windows.h>
 #include <array>
+#include <atomic>
 #include <cstdlib>
 #include <mutex>
 #include <string.h>
@@ -9,12 +10,98 @@
 #include <unordered_map>
 #include <vector>
 #include "glHooks.hpp"
+#include "../config/config.h"
 #include "../diagnostics/perfProfiler.hpp"
 #include "../graphics/pacloaderGraphics.h"
+#include "../graphics/sdlCalls.h"
 #include "../log/log.h"
 
 static thread_local uint32_t lastCompressedImageSize = 0;
 static thread_local uint32_t pendingCompressedImageSize = 0;
+
+extern int gWidth;
+extern int gHeight;
+
+/* Fullscreen letterbox: the guest sets a viewport for its own size, which leaves
+ * the picture in a corner of a larger drawable. Only framebuffer 0 is scaled -
+ * scaling a viewport aimed at a render target corrupts every offscreen pass. */
+static thread_local GLuint t_boundDrawFramebuffer = 0;
+
+/* Published by the window's own thread: SDL's video calls are not safe off it. */
+static std::atomic<double> g_letterboxScaleX{1.0};
+static std::atomic<double> g_letterboxScaleY{1.0};
+static std::atomic<double> g_letterboxOffsetX{0.0};
+static std::atomic<double> g_letterboxOffsetY{0.0};
+static std::atomic<bool> g_letterboxActive{false};
+static std::atomic<int> g_letterboxDrawableWidth{0};
+static std::atomic<int> g_letterboxDrawableHeight{0};
+static std::atomic<int> g_letterboxContentWidth{0};
+static std::atomic<int> g_letterboxContentHeight{0};
+
+extern "C" void GLHooks_SetDrawableSize(int drawableWidth, int drawableHeight)
+{
+    if (drawableWidth <= 0 || drawableHeight <= 0 || gWidth <= 0 || gHeight <= 0)
+        return;
+
+    if (drawableWidth == gWidth && drawableHeight == gHeight)
+    {
+        g_letterboxActive.store(false, std::memory_order_release);
+        return;
+    }
+
+    double scaleX = static_cast<double>(drawableWidth) / gWidth;
+    double scaleY = static_cast<double>(drawableHeight) / gHeight;
+    double offsetX = 0.0;
+    double offsetY = 0.0;
+    if (getConfig()->keepAspectRatio)
+    {
+        /* One scale for both axes, centred: a 16:9 guest on a 21:9 panel gets
+         * pillar boxes rather than stretched geometry. */
+        const double scale = scaleX < scaleY ? scaleX : scaleY;
+        scaleX = scale;
+        scaleY = scale;
+        offsetX = (drawableWidth - gWidth * scale) / 2.0;
+        offsetY = (drawableHeight - gHeight * scale) / 2.0;
+    }
+
+    g_letterboxScaleX.store(scaleX, std::memory_order_relaxed);
+    g_letterboxScaleY.store(scaleY, std::memory_order_relaxed);
+    g_letterboxOffsetX.store(offsetX, std::memory_order_relaxed);
+    g_letterboxOffsetY.store(offsetY, std::memory_order_relaxed);
+    g_letterboxDrawableWidth.store(drawableWidth, std::memory_order_relaxed);
+    g_letterboxDrawableHeight.store(drawableHeight, std::memory_order_relaxed);
+    g_letterboxContentWidth.store(static_cast<int>(gWidth * scaleX), std::memory_order_relaxed);
+    g_letterboxContentHeight.store(static_cast<int>(gHeight * scaleY), std::memory_order_relaxed);
+    g_letterboxActive.store(true, std::memory_order_release);
+
+    /* At warn so it survives the default log level: when the picture is the
+     * wrong size or in the wrong place, this one line says which geometry the
+     * loader chose and settles it without a rebuild. */
+    log_warn("GL letterbox: guest %dx%d on drawable %dx%d -> scale %.3f/%.3f offset %.1f/%.1f",
+             gWidth, gHeight, drawableWidth, drawableHeight, scaleX, scaleY, offsetX, offsetY);
+}
+
+/* What the guest set, in its coordinates: it reads the viewport back, and passes
+ * derived from it (WMMT4's wheels and glass) need the rectangle they chose. */
+static thread_local GLint t_guestViewport[4] = {0, 0, 0, 0};
+static thread_local GLint t_guestScissor[4] = {0, 0, 0, 0};
+static thread_local bool t_guestViewportKnown = false;
+static thread_local bool t_guestScissorKnown = false;
+
+/* Maps a guest rectangle onto the drawable; false when nothing has to change. */
+static bool letterboxRect(GLint *x, GLint *y, GLsizei *width, GLsizei *height)
+{
+    if (t_boundDrawFramebuffer != 0 || !g_letterboxActive.load(std::memory_order_acquire))
+        return false;
+
+    const double scaleX = g_letterboxScaleX.load(std::memory_order_relaxed);
+    const double scaleY = g_letterboxScaleY.load(std::memory_order_relaxed);
+    *x = static_cast<GLint>(g_letterboxOffsetX.load(std::memory_order_relaxed) + *x * scaleX);
+    *y = static_cast<GLint>(g_letterboxOffsetY.load(std::memory_order_relaxed) + *y * scaleY);
+    *width = static_cast<GLsizei>(*width * scaleX);
+    *height = static_cast<GLsizei>(*height * scaleY);
+    return true;
+}
 
 struct FramebufferAttachment
 {
@@ -156,6 +243,10 @@ bool glStreamBufferPoolEnabled()
     return enabled;
 }
 
+/* Re-specify unchanged buffers as glBufferSubData so the driver keeps the
+ * allocation: measured 2384 -> 392 us on the attract movie's 4 MB frame uploads
+ * and p99 22.7 -> 19.2 ms. Off by default - the sub-data path can wait on the
+ * GPU still reading the old contents. LL_GL_BUFFER_DATA_REUSE=1 turns it on. */
 bool glStreamBufferDataReuseEnabled()
 {
     static const bool enabled = [] {
@@ -808,6 +899,12 @@ extern "C" void __attribute__((cdecl)) bridgeglViewport(
     GLint x, GLint y, GLsizei width, GLsizei height)
 {
     PERF_PROFILE_SCOPE("GL");
+    t_guestViewport[0] = x;
+    t_guestViewport[1] = y;
+    t_guestViewport[2] = static_cast<GLint>(width);
+    t_guestViewport[3] = static_cast<GLint>(height);
+    t_guestViewportKnown = true;
+    letterboxRect(&x, &y, &width, &height);
     glad_glViewport(x, y, width, height);
 }
 
@@ -1008,11 +1105,56 @@ extern "C" void __attribute__((cdecl)) wrap_glFinish()
         glad_glFinish();
 }
 
+/* Nothing else writes the bars, so they keep whatever the back buffer held - an
+ * overlay drawn once at start-up stayed on screen forever. Rides the guest's own
+ * clear to stay on the drawing thread, scissored to the bars only. */
+static void clearLetterboxBars()
+{
+    if (!g_letterboxActive.load(std::memory_order_acquire) || t_boundDrawFramebuffer != 0)
+        return;
+    if (!glad_glClear || !glad_glScissor || !glad_glPushAttrib || !glad_glPopAttrib)
+        return;
+
+    const int drawableWidth = g_letterboxDrawableWidth.load(std::memory_order_relaxed);
+    const int drawableHeight = g_letterboxDrawableHeight.load(std::memory_order_relaxed);
+    const int contentWidth = g_letterboxContentWidth.load(std::memory_order_relaxed);
+    const int contentHeight = g_letterboxContentHeight.load(std::memory_order_relaxed);
+    const int offsetX = static_cast<int>(g_letterboxOffsetX.load(std::memory_order_relaxed));
+    const int offsetY = static_cast<int>(g_letterboxOffsetY.load(std::memory_order_relaxed));
+    if (drawableWidth <= 0 || drawableHeight <= 0)
+        return;
+
+    glad_glPushAttrib(GL_SCISSOR_BIT | GL_COLOR_BUFFER_BIT);
+    glad_glEnable(GL_SCISSOR_TEST);
+    glad_glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+
+    if (offsetX > 0)
+    {
+        glad_glScissor(0, 0, offsetX, drawableHeight);
+        glad_glClear(GL_COLOR_BUFFER_BIT);
+        glad_glScissor(offsetX + contentWidth, 0,
+                       drawableWidth - offsetX - contentWidth, drawableHeight);
+        glad_glClear(GL_COLOR_BUFFER_BIT);
+    }
+    if (offsetY > 0)
+    {
+        glad_glScissor(0, 0, drawableWidth, offsetY);
+        glad_glClear(GL_COLOR_BUFFER_BIT);
+        glad_glScissor(0, offsetY + contentHeight,
+                       drawableWidth, drawableHeight - offsetY - contentHeight);
+        glad_glClear(GL_COLOR_BUFFER_BIT);
+    }
+
+    glad_glPopAttrib();
+}
+
 extern "C" void __attribute__((cdecl)) wrap_glClear(GLbitfield mask)
 {
     PERF_PROFILE_SCOPE("GL");
     if (glad_glClear)
         glad_glClear(mask);
+    if (mask & GL_COLOR_BUFFER_BIT)
+        clearLetterboxBars();
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glClearColor(GLclampf r, GLclampf g, GLclampf b, GLclampf a)
@@ -1089,6 +1231,13 @@ extern "C" void __attribute__((cdecl)) wrap_glPolygonMode(GLenum face, GLenum mo
 extern "C" void __attribute__((cdecl)) wrap_glScissor(GLint x, GLint y, GLsizei width, GLsizei height)
 {
     PERF_PROFILE_SCOPE("GL");
+    t_guestScissor[0] = x;
+    t_guestScissor[1] = y;
+    t_guestScissor[2] = static_cast<GLint>(width);
+    t_guestScissor[3] = static_cast<GLint>(height);
+    t_guestScissorKnown = true;
+    /* Shares the viewport's coordinate space, so it moves with it. */
+    letterboxRect(&x, &y, &width, &height);
     if (glad_glScissor)
         glad_glScissor(x, y, width, height);
 }
@@ -1138,6 +1287,24 @@ extern "C" void __attribute__((cdecl)) wrap_glGetFloatv(GLenum pname, GLfloat *p
 extern "C" void __attribute__((cdecl)) wrap_glGetIntegerv(GLenum pname, GLint *params)
 {
     PERF_PROFILE_SCOPE("GL");
+
+    /* Answer the rewritten rectangles in the guest's own coordinates. */
+    if (params && g_letterboxActive.load(std::memory_order_acquire))
+    {
+        if (pname == GL_VIEWPORT && t_guestViewportKnown)
+        {
+            for (int i = 0; i < 4; ++i)
+                params[i] = t_guestViewport[i];
+            return;
+        }
+        if (pname == GL_SCISSOR_BOX && t_guestScissorKnown)
+        {
+            for (int i = 0; i < 4; ++i)
+                params[i] = t_guestScissor[i];
+            return;
+        }
+    }
+
     if (glad_glGetIntegerv)
         glad_glGetIntegerv(pname, params);
 }
@@ -1668,9 +1835,17 @@ extern "C" void __attribute__((cdecl)) wrap_glGenFramebuffersEXT(GLsizei n, GLui
     traceFramebufferIds("gen-ext", n, framebuffers);
 }
 
+/* GL_READ_FRAMEBUFFER does not affect where drawing lands. */
+static void noteDrawFramebufferBinding(GLenum target, GLuint framebuffer)
+{
+    if (target == GL_FRAMEBUFFER || target == GL_DRAW_FRAMEBUFFER)
+        t_boundDrawFramebuffer = framebuffer;
+}
+
 extern "C" void __attribute__((cdecl)) wrap_glBindFramebufferEXT(GLenum target, GLuint framebuffer)
 {
     PERF_PROFILE_SCOPE("GL");
+    noteDrawFramebufferBinding(target, framebuffer);
     if (glad_glBindFramebufferEXT)
         glad_glBindFramebufferEXT(target, framebuffer);
     replayFramebufferAttachments(framebuffer);
@@ -1889,6 +2064,7 @@ extern "C" void __attribute__((cdecl)) wrap_glGenFramebuffers(GLsizei n, GLuint 
 extern "C" void __attribute__((cdecl)) wrap_glBindFramebuffer(GLenum target, GLuint framebuffer)
 {
     PERF_PROFILE_SCOPE("GL");
+    noteDrawFramebufferBinding(target, framebuffer);
     if (glad_glBindFramebuffer)
         glad_glBindFramebuffer(target, framebuffer);
     replayFramebufferAttachments(framebuffer);
@@ -3430,6 +3606,18 @@ extern "C" void __attribute__((cdecl)) wrap_glGetProgramEnvParameterfvARB(GLhand
 extern "C" void __attribute__((cdecl)) wrap_glGetTexParameteriv(GLenum target, GLenum pname, GLint *params)
 {
     PERF_PROFILE_SCOPE("GL");
+
+    /* No modern driver answers this meaningfully, but asking is a synchronous
+     * round-trip: WMMT4 asks 139 times a frame and caching per texture missed 36%
+     * of them, costing 26 s of a 200 s run. LL_GL_TEX_RESIDENT_CACHE=0 to ask. */
+    if (pname == GL_TEXTURE_RESIDENT && glTextureResidentCacheEnabled())
+    {
+        PerfProfiler_TextureQuery(static_cast<uint32_t>(pname), 1);
+        if (params)
+            *params = GL_TRUE;
+        return;
+    }
+
     if (cachedTexParameter(target, pname, params))
     {
         PerfProfiler_TextureQuery(static_cast<uint32_t>(pname), 1);

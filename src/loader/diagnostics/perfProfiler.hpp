@@ -25,6 +25,9 @@ uint64_t PerfProfiler_NowTicks(void);
 void PerfProfiler_PresentTransaction(const char *source, uint64_t totalTicks,
                                      uint64_t eventTicks, uint64_t pacingTicks,
                                      uint64_t swapTicks);
+/* Records the interval between successive calls, one series per name. Used to
+ * measure the pacing the display actually sees rather than the work per frame. */
+void PerfProfiler_IntervalMark(const char *name);
 void PerfProfiler_GLBufferEvent(const char *operation, uintptr_t caller,
                                 uintptr_t context, uint32_t target, uint32_t usage,
                                 uint64_t size, uint32_t buffer);

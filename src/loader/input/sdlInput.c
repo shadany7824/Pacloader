@@ -90,6 +90,19 @@ extern bool mj4TouchedInsideScreen;
 int jvsAnalogueMaxValue;
 int jvsAnalogueCenterValue;
 
+/* WMMT4 displays the 16-bit JVS pedal values after shifting them right by six
+ * bits.  Keep the displayed/input-test value at 320, rather than sending 320
+ * as the raw JVS value (which would be displayed as 5). */
+static int jvsAnalogueMaxForAction(LogicalAction action)
+{
+    if (gGrp == GROUP_WMMT4_ES1 &&
+        (action == LA_Gas || action == LA_Gas_Digital ||
+         action == LA_Brake || action == LA_Brake_Digital))
+        return 320 << 6;
+
+    return jvsAnalogueMaxValue;
+}
+
 GameType gameType;
 
 // Map between string names and LogicalAction enums for INI parsing.
@@ -2207,9 +2220,49 @@ void updateCombinedAxes()
     }
 }
 
+/* WMMT4 can pump SDL from both its X11 compatibility path and the normal
+ * present path.  If one path consumes an axis event before the other path
+ * flushes the dirty list, the event-driven steering update can be missed.
+ * Poll the bound raw joystick axis as a second source of truth each frame. */
+static void refreshWmmt4SteeringAxis(void)
+{
+    if (gGrp != GROUP_WMMT4_ES1 || !sdlJoysticks.joysticks[0])
+        return;
+
+    for (int axis = 0; axis < MAX_JOY_AXES; axis++)
+    {
+        BindingPair *pair = &gJoyAxisBindings[0][axis];
+        for (int i = 0; i < 2; i++)
+        {
+            ControlBinding *binding = &pair->bindings[i];
+            if (binding->type != INPUT_TYPE_JOY_AXIS ||
+                binding->player != PLAYER_1 || binding->action != LA_Steer ||
+                binding->axisMode != AXIS_MODE_FULL)
+                continue;
+
+            const Sint16 rawValue = SDL_GetJoystickAxis(sdlJoysticks.joysticks[0], axis);
+            const int deadZone = gActionProperties[PLAYER_1][LA_Steer].deadzone;
+            float newValue = (abs(rawValue) < deadZone)
+                                 ? 0.5f
+                                 : (float)(rawValue + 32768) / 65535.0f;
+            if (binding->isInverted)
+                newValue = 1.0f - newValue;
+
+            ActionState *state = &gActionStates[PLAYER_1][LA_Steer];
+            if (fabs(state->analogValue - newValue) > 0.001f)
+            {
+                state->analogValue = newValue;
+                addActionToDirtyList(PLAYER_1, LA_Steer);
+            }
+        }
+    }
+}
+
 /* Sends every action queued since the last frame to the JVS I/O board. */
 void processChangedActions()
 {
+    refreshWmmt4SteeringAxis();
+
     for (int i = 0; i < gNumChangedActions; i++)
     {
         JVSPlayer player = gChangedActions[i].player;
@@ -2311,7 +2364,9 @@ void processChangedActions()
                 }
 #endif
 
-                setAnalogue(map->jvsInput, (int)(state->analogValue * jvsAnalogueMaxValue));
+                const int analogueMax = jvsAnalogueMaxForAction(actionId);
+                const float analogueValue = fmaxf(0.0f, fminf(1.0f, state->analogValue));
+                setAnalogue(map->jvsInput, (int)(analogueValue * analogueMax));
                 break;
             case JVS_CALL_COIN:
                 if (state->isActive)

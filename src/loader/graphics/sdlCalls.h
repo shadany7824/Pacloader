@@ -44,6 +44,8 @@ int presentSDLFrame(const SDLFramePresentOptions *options);
  * course loads. Cheap to call often; does nothing off the window's thread.
  */
 void keepWindowResponsive(void);
+/* Re-reads the drawable size and hands it to the GL hooks. Owning thread only. */
+void publishDrawableSize(void);
 
 void showFpsInWindowTitle(const char *name);
 
