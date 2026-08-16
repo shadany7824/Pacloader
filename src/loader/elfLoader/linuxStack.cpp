@@ -1,3 +1,4 @@
+#include <cstring>
 #include "linuxStack.hpp"
 #include <windows.h>
 
@@ -61,6 +62,28 @@ uint32_t LinuxStack::Setup(uint32_t size, int argc, char** argv, uint32_t* outSt
     }
     
     *(--ptr) = argc;  // argc
-    
-    return (uint32_t)ptr;
+
+    /*
+     * The SysV i386 ABI wants esp 16-byte aligned at process entry, with argc
+     * at [esp]. Nothing above guarantees that, and a guest built with SSE
+     * spills through movaps, which raises a general protection fault on an
+     * 8-aligned frame - Windows reports it as an access violation on address
+     * ffffffff. WMMT5 faults in its first such frame; the older titles happen
+     * to tolerate whatever lands.
+     *
+     * Slide the finished block down rather than counting what was pushed, so
+     * this keeps working when the block above changes. Everything in it is a
+     * scalar or a pointer to memory outside the block, so nothing needs fixing
+     * up after the move.
+     */
+    uint32_t sp = (uint32_t)ptr;
+    const uint32_t misalignment = sp & 15u;
+    if (misalignment)
+    {
+        const uint32_t used = esp - sp;
+        memmove((void *)(sp - misalignment), (void *)sp, used);
+        sp -= misalignment;
+    }
+
+    return sp;
 }

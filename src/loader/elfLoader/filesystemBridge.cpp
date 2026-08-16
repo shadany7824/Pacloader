@@ -29,6 +29,8 @@ bool isEventfd(int fd);
 int readEventfd(int fd, void *buffer, size_t length);
 int writeEventfd(int fd, const void *buffer, size_t length);
 int closeEventfd(int fd);
+bool isEpoll(int fd);
+int closeEpoll(int fd);
 void forgetDescriptor(int fd);
 }
 
@@ -100,6 +102,8 @@ namespace FileSystemBridge
         Es1CompatBridge::forgetDescriptor(fd);
         if (Es1CompatBridge::isEventfd(fd))
             return Es1CompatBridge::closeEventfd(fd);
+        if (Es1CompatBridge::isEpoll(fd))
+            return Es1CompatBridge::closeEpoll(fd);
         if (const auto *device = VirtualDeviceRegistry::find(fd))
             return device->close(fd);
         if (NetworkBridge::isSocketDescriptor(fd))
@@ -309,37 +313,40 @@ namespace FileSystemBridge
         return setvbuf(stream, buf, mode, size);
     }
 
-    size_t bridgeWritev(int fd, const struct iovec *iov, int iovcnt)
+    /* These go through the same dispatch as read() and write(); the CRT calls
+     * they replaced reached none of the emulated descriptors. */
+    ssize_t bridgeWritev(int fd, const struct iovec *iov, int iovcnt)
     {
         log_trace("Intercepted writev");
-        size_t total_written = 0;
-        for (int i = 0; i < iovcnt; ++i) {
-            int written = _write(fd, iov[i].iov_base, iov[i].iov_len);
-            if (written < 0) {
-                if (total_written == 0) return -1;
+        ssize_t totalWritten = 0;
+        for (int i = 0; i < iovcnt; ++i)
+        {
+            const ssize_t written = bridgeWriteDescriptor(fd, iov[i].iov_base, iov[i].iov_len);
+            if (written < 0)
+                return totalWritten == 0 ? -1 : totalWritten;
+            totalWritten += written;
+            if (static_cast<size_t>(written) < iov[i].iov_len)
                 break;
-            }
-            total_written += written;
-            if ((size_t)written < iov[i].iov_len) break;
         }
-        return total_written;
+        return totalWritten;
     }
 
     ssize_t bridgeReadv(int fd, const struct iovec *iov, int iovcnt)
     {
         log_trace("Intercepted readv");
-        ssize_t total_read = 0;
-        for (int i = 0; i < iovcnt; ++i) {
-            int bytes_read = _read(fd, iov[i].iov_base, iov[i].iov_len);
-            if (bytes_read < 0) {
-                if (total_read == 0) return -1;
+        ssize_t totalRead = 0;
+        for (int i = 0; i < iovcnt; ++i)
+        {
+            const ssize_t bytesRead = bridgeReadDescriptor(fd, iov[i].iov_base, iov[i].iov_len);
+            if (bytesRead < 0)
+                return totalRead == 0 ? -1 : totalRead;
+            if (bytesRead == 0)
                 break;
-            }
-            total_read += bytes_read;
-            if ((size_t)bytes_read < iov[i].iov_len) break;
-            if (bytes_read == 0) break; // EOF
+            totalRead += bytesRead;
+            if (static_cast<size_t>(bytesRead) < iov[i].iov_len)
+                break;
         }
-        return total_read;
+        return totalRead;
     }
 
     int bridgeDup(int fd)
@@ -758,6 +765,14 @@ extern "C"
         struct _stat64 win_stat;
         char winPath[MAX_PATH];
         ConvertPath(winPath, path, MAX_PATH);
+
+        /* Linux stats a directory with or without its trailing slash; the CRT
+         * rejects the trailing one outright. */
+        size_t winLength = strlen(winPath);
+        while (winLength > 1 && winPath[winLength - 1] == '\\' &&
+               winPath[winLength - 2] != ':')
+            winPath[--winLength] = '\0';
+
         log_debug("stat: %s (as %s)", path, winPath);
         if (_stat64(winPath, &win_stat) != 0)
         {

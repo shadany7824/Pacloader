@@ -36,6 +36,7 @@
 #include "../log/log.h"
 #include "../platform/platformBackend.h"
 #include "guestTls.hpp"
+#include "guestCall.hpp"
 
 extern "C" void __gmon_start__()
 {
@@ -65,7 +66,7 @@ extern "C" int __libc_start_main(int (*main_func)(int, char **, char **), int ar
         if (guestTlsInstalled)
             GuestTls::EnterGuestCode();
         log_debug("Calling init from __libc_start_main");
-        init();
+        callGuestVoid(init);
         if (guestTlsInstalled)
             GuestTls::EnterHostCall();
     }
@@ -77,7 +78,7 @@ extern "C" int __libc_start_main(int (*main_func)(int, char **, char **), int ar
     log_info("Transferring control to main()...");
     if (guestTlsInstalled)
         GuestTls::EnterGuestCode();
-    int exitCode = main_func(argc, argv, envp);
+    int exitCode = callGuestMain(main_func, argc, argv, envp);
     if (guestTlsInstalled)
         GuestTls::EnterHostCall();
     log_info("Program main() exited with code: %d", exitCode);
@@ -87,7 +88,7 @@ extern "C" int __libc_start_main(int (*main_func)(int, char **, char **), int ar
         if (guestTlsInstalled)
             GuestTls::EnterGuestCode();
         log_debug("Calling fini from __libc_start_main");
-        fini();
+        callGuestVoid(fini);
         if (guestTlsInstalled)
             GuestTls::EnterHostCall();
     }

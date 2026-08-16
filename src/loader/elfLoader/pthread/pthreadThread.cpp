@@ -52,6 +52,15 @@ struct ThreadStartContext {
 /* ES1's audio worker uses aligned SSE stores on its native pthread stack. */
 __attribute__((force_align_arg_pointer))
 #endif
+/*
+ * The guest is Linux i386 code built to the SysV ABI, which requires esp to be
+ * 16-byte aligned at a call so SSE spills can use movaps. Whatever alignment
+ * the host hands this trampoline is what the guest inherits, and one that is
+ * only 8-byte aligned faults on the first movaps with a general protection
+ * error - reported as an access violation on address ffffffff. Realign here,
+ * at the one place control crosses from host to guest on a new thread.
+ */
+__attribute__((force_align_arg_pointer))
 static unsigned __stdcall ThreadEntryPoint(void* param) {
     ThreadStartContext* ctx = (ThreadStartContext*)param;
     

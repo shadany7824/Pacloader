@@ -210,9 +210,9 @@ namespace LibcBridge
         MAP("setitimer", bridgeSetitimer);
         MAP("sigwait", bridgeSigwait);
         MAP("alarm", bridgeStubSuccess);
-        MAP("qsort", qsort);
+        MAP("qsort", bridgeQsort);
         MAP("poll", bridgePoll);
-        MAP("bsearch", bsearch);
+        MAP("bsearch", bridgeBsearch);
         MAP("realpath", bridgeRealpath);
         MAP("popen", bridgePopen);
         MAP("pclose", bridgePclose);
@@ -768,6 +768,48 @@ namespace LibcBridge
     bool isGuestConsole(void *stream)
     {
         return stream == nullptr || stream == stdout || stream == stderr;
+    }
+
+    /*
+     * The host CRT's qsort and bsearch call the comparison function the guest
+     * gave them, and they call it the Windows way: nothing guarantees esp is
+     * 16-byte aligned. Guest code is Linux SysV i386, where that alignment is
+     * promised, so a comparator that spills through movaps takes a general
+     * protection fault - seen on WMMT5, whose comparator does exactly that.
+     *
+     * Route the callback through a thunk of our own, which realigns and then
+     * calls the guest with the alignment it expects. The saved pointer is
+     * per-thread and restored afterwards so a comparator may sort again.
+     */
+    static __thread int (*t_guestCompare)(const void *, const void *) = nullptr;
+
+    __attribute__((force_align_arg_pointer))
+    static int alignedGuestCompare(const void *a, const void *b)
+    {
+        return t_guestCompare ? t_guestCompare(a, b) : 0;
+    }
+
+    void bridgeQsort(void *base, size_t count, size_t size,
+                     int (*compare)(const void *, const void *))
+    {
+        if (!compare)
+            return;
+        int (*saved)(const void *, const void *) = t_guestCompare;
+        t_guestCompare = compare;
+        ::qsort(base, count, size, alignedGuestCompare);
+        t_guestCompare = saved;
+    }
+
+    void *bridgeBsearch(const void *key, const void *base, size_t count, size_t size,
+                        int (*compare)(const void *, const void *))
+    {
+        if (!compare)
+            return nullptr;
+        int (*saved)(const void *, const void *) = t_guestCompare;
+        t_guestCompare = compare;
+        void *result = ::bsearch(key, base, count, size, alignedGuestCompare);
+        t_guestCompare = saved;
+        return result;
     }
 
     int bridgePrintf(const char *format, ...)

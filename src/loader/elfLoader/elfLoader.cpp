@@ -5,6 +5,7 @@
 #include "symbolResolver.hpp"
 #include "linuxStack.hpp"
 #include "guestTls.hpp"
+#include "guestCall.hpp"
 #include "libcBridge.hpp"
 #include <elfio.hpp>
 #include <cstring>
@@ -862,7 +863,7 @@ bool ElfLoader::RunInit()
                 typedef void (*InitFunc)(void);
                 InitFunc init = reinterpret_cast<InitFunc>(actualInit);
                 GuestTls::EnterGuestCode();
-                init();
+                callGuestVoid(init);
                 GuestTls::EnterHostCall();
             }
 
@@ -890,7 +891,7 @@ bool ElfLoader::RunInit()
                     typedef void (*InitArrayFunc)(void);
                     InitArrayFunc func = reinterpret_cast<InitArrayFunc>(reinterpret_cast<uintptr_t>(funcPtrVal));
                     GuestTls::EnterGuestCode();
-                    func();
+                    callGuestVoid(func);
                     GuestTls::EnterHostCall();
                 }
             }

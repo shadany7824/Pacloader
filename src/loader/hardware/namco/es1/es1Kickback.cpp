@@ -10,6 +10,7 @@
 #include <deque>
 #include <mutex>
 
+#include "../../common/jvs.h"
 #include "../../../platform/platformBackend.h"
 #include "../../../log/log.h"
 #include "es1.h"
@@ -23,6 +24,8 @@ constexpr size_t MaximumQueuedBytes = 1024;
 constexpr uint8_t FrameHeader = 0xff;
 constexpr uint8_t HealthyResult[3] = {'E', '0', '0'};
 constexpr uint8_t WheelCentre[3] = {'H', 0x01, 0xff};
+/* The wheel is 'H' plus a big-endian ten-bit angle, so centred is 0x01ff. */
+constexpr int WheelReportMaximum = 1023;
 
 /* WMMT4's steering PCB is framed instead: 02, command, lengthHigh, lengthLow,
  * payload, checksum, 03, the checksum a plain sum from the command byte on. The
@@ -48,6 +51,7 @@ std::deque<uint8_t> replyBytes;
 bool opened = false;
 unsigned long framesSeen = 0;
 unsigned int unpromptedStateReports = 0;
+bool boardStarted = false;
 
 /* WMMT4 reads board state; report motor and self-check replies proactively. */
 constexpr uint8_t MotorRunning[3] = {'C', '0', '1'};
@@ -59,20 +63,56 @@ bool boardReportsUnprompted(void)
     return es1TitleQuirks()->steeringBoardReportsUnprompted != 0;
 }
 
+bool boardVolunteersSelfCheck(void)
+{
+    return es1TitleQuirks()->steeringBoardVolunteersSelfCheck != 0;
+}
+
+/* The wheel as the board would report it, from the axis the input layer binds. */
+void wheelReport(uint8_t report[3])
+{
+    report[0] = WheelCentre[0];
+    int angle = (WheelCentre[1] << 8) | WheelCentre[2];
+    const JVSIO *jvs = getJVSIO();
+    if (jvs && jvs->analogueMax > 0)
+    {
+        const long long raw = jvs->state.analogueChannel[ANALOGUE_1];
+        angle = static_cast<int>(raw * WheelReportMaximum / jvs->analogueMax);
+        if (angle < 0)
+            angle = 0;
+        else if (angle > WheelReportMaximum)
+            angle = WheelReportMaximum;
+    }
+    report[1] = static_cast<uint8_t>(angle >> 8);
+    report[2] = static_cast<uint8_t>(angle);
+}
+
 /* Advance the steering-board state machine; caller holds boardMutex. */
 void offerState(void)
 {
     if (!replyBytes.empty() || !boardReportsUnprompted())
         return;
 
-    /* Report the centre position immediately after the initial power reply. */
+    /* A board that keeps its self-check to itself stays silent until the title
+     * first powers the motor, then reports position whenever it is read. */
+    if (!boardVolunteersSelfCheck() && !boardStarted)
+        return;
+
+    /* Report the wheel immediately after the initial power reply. */
+    uint8_t wheel[3];
+    wheelReport(wheel);
     const uint8_t *state = MotorRunning;
-    if (unpromptedStateReports == RunningReports)
-        state = WheelCentre;
-    else if (unpromptedStateReports == RunningReports + 1)
-        state = HealthyResult;
-    else if (unpromptedStateReports > RunningReports + 1)
-        state = SelfCheckComplete;
+    if (unpromptedStateReports >= RunningReports)
+    {
+        state = wheel;
+        if (boardVolunteersSelfCheck())
+        {
+            if (unpromptedStateReports == RunningReports + 1)
+                state = HealthyResult;
+            else if (unpromptedStateReports > RunningReports + 1)
+                state = SelfCheckComplete;
+        }
+    }
     replyBytes.insert(replyBytes.end(), state, state + 3);
     ++unpromptedStateReports;
 }
@@ -196,6 +236,7 @@ extern "C" int es1KickbackOpen(const char *path, int)
     replyBytes.clear();
     framesSeen = 0;
     unpromptedStateReports = 0;
+    boardStarted = false;
     if (!opened)
     {
         opened = true;
@@ -269,6 +310,7 @@ extern "C" int es1KickbackClose(int fd)
     commandBytes.clear();
     replyBytes.clear();
     unpromptedStateReports = 0;
+    boardStarted = false;
     return 0;
 }
 
@@ -294,10 +336,27 @@ extern "C" void es1KickbackReportSelfCheck(void)
     queueReports(selfCheckReports, sizeof(selfCheckReports), RunningReports);
 }
 
+extern "C" void es1KickbackReportPoweredSelfCheck(void)
+{
+    /* Motor running, then the self-check result, then the wheel: a board the
+     * title never asks separately has to volunteer the result here. */
+    constexpr uint8_t poweredReports[] = {'C', '0', '1', 'E', '0', '0'};
+    queueReports(poweredReports, sizeof(poweredReports), RunningReports);
+    std::lock_guard<std::mutex> lock(boardMutex);
+    boardStarted = true;
+}
+
 extern "C" void es1KickbackReportMotorPower(int running)
 {
     const uint8_t *state = running ? MotorRunning : SelfCheckComplete;
-    queueReports(state, 3, running ? 0 : RunningReports);
+    /* The power reply is queued once here, so the next volunteered report is
+     * the wheel position rather than the same reply a second time. */
+    queueReports(state, 3, running && boardVolunteersSelfCheck() ? 0 : RunningReports);
+    if (running)
+    {
+        std::lock_guard<std::mutex> lock(boardMutex);
+        boardStarted = true;
+    }
 }
 
 #endif

@@ -84,6 +84,7 @@ set(PACLOADER_SOURCES
     src/loader/hardware/namco/es1/es1Jvs.cpp
     src/loader/hardware/namco/es1/es1Kickback.cpp
     src/loader/hardware/namco/es1/es1Network.cpp
+    src/loader/hardware/namco/es1/es1OnlineNetwork.cpp
     src/loader/hardware/namco/es1/es1VirtualDevices.cpp
     src/loader/hardware/namco/es1/es1AudioCompat.cpp
     src/loader/hardware/namco/es1/es1AlinCompat.cpp
@@ -91,6 +92,14 @@ set(PACLOADER_SOURCES
     src/loader/hardware/namco/es1/es1Titles.cpp
     src/loader/hardware/namco/es1/maximumHeat3d/es1MaximumHeat3D.cpp
     src/loader/hardware/namco/es1/wmmt4/es1Wmmt4.cpp
+    src/loader/hardware/namco/es1/wmmt5/es1Wmmt5.cpp
+    src/loader/hardware/namco/es1/wmmt5/es1Wmmt5Cabinet.cpp
+    src/loader/hardware/namco/es1/wmmt5/es1Wmmt5Card.cpp
+    src/loader/hardware/namco/es1/wmmt5/es1Wmmt5Dongle.cpp
+    src/loader/hardware/namco/es1/wmmt5/es1Wmmt5Log.cpp
+    src/loader/hardware/namco/es1/wmmt5/es1Wmmt5Network.cpp
+    src/loader/hardware/namco/es1/wmmt5/es1Wmmt5Steering.cpp
+    src/loader/hardware/namco/es1/wmmt5/es1Wmmt5Vendor.cpp
     src/loader/hardware/namco/es1/wmmt4/es1Wmmt4Card.cpp
     src/loader/hardware/namco/es1/wmmt4/es1Wmmt4Ffb.cpp
     src/loader/hardware/namco/es1/wmmt4/es1Wmmt4Network.cpp

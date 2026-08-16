@@ -132,6 +132,10 @@ namespace LibcBridge
      * loader through the unresolved-symbol stub. */
     void bridgeStackChkFail(void);
     int bridgePutcUnlocked(int character, FILE *stream);
+    void bridgeQsort(void *base, size_t count, size_t size,
+                     int (*compare)(const void *, const void *));
+    void *bridgeBsearch(const void *key, const void *base, size_t count, size_t size,
+                        int (*compare)(const void *, const void *));
     int bridgePutchar(int character);
     int bridgePutc(int character, FILE *stream);
     int bridgeNice(int increment);

@@ -7,7 +7,7 @@
 #include "guestTls.hpp"
 #include "../config/config.h"
 #include "../hardware/namco/es1/es1.h"
-#include "../hardware/namco/es1/wmmt4/es1Wmmt4Network.hpp"
+#include "../hardware/namco/es1/es1OnlineNetwork.hpp"
 #include "../log/log.h"
 
 #include <algorithm>
@@ -220,9 +220,9 @@ void *bridgeCurlEasyInit()
 {
     void *handle = loadCurlApi() ? g_curlApi.easyInit() : nullptr;
     log_info("ES1 curl: curl_easy_init() -> %p", handle);
-    /* WMMT4's CA bundle, address pins and TLS security level all live in
-     * hardware/namco/es1/wmmt4/; this bridge only owns the DLL. */
-    wmmt4ConfigureCurlHandle(handle, g_curlApi.easySetopt, g_curlApi.slistAppend);
+    /* The cabinet's CA bundle, address pins and TLS security level all live in
+     * hardware/namco/es1/; this bridge only owns the DLL. */
+    es1ConfigureCurlHandle(handle, g_curlApi.easySetopt, g_curlApi.slistAppend);
     return handle;
 }
 
@@ -898,6 +898,30 @@ int writeEventfdInternal(int fd, const void *buffer, size_t length)
     return static_cast<int>(sizeof(value));
 }
 
+bool isEpollInternal(int fd)
+{
+    return fd >= FirstEpollDescriptor &&
+           fd < FirstEpollDescriptor + static_cast<int>(g_epollInstances.size());
+}
+
+/* Closing an epoll set has to give the slot back, or the pool is spent and the
+ * next epoll_create answers EMFILE. */
+int closeEpollInternal(int fd)
+{
+    std::lock_guard<HostMutex> lock(g_epollMutex);
+    for (EpollInstance &instance : g_epollInstances)
+    {
+        if (!instance.used || instance.fd != fd)
+            continue;
+        instance.used = false;
+        instance.fd = -1;
+        instance.entries.clear();
+        return 0;
+    }
+    errno = EBADF;
+    return -1;
+}
+
 int closeEventfdInternal(int fd)
 {
     std::lock_guard<HostMutex> lock(g_epollMutex);
@@ -1053,8 +1077,10 @@ void forgetEdgeState(int fd)
         for (EpollEntry &entry : instance.entries)
         {
             if (entry.fd == fd)
+            {
                 entry.lastReadyEvents = 0;
                 entry.lastReadableBytes = 0;
+            }
         }
     }
 }
@@ -1095,6 +1121,16 @@ int writeEventfd(int fd, const void *buffer, size_t length)
 int closeEventfd(int fd)
 {
     return closeEventfdInternal(fd);
+}
+
+bool isEpoll(int fd)
+{
+    return isEpollInternal(fd);
+}
+
+int closeEpoll(int fd)
+{
+    return closeEpollInternal(fd);
 }
 
 void *bridgeTlsGetAddr(const void *tlsIndex)

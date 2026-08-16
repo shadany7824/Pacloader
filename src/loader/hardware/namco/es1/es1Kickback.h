@@ -19,6 +19,9 @@ int es1KickbackIoctl(int fd, unsigned long request, void *argument);
 /* WMMT4's STR PCB volunteers these reports instead of receiving a request. */
 void es1KickbackReportSelfCheck(void);
 void es1KickbackReportMotorPower(int running);
+/* Power-on reply with the self-check result attached, for a board the title
+ * never asks for that result separately. */
+void es1KickbackReportPoweredSelfCheck(void);
 
 #ifdef __cplusplus
 }

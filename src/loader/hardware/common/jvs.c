@@ -74,6 +74,23 @@ int initJVS()
         strncpy(io.capabilities.name, ident ? ident : "namco ltd.;ES1-JAMMA;Ver1.00;USA,Driving",
                 sizeof(io.capabilities.name) - 1);
         io.capabilities.name[sizeof(io.capabilities.name) - 1] = '\0';
+
+        /* A title that knows its own board describes it instead. */
+        const Es1TitleQuirks *quirks = es1TitleQuirks();
+        if (quirks->jvsBoard.declared)
+        {
+            io.capabilities.players = quirks->jvsBoard.players;
+            io.capabilities.switches = quirks->jvsBoard.switches;
+            io.capabilities.coins = quirks->jvsBoard.coins;
+            io.capabilities.analogueInChannels = quirks->jvsBoard.analogueInChannels;
+            io.capabilities.analogueInBits = quirks->jvsBoard.analogueInBits;
+            io.capabilities.rotaryChannels = quirks->jvsBoard.rotaryChannels;
+            io.capabilities.keypad = quirks->jvsBoard.keypad;
+            io.capabilities.generalPurposeOutputs = quirks->jvsBoard.generalPurposeOutputs;
+            io.capabilities.analogueOutChannels = quirks->jvsBoard.analogueOutChannels;
+            io.capabilities.displayOutColumns = quirks->jvsBoard.displayOutColumns;
+            io.capabilities.displayOutRows = quirks->jvsBoard.displayOutRows;
+        }
     }
     else
     {

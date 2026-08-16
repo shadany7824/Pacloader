@@ -169,7 +169,7 @@ namespace FileSystemBridge
     int bridgeReadlink(const char *path, char *buf, size_t bufsiz);
     FILE* bridgeFdopen(int fd, const char* mode);
     int bridgeSetvbuf(FILE *stream, char *buf, int mode, size_t size);
-    size_t bridgeWritev(int fd, const struct iovec *iov, int iovcnt);
+    ssize_t bridgeWritev(int fd, const struct iovec *iov, int iovcnt);
     ssize_t bridgeReadv(int fd, const struct iovec *iov, int iovcnt);
     int bridgeDup(int fd);
     extern "C" int bridgeFsync(int fd);

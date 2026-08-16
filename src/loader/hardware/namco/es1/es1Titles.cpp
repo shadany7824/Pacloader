@@ -1,6 +1,7 @@
 #include "es1Title.h"
 #include "maximumHeat3d/es1MaximumHeat3D.hpp"
 #include "wmmt4/es1Wmmt4.h"
+#include "wmmt5/es1Wmmt5.h"
 
 #include "../../../log/log.h"
 
@@ -43,10 +44,49 @@ constexpr Es1Title Titles[] = {
             1,
             320 << 6,
             CABINET_PANEL_WANGAN_ES1,
-            /* The steering board volunteers its state. */
+            /* The steering board volunteers its state, self-check included. */
+            1,
             1,
             /* The JVIO master will not talk to a board whose name lacks this. */
             "namco ltd.;NA-JV;Ver1.00;JPN,Multipurpose",
+            /* Board left as the generic ES1 profile; this title accepts it. */
+            {0},
+        },
+    },
+    {
+        /* TODO: provisional. Most traits are WMMT4's and unconfirmed here. */
+        "WMMT5DX+",
+        "WMMT4",
+        "WMMT5DX+",
+        "Wangan Midnight Maximum Tune 5DX+",
+        "WMN5r",
+        "2015",
+        EX,
+        GROUP_WMMT4_ES1,
+        es1Wmmt5dxPlusDetect,
+        es1Wmmt5dxPlusInstallHooks,
+        {
+            {192, 168, 92, 11},
+            {255, 255, 255, 0},
+            "/dev/ttyS0",
+            /* TODO: unverified against this build. */
+            0,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            320 << 6,
+            CABINET_PANEL_WANGAN_ES1,
+            1,
+            /* Its self-check result rides the power-on reply instead. */
+            0,
+            /* This build's JVIO master wants a Ver4.00 board; Ver1.00 is WMMT4's. */
+            "namco ltd.;NA-JV;Ver4.00;JPN,Multipurpose",
+            /* declared, players, switches, coins, analogue in channels/bits,
+             * rotary, keypad, general out, analogue out, display columns/rows. */
+            {1, 1, 24, 2, 8, 16, 4, 0, 18, 2, 80, 25},
         },
     },
     {
@@ -74,14 +114,16 @@ constexpr Es1Title Titles[] = {
             0,
             CABINET_PANEL_MAXIMUM_HEAT_3D,
             0,
+            0,
             nullptr,
+            {0},
         },
     },
 };
 
 constexpr Es1TitleQuirks NeutralQuirks = {{0, 0, 0, 0}, {0, 0, 0, 0}, nullptr, 0,
                                           0, 0, 0, 0, 0, 0, 0,
-                                          CABINET_PANEL_GENERIC, 0, nullptr};
+                                          CABINET_PANEL_GENERIC, 0, 0, nullptr, {0}};
 
 const Es1Title *g_current = nullptr;
 std::string g_revision;

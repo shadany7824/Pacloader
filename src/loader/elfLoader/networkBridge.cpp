@@ -12,7 +12,7 @@
 #include "../hardware/namco/es1/es1Network.h"
 #include "../hardware/namco/es1/es1Title.h"
 #include "../hardware/namco/es1/wmmt4/es1Wmmt4.h"
-#include "../hardware/namco/es1/wmmt4/es1Wmmt4Network.hpp"
+#include "../hardware/namco/es1/es1OnlineNetwork.hpp"
 #include "virtualDeviceRegistry.hpp"
 
 #include <winsock2.h>
@@ -2220,7 +2220,7 @@ extern "C" int NetworkBridge::bridgeGetaddrinfo(const char *node, const char *se
     }
 
     struct addrinfo *hostResult = nullptr;
-    const char *lookupNode = wmmt4RedirectedHost(node);
+    const char *lookupNode = es1RedirectedHost(node);
     static const bool traceDns = std::getenv("LL_WMMT4_DNS_TRACE") != nullptr;
     if (traceDns && node)
         log_info("LLDNS getaddrinfo %s%s%s -> %s", node, service ? ":" : "",
@@ -2367,7 +2367,7 @@ namespace
         hints.ai_socktype = SOCK_STREAM;
 
         struct addrinfo *found = nullptr;
-        const char *lookupName = wmmt4RedirectedHost(name);
+        const char *lookupName = es1RedirectedHost(name);
         if (getaddrinfo(lookupName, nullptr, &hints, &found) != 0 || !found)
             return nullptr;
 

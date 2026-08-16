@@ -14,6 +14,38 @@
 
 char envpath[100] = {0};
 
+/* A cabinet whose data arrives as several packages sees one "data/" tree
+ * because they are mounted over each other; extracted, they stay separate. */
+#define MAX_DATA_OVERLAY_ROOTS 4
+static const char *dataOverlayRoots[MAX_DATA_OVERLAY_ROOTS];
+static size_t dataOverlayRootCount = 0;
+
+void redirectSetDataOverlay(const char *const *roots, size_t count)
+{
+    dataOverlayRootCount = 0;
+    if (!roots)
+        return;
+    for (size_t i = 0; i < count && i < MAX_DATA_OVERLAY_ROOTS; ++i)
+    {
+        if (roots[i])
+            dataOverlayRoots[dataOverlayRootCount++] = roots[i];
+    }
+}
+
+static const char *overlayDataPath(const char *path, char *buffer, size_t size)
+{
+    if (dataOverlayRootCount == 0 || strncmp(path, "data/", 5) != 0)
+        return path;
+
+    for (size_t i = 0; i < dataOverlayRootCount; ++i)
+    {
+        snprintf(buffer, size, "%s/%s", dataOverlayRoots[i], path + 5);
+        if (_access(buffer, 0) == 0)
+            return buffer;
+    }
+    return path;
+}
+
 const char *redirectTempPath(const char *path)
 {
     if (!path)
@@ -27,6 +59,19 @@ const char *redirectTempPath(const char *path)
 
     static _Thread_local char rewritten[4][MAX_PATH_LENGTH];
     static _Thread_local unsigned int nextSlot = 0;
+
+    if (strncmp(path, "data/", 5) == 0)
+    {
+        char *candidate = rewritten[nextSlot % 4];
+        const char *overlaid = overlayDataPath(path, candidate, MAX_PATH_LENGTH);
+        if (overlaid != path)
+        {
+            nextSlot++;
+            return overlaid;
+        }
+        return path;
+    }
+
     const char *boardPath = NULL;
     if (strncmp(path, "/app/mnt/contents2/", 19) == 0)
         boardPath = path + 18;

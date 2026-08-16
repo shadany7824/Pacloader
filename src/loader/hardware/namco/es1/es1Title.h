@@ -78,12 +78,34 @@ typedef struct Es1TitleQuirks
      */
     int steeringBoardReportsUnprompted;
 
+    /* Whether the board's self-check result arrives unasked in the position
+     * stream, rather than only when the title requests it. */
+    int steeringBoardVolunteersSelfCheck;
+
     /*
      * What the loader's JVS board calls itself, or NULL for the ES1 default.
      * A title's JVIO master checks this before it will talk to the board: WMMT4
      * requires the string to contain "NA-JV".
      */
     const char *jvsBoardIdent;
+
+    /* What the cabinet's I/O board declares when the title enumerates it.
+     * Leave declared at 0 to keep the generic ES1 profile. */
+    struct
+    {
+        int declared;
+        int players;
+        int switches;
+        int coins;
+        int analogueInChannels;
+        int analogueInBits;
+        int rotaryChannels;
+        int keypad;
+        int generalPurposeOutputs;
+        int analogueOutChannels;
+        int displayOutColumns;
+        int displayOutRows;
+    } jvsBoard;
 } Es1TitleQuirks;
 
 /*

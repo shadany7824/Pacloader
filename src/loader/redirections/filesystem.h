@@ -12,6 +12,8 @@ extern "C" {
 
 void ConvertPath(char *destination, const char *source, size_t size);
 const char *redirectTempPath(const char *path);
+/* Extra roots searched when a "data/" path is missing; see the definition. */
+void redirectSetDataOverlay(const char *const *roots, size_t count);
 DIR *sharedOpendir(const char *path);
 int sharedRemove(const char *path);
 int sharedMkdir(const char *path, mode_t mode);
