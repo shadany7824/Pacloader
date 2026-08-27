@@ -1,4 +1,5 @@
 #include "es1Title.h"
+#include "kizuna/es1Kizuna.hpp"
 #include "maximumHeat3d/es1MaximumHeat3D.hpp"
 #include "wmmt4/es1Wmmt4.h"
 #include "wmmt5/es1Wmmt5.h"
@@ -22,6 +23,9 @@ constexpr Es1Title Titles[] = {
         "Wangan Midnight Maximum Tune 4",
         "WMN4r",
         "2011",
+        1360,
+        768,
+        "1360x768",
         JP,
         GROUP_WMMT4_ES1,
         es1Wmmt4Detect,
@@ -47,9 +51,11 @@ constexpr Es1Title Titles[] = {
             /* The steering board volunteers its state, self-check included. */
             1,
             1,
-            /* The JVIO master will not talk to a board whose name lacks this. */
-            "namco ltd.;NA-JV;Ver1.00;JPN,Multipurpose",
-            /* Board left as the generic ES1 profile; this title accepts it. */
+            /* NA-JV identity from the WMMT5DX+ manual's I/O TEST screen. It does not
+             * redefine the feature counts, so keep WMMT4's capability profile. */
+            "namco ltd.;NA-JV;Ver4.00;JPN,Multipurpose.",
+            /* Keep the generic ES1 capability profile until WMMT4's own
+             * feature enumeration is verified against a real cabinet. */
             {0},
         },
     },
@@ -61,6 +67,9 @@ constexpr Es1Title Titles[] = {
         "Wangan Midnight Maximum Tune 5DX+",
         "WMN5r",
         "2015",
+        1360,
+        768,
+        "1360x768",
         EX,
         GROUP_WMMT4_ES1,
         es1Wmmt5dxPlusDetect,
@@ -90,12 +99,59 @@ constexpr Es1Title Titles[] = {
         },
     },
     {
+        /* TODO: provisional.  Everything below the identification is a guess
+         * from the executable's strings and has not been seen running. */
+        "KIZUNA3",
+        "Kizuna",
+        "Kizuna",
+        "Kidou Senshi Gundam: Senjou no Kizuna",
+        "GKE1",
+        "2016",
+        1024,
+        768,
+        "1024x768",
+        JP,
+        GROUP_KIZUNA_ES1,
+        es1KizunaDetect,
+        es1KizunaInstallHooks,
+        {
+            /* No fixed address known; report whatever the host adapter has. */
+            {0, 0, 0, 0},
+            {0, 0, 0, 0},
+            /* No steering board - the POD has sticks and pedals over JVS. */
+            nullptr,
+            /* TODO: unverified against this build. */
+            0,
+            /* The POD's screen is a fixed projector panel. */
+            1,
+            /* No H-pattern shifter, and the card is not a reader command. */
+            0,
+            0,
+            /* Its TEST switch latches, the same as the Wangan cabinets - without
+             * this the key has to be held down for test mode to stay up. */
+            1,
+            0,
+            0,
+            0,
+            CABINET_PANEL_KIZUNA_POD,
+            0,
+            0,
+            /* Same JVIO family as WMMT4; the executable carries NA-JV beside its
+             * /dev/ttyS2 open. The version digits are a guess. */
+            "namco ltd.;NA-JV;Ver1.00;JPN,Multipurpose",
+            {0},
+        },
+    },
+    {
         "MHEAT3D",
         "MaximumHeat3D",
         "Maximum Heat 3D",
         "Maximum Heat 3D",
         "8807",
         "2009",
+        1360,
+        768,
+        "1360x768",
         US,
         GROUP_MAXIMUM_HEAT_3D,
         es1MaximumHeat3DDetect,

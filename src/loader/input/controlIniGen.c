@@ -251,6 +251,24 @@ const size_t gDefaultWmmt4BindingsSize = sizeof(gDefaultWmmt4Bindings) / sizeof(
  * TEST UP, TEST DOWN, VIEW CHANGE, NITRO and 3D CHANGE inputs. Their JVS
  * mappings are installed in remapPerGame().
  */
+
+/* Kizuna's POD: only the service panel is mapped so far. The test menu is
+ * driven by SELECT and ENTER, on the service line and the first switch bit. */
+const ControlBinding gDefaultKizunaBindings[] = {
+    {INPUT_TYPE_KEY, 0, SDL_SCANCODE_T, AXIS_MODE_DIGITAL, 0, false, SYSTEM, LA_Test, -1, 0},
+    {INPUT_TYPE_KEY, 0, SDL_SCANCODE_S, AXIS_MODE_DIGITAL, 0, false, PLAYER_1, LA_Service, -1, 0},
+    {INPUT_TYPE_KEY, 0, SDL_SCANCODE_RETURN, AXIS_MODE_DIGITAL, 0, false, PLAYER_1, LA_Enter, -1, 0},
+    {INPUT_TYPE_GAMEPAD_BUTTON, 0, SDL_GAMEPAD_BUTTON_SOUTH, AXIS_MODE_DIGITAL, 0, false, PLAYER_1, LA_Enter, -1, 0},
+    {INPUT_TYPE_KEY, 0, SDL_SCANCODE_I, AXIS_MODE_DIGITAL, 0, false, PLAYER_1, LA_TestUp, -1, 0},
+    {INPUT_TYPE_GAMEPAD_BUTTON, 0, SDL_GAMEPAD_BUTTON_DPAD_UP, AXIS_MODE_DIGITAL, 0, false, PLAYER_1, LA_TestUp, -1, 0},
+    {INPUT_TYPE_KEY, 0, SDL_SCANCODE_K, AXIS_MODE_DIGITAL, 0, false, PLAYER_1, LA_TestDown, -1, 0},
+    {INPUT_TYPE_GAMEPAD_BUTTON, 0, SDL_GAMEPAD_BUTTON_DPAD_DOWN, AXIS_MODE_DIGITAL, 0, false, PLAYER_1, LA_TestDown, -1, 0},
+    {INPUT_TYPE_KEY, 0, SDL_SCANCODE_5, AXIS_MODE_DIGITAL, 0, false, PLAYER_1, LA_Coin, -1, 0},
+};
+
+const size_t gDefaultKizunaBindingsSize =
+    sizeof(gDefaultKizunaBindings) / sizeof(gDefaultKizunaBindings[0]);
+
 const ControlBinding gDefaultMaximumHeat3dBindings[] = {
     // Test-menu and cabinet buttons
     {INPUT_TYPE_KEY, 0, SDL_SCANCODE_T, AXIS_MODE_DIGITAL, 0, false, SYSTEM, LA_Test, -1, 0},
@@ -607,6 +625,8 @@ int createDefaultControlsIni(const char *fileName)
     addBindingsToIni(ini, "WMMT", gDefaultWmmtBindings, gDefaultWmmtBindingsSize);
     addBindingsToIni(ini, "WMMT4", gDefaultWmmt4Bindings, gDefaultWmmt4BindingsSize);
     iniSetValue(ini, "WMMT4", "TestToggle", "1");
+    addBindingsToIni(ini, "Kizuna", gDefaultKizunaBindings, gDefaultKizunaBindingsSize);
+    iniSetValue(ini, "Kizuna", "TestToggle", "1");
     addBindingsToIni(ini, "MaximumHeat3D", gDefaultMaximumHeat3dBindings,
                      gDefaultMaximumHeat3dBindingsSize);
     iniSetValue(ini, "MaximumHeat3D", "TestToggle", "1");

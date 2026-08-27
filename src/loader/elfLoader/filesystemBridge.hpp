@@ -8,8 +8,6 @@
 #ifndef _DIRENT_H
 #define _DIRENT_H
 
-#include <windows.h>
-
 struct linux_dirent
 {
     long d_ino;
@@ -129,16 +127,13 @@ struct linux_stat64_safe
 
 #pragma pack(pop)
 
-// The sizes the guest's libc was built against; a mismatch here is a buffer
-// overrun into whatever the guest put next to its stat buffer.
+// Keep these layouts identical to the guest libc's stat buffers.
 static_assert(sizeof(struct linux_stat) == 64, "i386 Linux old struct stat is 64 bytes");
 static_assert(sizeof(struct linux_stat64) == 96, "i386 Linux struct stat64 is 96 bytes");
 static_assert(sizeof(struct linux_stat_ver3) == 88, "i386 Linux struct stat (ver 3) is 88 bytes");
 static_assert(sizeof(struct linux_stat64_safe) == 96, "i386 Linux struct stat64 is 96 bytes");
 
-// =============================================================
-//   File Type Flags (st_mode)
-// =============================================================
+// File type flags for st_mode.
 #define LINUX_S_IFMT 0170000
 #define LINUX_S_IFSOCK 0140000
 #define LINUX_S_IFLNK 0120000
@@ -190,12 +185,11 @@ extern "C"
     int bridgeUngetc(int c, FILE *stream);
 
     void *bridgeOpendir(const char *name);
-    /* Plain readdir with no title-specific behaviour; bridgeReaddir() is the
-     * same thing plus the WMMT4 end-of-directory quirk documented at its
-     * definition. */
+    /* Plain readdir; bridgeReaddir() adds the WMMT4 end-of-directory quirk. */
     struct linux_dirent *bridgeReaddirPosix(void *dirp);
     struct linux_dirent *bridgeReaddir(void *dirp);
     int bridgeClosedir(void *dirp);
+    void bridgeRewinddir(void *dirp);
 
     int bridgeUnlink(const char *pathname);
     int bridgeRename(const char *oldpath, const char *newpath);

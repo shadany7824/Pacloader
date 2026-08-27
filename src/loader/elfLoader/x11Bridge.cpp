@@ -16,6 +16,9 @@
 #include <mutex>
 #include <type_traits>
 
+extern int gWidth;
+extern int gHeight;
+
 namespace
 {
 /*
@@ -412,6 +415,61 @@ extern "C" int bridgeXNextEvent(void *display, void *event)
     return 0;
 }
 
+/* The predicate is guest code, so deliver the next pending event and let the
+ * caller's loop decide; blocking would hang on events this shim never makes. */
+extern "C" int bridgeXIfEvent(void *display, void *event, void *predicate, void *arg)
+{
+    (void)predicate;
+    (void)arg;
+    static bool warned = false;
+    if (!warned)
+    {
+        warned = true;
+        log_warn("XIfEvent: the predicate is not consulted; delivering pending events");
+    }
+    return bridgeXNextEvent(display, event);
+}
+
+/* Reports the loader's own window as the mode line. Titles read screen
+ * geometry from this, so it must match the window, not a real modeline. */
+extern "C" int bridgeXF86VidModeGetModeLine(void *display, int screen, int *dotclock,
+                                            void *modeline)
+{
+    (void)display;
+    (void)screen;
+
+    const unsigned short width = static_cast<unsigned short>(gWidth > 0 ? gWidth : 1024);
+    const unsigned short height = static_cast<unsigned short>(gHeight > 0 ? gHeight : 768);
+
+    /* Blanking and dot clock must be non-zero and agree: callers derive refresh
+     * as dotclock / (htotal * vtotal), so a zero clock divides by zero. */
+    const unsigned short htotal = static_cast<unsigned short>(width + width / 4);
+    const unsigned short vtotal = static_cast<unsigned short>(height + 38);
+
+    if (dotclock)
+        *dotclock = static_cast<int>(60ull * htotal * vtotal / 1000ull); /* kHz */
+    if (!modeline)
+        return 0;
+
+    /* struct XF86VidModeModeLine: nine unsigned shorts, then flags, privsize
+     * and a private pointer. */
+    unsigned short *fields = static_cast<unsigned short *>(modeline);
+
+    fields[0] = width;                                          /* hdisplay */
+    fields[1] = static_cast<unsigned short>(width + width / 16); /* hsyncstart */
+    fields[2] = static_cast<unsigned short>(width + width / 8);  /* hsyncend */
+    fields[3] = htotal;
+    fields[4] = 0;                                              /* hskew */
+    fields[5] = height;                                         /* vdisplay */
+    fields[6] = static_cast<unsigned short>(height + 3);         /* vsyncstart */
+    fields[7] = static_cast<unsigned short>(height + 9);         /* vsyncend */
+    fields[8] = vtotal;
+
+    unsigned char *tail = static_cast<unsigned char *>(modeline) + 20;
+    std::memset(tail, 0, 12); /* flags, privsize, private */
+    return 1;
+}
+
 extern "C" int bridgeXPending(void *display)
 {
     (void)display;
@@ -548,6 +606,8 @@ void initBridges()
     map("XMapWindow", bridgeXMapWindow);
     map("XMoveResizeWindow", bridgeXMoveResizeWindow);
     map("XNextEvent", bridgeXNextEvent);
+    map("XIfEvent", bridgeXIfEvent);
+    map("XF86VidModeGetModeLine", bridgeXF86VidModeGetModeLine);
     map("XOpenDisplay", bridgeXOpenDisplay);
     map("XPending", bridgeXPending);
     map("XPutImage", bridgeXPutImage);

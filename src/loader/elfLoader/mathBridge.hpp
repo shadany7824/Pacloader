@@ -102,4 +102,11 @@ namespace MathBridge
     extern "C" int bridge_finitef(float x);
     extern "C" double bridge_frexp(double x, int *exp);
     extern "C" float bridge_frexpf(float x, int *exp);
+
+    extern "C" void bridge_sincos(double x, double *sinResult, double *cosResult);
+    extern "C" void bridge_sincosf(float x, float *sinResult, float *cosResult);
+    extern "C" int bridge_fesetround(int mode);
+    extern "C" int bridge_fegetround(void);
+    extern "C" int bridge_fetestexcept(int excepts);
+    extern "C" int bridge_feclearexcept(int excepts);
 }

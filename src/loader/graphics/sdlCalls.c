@@ -10,7 +10,6 @@
 #include <GL/glx.h>
 #endif
 
-#include <glad/gl.h>
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_error.h>
 #include <stdbool.h>
@@ -72,9 +71,7 @@ void GLAPIENTRY openglDebugCallback(GLenum source, GLenum type, GLuint id, GLenu
 
 int initSDL()
 {
-    /* X11 guests expect XMapWindow/XRaiseWindow to activate their top-level
-     * window. SDL leaves this platform-dependent unless these hints are set,
-     * which can leave the launcher's console in front on Windows. */
+    /* Keep X11 guest windows active when SDL creates or raises them. */
     SDL_SetHint(SDL_HINT_WINDOW_ACTIVATE_WHEN_SHOWN, "1");
     SDL_SetHint(SDL_HINT_WINDOW_ACTIVATE_WHEN_RAISED, "1");
 
@@ -87,11 +84,7 @@ int initSDL()
     return 0;
 }
 
-/*
- * Windows ghosts a window whose thread stops taking messages, which a long load
- * looks exactly like.  So ghosting is off and the queue is pumped from the file
- * paths a load goes through - by the owning thread only, and throttled.
- */
+/* Pump the owning window thread during long loads to avoid ghosting. */
 #define WINDOW_PUMP_INTERVAL_MS 100
 
 static SDL_ThreadID g_windowThread = 0;
@@ -100,8 +93,7 @@ static Uint64 g_lastPumpTicks = 0;
 static void disableWindowGhosting(void)
 {
 #if defined(_WIN32) || defined(__MINGW32__)
-    /* Loaded through SDL rather than windows.h, which clashes with the GL
-     * headers here.  user32 is resident anyway, so the handle stays open. */
+    /* Load user32 through SDL to avoid including windows.h in this C file. */
     SDL_SharedObject *user32 = SDL_LoadObject("user32.dll");
     if (!user32)
         return;
@@ -113,12 +105,7 @@ static void disableWindowGhosting(void)
 #endif
 }
 
-/* The GL hooks must never ask SDL for this: they run on the render threads.
- *
- * ES1 only. The letterbox exists because those titles set a viewport for their
- * own size and the loader passes it through, which leaves the picture in a
- * corner of a larger drawable. N2 titles scale themselves through blitStretch(),
- * so letterboxing them as well drew nothing at all in fullscreen. */
+/* Publish drawable size for ES1 letterboxing without calling SDL on render threads. */
 void publishDrawableSize(void)
 {
     if (!g_SdlWindow || !platformIsES1())
@@ -135,9 +122,7 @@ void keepWindowResponsive(void)
     if (!g_windowThread)
         return;
 
-    /* The thread test comes before the interval test on purpose: a queue belongs
-     * to the thread that created the window, so sharing the throttle lets a busy
-     * worker starve the owning thread until Windows calls the window hung. */
+    /* Only the window-owning thread may pump its native queue. */
     if (SDL_GetCurrentThreadID() != g_windowThread)
         return;
 
@@ -146,9 +131,7 @@ void keepWindowResponsive(void)
         return;
 
     g_lastPumpTicks = now;
-    /* Pump the native queue without consuming it: SDL 1.2 titles read events
-     * themselves, and draining here would swallow TEST before the guest test
-     * menu sees it. */
+    /* Pump without draining; SDL 1.2 titles consume the events themselves. */
     SDL_PumpEvents();
 #if defined(_WIN32) || defined(__MINGW32__)
     if (platformIsES1())
@@ -199,7 +182,7 @@ void startSDL()
 
     if (g_SdlWindow)
     {
-        // Whoever created the window is the only thread allowed to pump for it.
+        /* The creating thread owns the window queue. */
         g_windowThread = SDL_GetCurrentThreadID();
         log_debug("Window created on thread %llu; only it may pump for the window",
                   (unsigned long long)g_windowThread);
@@ -219,7 +202,7 @@ void startSDL()
 #endif
     }
 
-    // Hacky way to make AxA games render the characters properly
+    /* AxA requires the legacy 1024x768 window size. */
     if (gId == QUIZ_AXA_SBMS || gId == QUIZ_AXA_SBUR_LIVE)
         SDL_SetWindowSize(g_SdlWindow, 1024, 768);
 
@@ -251,8 +234,7 @@ void startSDL()
         exit(EXIT_FAILURE);
     }
 
-    /* Off: the QPC grid alone decides when to present, which tears. On: the
-     * display paces the swap and the limiter stands aside, see frameTiming(). */
+    /* Let the display pace swaps when vsync is enabled. */
     if (getConfig()->fpsLimiter && !setSDLSwapInterval(getConfig()->vsync ? 1 : 0))
         log_warn("Failed to set OpenGL swap interval to %d: %s",
                  getConfig()->vsync ? 1 : 0, SDL_GetError());
@@ -265,13 +247,13 @@ void startSDL()
 
     if (getConfig()->showDebugMessages)
     {
-        // Enable OpenGL debug output
+        /* Enable OpenGL diagnostics. */
         glad_glEnable(GL_DEBUG_OUTPUT);
         glad_glEnable(GL_DEBUG_OUTPUT_SYNCHRONOUS);
         glad_glDebugMessageCallback(openglDebugCallback, NULL);
     }
 
-    // If games are any of the LGJ or Primeval Hunt, we prevent the window to resize.
+    /* Restrict resizing for fixed-size cabinet titles. */
     if ((gGrp == GROUP_LGJ || gId == PRIMEVAL_HUNT_SBPP) && !getConfig()->fullscreen)
         SDL_SetWindowMaximumSize(g_SdlWindow, gWidth, gHeight);
     else if (gGrp != GROUP_LGJ)
@@ -279,7 +261,7 @@ void startSDL()
 
     SDL_SetWindowMinimumSize(g_SdlWindow, gWidth, gHeight);
 
-    // Hacky way to make AxA games render the characters properly
+    /* Center the legacy AxA window. */
     if (gId == QUIZ_AXA_SBMS || gId == QUIZ_AXA_SBUR_LIVE)
         SDL_SetWindowPosition(g_SdlWindow, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
 
@@ -314,7 +296,7 @@ void startSDL()
     Uint64 startTime = SDL_GetTicks();
     int running = 1;
 
-    // We clear the window background
+    /* Clear the background before showing the window. */
     while (running)
     {
         if (SDL_GetTicks() - startTime >= 1000)
@@ -415,7 +397,7 @@ int presentSDLFrame(const SDLFramePresentOptions *options)
         return 0;
     }
 
-    // Present only completed WMMT frames.
+    /* Present only completed WMMT frames. */
     if (gGrp == GROUP_WMMT3 && n2WmmtShouldBlit())
         blitStretch();
 
@@ -479,8 +461,7 @@ void pollEvents()
 {
     uint64_t profileStart = PerfProfiler_Begin("SDL", "pollEvents");
     SDL_Event event;
-    /* Only count this as a pump when it ran on the owning thread and really
-     * drained the queue; otherwise it throttles out the pump that matters. */
+    /* Refresh the pump timestamp only on the owning thread. */
     if (SDL_GetCurrentThreadID() == g_windowThread)
         g_lastPumpTicks = SDL_GetTicks();
     while (SDL_PollEvent(&event))

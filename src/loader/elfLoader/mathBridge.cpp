@@ -6,6 +6,7 @@
 
 #include <math.h>
 #include <cmath>
+#include <cfenv>
 
 #define MAP(name, func) SymbolResolver::GetInstance().RegisterVTable(name, reinterpret_cast<void *>(func))
 
@@ -13,6 +14,12 @@ namespace MathBridge
 {
     void initBridges()
     {
+        MAP("sincos", bridge_sincos);
+        MAP("sincosf", bridge_sincosf);
+        MAP("fesetround", bridge_fesetround);
+        MAP("fegetround", bridge_fegetround);
+        MAP("fetestexcept", bridge_fetestexcept);
+        MAP("feclearexcept", bridge_feclearexcept);
         MAP("atan", bridge_atan);
         MAP("atan2", bridge_atan2);
         MAP("atanf", bridge_atanf);
@@ -506,6 +513,44 @@ extern "C" int bridge_signbitd(double x)
 extern "C" int bridge_signbitf(float x)
 {
     return std::signbit(x) ? 1 : 0;
+}
+
+/* GCC emits a call to sincos() whenever it sees sin() and cos() of the same
+ * argument, so a title never names it and still needs it. */
+extern "C" void bridge_sincos(double x, double *sinResult, double *cosResult)
+{
+    if (sinResult)
+        *sinResult = std::sin(x);
+    if (cosResult)
+        *cosResult = std::cos(x);
+}
+
+extern "C" void bridge_sincosf(float x, float *sinResult, float *cosResult)
+{
+    if (sinResult)
+        *sinResult = std::sin(x);
+    if (cosResult)
+        *cosResult = std::cos(x);
+}
+
+extern "C" int bridge_fesetround(int mode)
+{
+    return fesetround(mode);
+}
+
+extern "C" int bridge_fetestexcept(int excepts)
+{
+    return fetestexcept(excepts);
+}
+
+extern "C" int bridge_feclearexcept(int excepts)
+{
+    return feclearexcept(excepts);
+}
+
+extern "C" int bridge_fegetround(void)
+{
+    return fegetround();
 }
 
 #endif

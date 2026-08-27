@@ -565,9 +565,63 @@ extern "C"
 
 namespace PosixCompatBridge
 {
+    /* The cabinet runs Asia/Tokyo with the RTC in local time, and the CRT reads
+     * TZ, which the loader does not otherwise set. */
+    void bridgeTzset(void)
+    {
+        static bool seeded = false;
+        if (!seeded)
+        {
+            seeded = true;
+            if (!getenv("TZ"))
+                _putenv("TZ=JST-9");
+        }
+        _tzset();
+    }
+
+    /* Windows has no FIFOs. Failing here beats pretending the node exists and
+     * making the caller's open() fail less obviously. */
+    int bridgeMkfifo(const char *path, unsigned int mode)
+    {
+        (void)mode;
+        log_warn("mkfifo(\"%s\") is not supported on this host", path ? path : "");
+        errno = EPERM;
+        return -1;
+    }
+
+    /* Every prctl() a game issues is advisory - naming a thread, asking to be
+     * signalled when the parent dies - so reporting success costs nothing. */
+    int bridgePrctl(int option, unsigned long a, unsigned long b, unsigned long c,
+                    unsigned long d)
+    {
+        (void)a;
+        (void)b;
+        (void)c;
+        (void)d;
+        log_debug("prctl(%d) ignored", option);
+        return 0;
+    }
+
+    /* Zero-copy pipe splicing has no host equivalent; callers fall back to a
+     * normal write() when it fails. */
+    int bridgeVmsplice(int fd, const void *iov, unsigned long count, unsigned int flags)
+    {
+        (void)fd;
+        (void)iov;
+        (void)count;
+        (void)flags;
+        errno = EPERM;
+        return -1;
+    }
+
     void initBridges()
     {
         log_info("Initializing POSIX compatibility Bridges...");
+
+        MAP("tzset", bridgeTzset);
+        MAP("mkfifo", bridgeMkfifo);
+        MAP("prctl", bridgePrctl);
+        MAP("vmsplice", bridgeVmsplice);
 
         MAP("sysconf", bridgeSysconf);
         MAP("sysinfo", bridgeSysinfo);

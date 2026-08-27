@@ -7,11 +7,7 @@
 #include "iniParser.h"
 #include "../log/log.h"
 
-/**
- * @brief Trims leading and trailing whitespace from a string in-place.
- * @param str The string to trim.
- * @return A pointer to the beginning of the trimmed string.
- */
+/* Trim leading and trailing whitespace in place. */
 static char *trimString(char *str)
 {
     char *end;
@@ -26,14 +22,7 @@ static char *trimString(char *str)
     return str;
 }
 
-/**
- * @brief Loads and parses an INI file into an IniConfig structure.
- * This function reads an INI file, parsing its sections and key-value pairs.
- * It allocates memory for the configuration structure, which must be freed
- * later by calling iniFree().
- * @param filename The path to the INI file.
- * @return A pointer to the newly created IniConfig structure, or NULL on failure.
- */
+/* Load an INI file; the caller owns the returned configuration. */
 IniConfig *iniLoad(const char *filename)
 {
     FILE *file = fopen(filename, "r");
@@ -97,12 +86,7 @@ IniConfig *iniLoad(const char *filename)
     return config;
 }
 
-/**
- * @brief Retrieves a section from the INI configuration by its name.
- * @param config Pointer to the INI configuration structure.
- * @param section_name The name of the section to find.
- * @return A pointer to the IniSection if found, otherwise NULL.
- */
+/* Find a section by name. */
 IniSection *iniGetSection(const IniConfig *config, const char *sectionName)
 {
     if (!config)
@@ -115,11 +99,7 @@ IniSection *iniGetSection(const IniConfig *config, const char *sectionName)
     return NULL;
 }
 
-/**
- * @brief Frees all memory associated with an IniConfig structure.
- * This includes all sections, key-value pairs, and their names.
- * @param config Pointer to the INI configuration structure to free.
- */
+/* Free an INI configuration and all owned strings. */
 void iniFree(IniConfig *config)
 {
     if (!config)
@@ -138,16 +118,7 @@ void iniFree(IniConfig *config)
     free(config);
 }
 
-/**
- * @brief Sets a key-value pair in a given section.
- * If the section does not exist, it is created.
- * If the key exists within the section, its value is updated.
- * If the key does not exist, it is created.
- * @param config Pointer to the INI configuration structure.
- * @param section_name The name of the section.
- * @param key The key to set.
- * @param value The value to associate with the key.
- */
+/* Update a key or append it to the requested section. */
 bool iniSetValue(IniConfig *config, const char *sectionName, const char *key, const char *value)
 {
     if (!config || !sectionName || !key || !value)
@@ -155,7 +126,6 @@ bool iniSetValue(IniConfig *config, const char *sectionName, const char *key, co
         return false;
     }
 
-    // Find the section, or create it if it doesn't exist.
     IniSection *section = iniGetSection(config, sectionName);
     if (!section)
     {
@@ -169,19 +139,16 @@ bool iniSetValue(IniConfig *config, const char *sectionName, const char *key, co
         section->numPairs = 0;
     }
 
-    // Find the key within the section.
     for (int i = 0; i < section->numPairs; i++)
     {
         if (strcmp(section->pairs[i].key, key) == 0)
         {
-            // Key found, update the value.
             free(section->pairs[i].value);
             section->pairs[i].value = strdup(value);
             return true;
         }
     }
 
-    // Key not found, add a new key-value pair.
     IniKeyValuePair *newPairs = realloc(section->pairs, (section->numPairs + 1) * sizeof(IniKeyValuePair));
     if (!newPairs)
         return false;
@@ -192,14 +159,7 @@ bool iniSetValue(IniConfig *config, const char *sectionName, const char *key, co
     return true;
 }
 
-/**
- * @brief Saves the in-memory INI configuration to a file.
- * NOTE: This will overwrite the existing file and will lose any comments
- * or special formatting from the original.
- * @param config Pointer to the INI configuration to save.
- * @param filename The path of the file to save to.
- * @return 0 on success, -1 on failure (e.g., cannot open file for writing).
- */
+/* Save the configuration, replacing any existing file. */
 int iniSave(const IniConfig *config, const char *filename)
 {
     if (!config || !filename)
@@ -214,7 +174,6 @@ int iniSave(const IniConfig *config, const char *filename)
         return -1;
     }
 
-    // Write each section and its key-value pairs
     for (int i = 0; i < config->numSections; i++)
     {
         IniSection *section = &config->sections[i];
@@ -224,7 +183,6 @@ int iniSave(const IniConfig *config, const char *filename)
             IniKeyValuePair *pair = &section->pairs[j];
             fprintf(file, "%s = %s\n", pair->key, pair->value);
         }
-        // Add a blank line between sections for readability
         if (i < config->numSections - 1)
         {
             fprintf(file, "\n");

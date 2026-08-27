@@ -21,26 +21,21 @@ static int damperEffect = -1;
 static int constantEffect = -1;
 static int periodicEffect = -1;
 
-// The last state actually pushed to the device, so repeats can be dropped.
+/* Last state submitted to the device; identical states can be skipped. */
 static FfbSteeringState lastSteering;
 static int steeringApplied;
 
-/*
- * Effect bookkeeping.  Creating and destroying an effect is far dearer than
- * updating one, so a state that keeps crossing a magnitude threshold can cost
- * more than a state that changes constantly.  Counting them is the only way to
- * tell those two apart from a frame rate alone.
- */
+/* Counters used to diagnose effect churn and dropped steering updates. */
 static unsigned long effectCreates;
 static unsigned long effectDestroys;
 static unsigned long effectUpdates;
 static unsigned long steeringApplies;
 static unsigned long steeringSkips;
 
-// Vibration magnitude last pushed, to spot the rising edge of a fresh burst.
+/* Previous vibration magnitude, used to detect a new burst. */
 static float previousVibration;
 
-// Defined with the worker below; started as soon as a device is chosen.
+/* The worker starts when a compatible device is selected. */
 static void startSteeringWorker(void);
 
 static float clampUnit(float value)
@@ -92,12 +87,7 @@ static void applyEffect(int *effectId, SDL_HapticEffect *effect)
 
     if (*effectId >= 0)
     {
-        /*
-         * An update keeps a running effect running, so it must not be followed
-         * by another run.  Re-running costs a second driver round trip and
-         * restarts the effect from its beginning, which turns a steady spring
-         * into one that is continually retriggered.
-         */
+        /* Updating a running effect preserves its phase and avoids retriggering. */
         if (SDL_UpdateHapticEffect(activeHaptic, *effectId, effect))
         {
             effectUpdates++;
@@ -138,8 +128,7 @@ static int selectHaptic(SDL_Haptic *haptic, const char *name)
 
     Uint32 features = SDL_GetHapticFeatures(haptic);
 
-    // Report the raw mask either way: knowing which effects a wheel advertises
-    // is the only way to tell a rejected device from an unsupported one.
+    /* Log the raw mask before deciding whether the device is usable. */
     log_info("FFB: %s features=0x%08x [%s%s%s%s%s%s] axes=%d effects=%d",
              name ? name : "SDL haptic", features,
              (features & SDL_HAPTIC_CONSTANT) ? "constant " : "",
@@ -165,8 +154,7 @@ void sdlFfbInit(void)
     if (activeHaptic)
         return;
 
-    // Slots are player-indexed, not packed, so scan all of them rather than
-    // stopping at joysticksCount.
+    /* Slots are player-indexed, so scan the complete array. */
     for (int i = 0; i < MAX_JOYSTICKS; ++i)
     {
         SDL_Joystick *joystick = NULL;
@@ -283,10 +271,7 @@ void sdlFfbStopSteering(void)
 
 static void applySteeringNow(const FfbSteeringState *original)
 {
-    // A disabled state is driven to zero rather than torn down: the game toggles
-    // torque off and back on sixty odd milliseconds apart, over and over, and
-    // rebuilding every effect each time costs the frame time this worker exists
-    // to save.
+    /* Zero disabled effects so rapid game-side toggles do not recreate them. */
     FfbSteeringState zeroed;
     const FfbSteeringState *state = original;
 
@@ -305,44 +290,27 @@ static void applySteeringNow(const FfbSteeringState *original)
                  steeringApplies, steeringSkips, effectCreates, effectDestroys,
                  effectUpdates);
 
-    /*
-     * Effects are left allocated once they exist and driven to zero instead of
-     * being torn down, because the game's magnitudes cross zero constantly -
-     * reflection alone was measured toggling 0/34/0 while driving - and a
-     * create/destroy pair per crossing costs far more than an update carrying a
-     * zero.  They are only really destroyed when steering stops.
-     */
+    /* Keep effects allocated and update their magnitude instead of recreating them. */
     const float spring = clampUnit(state->springStrength);
     if ((activeFeatures & SDL_HAPTIC_SPRING) && (spring > 0.001f || springEffect >= 0))
     {
         SDL_HapticEffect effect;
         memset(&effect, 0, sizeof(effect));
         effect.type = SDL_HAPTIC_SPRING;
-        /*
-         * The one effect that reaches the wheel is the constant force, and the
-         * only thing it does differently is name its axis. A condition effect
-         * left with a zeroed direction defaults to polar zero, which is not the
-         * steering axis on a two axis device.
-         */
+        /* Name the steering axis explicitly on multi-axis devices. */
         effect.condition.direction.type = SDL_HAPTIC_STEERING_AXIS;
         effect.condition.length = SDL_HAPTIC_INFINITY;
         effect.condition.center[0] = 0;
         effect.condition.right_sat[0] = effect.condition.left_sat[0] = 65535;
         effect.condition.deadband[0] =
             (Uint16)(clampUnit(state->springDeadband) * 65535.0f);
-        /*
-         * Both coefficients are positive, which is what makes a spring pull
-         * back towards its centre. A negative one on the right pushed further
-         * right instead, so the two halves fought each other and what reached
-         * the wheel was a fraction of the centring force the game asked for.
-         */
+        /* Positive coefficients pull both sides back towards the centre. */
         effect.condition.right_coeff[0] = (Sint16)(32767.0f * spring);
         effect.condition.left_coeff[0] = (Sint16)(32767.0f * spring);
         applyEffect(&springEffect, &effect);
     }
 
-    // Optional floor, off by default. The cabinet is direct drive too, so the
-    // game's own viscosity is already the damping it means - this is taste.
+    /* Apply the optional damper floor before sending the condition effect. */
     float damper = clampUnit(state->damperStrength);
     const float damperFloor = clampUnit(state->damperFloor);
     if (damper < damperFloor)
@@ -356,7 +324,7 @@ static void applySteeringNow(const FfbSteeringState *original)
         effect.condition.direction.type = SDL_HAPTIC_STEERING_AXIS;
         effect.condition.length = SDL_HAPTIC_INFINITY;
         effect.condition.right_sat[0] = effect.condition.left_sat[0] = 65535;
-        // Same again: a damper resists movement in both directions.
+        /* A damper resists movement in both directions. */
         effect.condition.right_coeff[0] = (Sint16)(32767.0f * damper);
         effect.condition.left_coeff[0] = (Sint16)(32767.0f * damper);
         applyEffect(&damperEffect, &effect);
@@ -384,8 +352,7 @@ static void applySteeringNow(const FfbSteeringState *original)
         memset(&effect, 0, sizeof(effect));
         effect.type = SDL_HAPTIC_CONSTANT;
         effect.constant.direction.type = SDL_HAPTIC_STEERING_AXIS;
-        // Held indefinitely: a length taken from the vibration fields would end
-        // the effect behind the game's back and need it recreated.
+        /* Keep the constant force alive until the title changes it. */
         effect.constant.length = SDL_HAPTIC_INFINITY;
         effect.constant.level = (Sint16)(constant * 32767.0f);
         applyEffect(&constantEffect, &effect);
@@ -400,8 +367,7 @@ static void applySteeringNow(const FfbSteeringState *original)
             memset(&effect, 0, sizeof(effect));
             effect.type = SDL_HAPTIC_SINE;
             effect.periodic.direction.type = SDL_HAPTIC_STEERING_AXIS;
-            // The game passes a duration, so let the burst end on its own
-            // rather than deciding here how long a shake should last.
+            /* Let the title-provided duration end the burst. */
             effect.periodic.length = state->vibrationDurationMs > 0
                                          ? (Uint32)state->vibrationDurationMs
                                          : SDL_HAPTIC_INFINITY;
@@ -411,8 +377,7 @@ static void applySteeringNow(const FfbSteeringState *original)
             effect.periodic.magnitude = (Sint16)(vibration * 32767.0f);
             applyEffect(&periodicEffect, &effect);
 
-            // A burst that already ran to its length is stopped, so starting
-            // the next one takes a run and not just new parameters.
+            /* Restart a new burst after the previous one has ended. */
             if (periodicEffect >= 0 && vibration > 0.001f &&
                 previousVibration <= 0.001f)
                 SDL_RunHapticEffect(activeHaptic, periodicEffect, 1);
@@ -423,13 +388,7 @@ static void applySteeringNow(const FfbSteeringState *original)
         sdlFfbRumble(vibration, vibration, state->vibrationDurationMs);
 }
 
-/*
- * Every SDL haptic call runs here rather than on the thread that owns the
- * game's steering setters. A DirectInput parameter change is a driver round
- * trip, and the game restates its steering about eighty six times a second -
- * enough frame time to be visible. The worker applies only the newest state, so
- * a burst collapses into one update.
- */
+/* Apply haptics on a worker and coalesce bursts into the newest state. */
 static SDL_Thread *steeringWorker;
 static SDL_Mutex *steeringLock;
 static SDL_Condition *steeringSignal;
@@ -460,13 +419,7 @@ static int SDLCALL steeringWorkerMain(void *unused)
         SDL_LockMutex(steeringLock);
         while (workerRunning && !pendingValid)
         {
-            /*
-             * Time out rather than sleeping indefinitely so the poller below
-             * still runs when the game has gone quiet. It stops calling
-             * clKickback's setters altogether between races, and the board's
-             * own fields keep changing while it does - that is where the
-             * release of the wheel comes from.
-             */
+            /* Timeout so the poller can refresh quiet game-side state. */
             if (!SDL_WaitConditionTimeout(steeringSignal, steeringLock, 50))
                 break;
         }
@@ -556,11 +509,7 @@ void sdlFfbApplySteering(const FfbSteeringState *state)
     if (!state || !activeHaptic)
         return;
 
-    /*
-     * The game restates its whole steering state from every one of clKickback's
-     * setters, so most calls carry nothing new - measured at better than nine
-     * in ten. Dropping those here keeps them off the worker entirely.
-     */
+    /* Skip identical states before they reach the worker. */
     if (steeringApplied && memcmp(&lastSteering, state, sizeof(*state)) == 0)
     {
         steeringSkips++;
@@ -577,6 +526,24 @@ void sdlFfbApplySteering(const FfbSteeringState *state)
 
     SDL_LockMutex(steeringLock);
     pendingSteering = *state;
+    pendingValid = 1;
+    SDL_SignalCondition(steeringSignal);
+    SDL_UnlockMutex(steeringLock);
+}
+
+void sdlFfbReapplySteering(void)
+{
+    if (!activeHaptic || !steeringApplied)
+        return;
+
+    if (!steeringWorker)
+    {
+        applySteeringNow(&lastSteering);
+        return;
+    }
+
+    SDL_LockMutex(steeringLock);
+    pendingSteering = lastSteering;
     pendingValid = 1;
     SDL_SignalCondition(steeringSignal);
     SDL_UnlockMutex(steeringLock);

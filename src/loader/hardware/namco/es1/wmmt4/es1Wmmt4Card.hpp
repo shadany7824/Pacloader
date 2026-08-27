@@ -11,6 +11,9 @@ extern "C" {
 /* Installs the reader hooks; returns how many were installed. */
 int wmmt4InstallCardHooks(void);
 
+/* Present and remove with banapassportPresent()/banapassportRemove() in
+ * hardware/namco/banapassport - the same for every title using this reader. */
+
 #ifdef __cplusplus
 }
 #endif

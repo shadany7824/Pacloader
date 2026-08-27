@@ -526,6 +526,7 @@ namespace NetworkBridge
         MAP("gethostbyname", bridgeGethostbyname);
         MAP("gethostbyaddr", bridgeGethostbyaddr);
         MAP("gethostname", bridgeGethostname);
+        MAP("gai_strerror", bridgeGaiStrerror);
         MAP("getservbyname", bridgeGetservbyname);
         MAP("getaddrinfo", bridgeGetaddrinfo);
         MAP("freeaddrinfo", bridgeFreeaddrinfo);
@@ -2494,6 +2495,28 @@ int NetworkBridge::bridgeGethostbyaddr_r(const void *addr, int len, int type, vo
     if (result)
         *result = ret;
     return 0;
+}
+
+/* Winsock's gai_strerror is a macro returning storage the guest cannot own,
+ * and its codes differ from the negative Linux EAI_* values used here. */
+extern "C" const char *bridgeGaiStrerror(int errorCode)
+{
+    switch (errorCode)
+    {
+        case 0:    return "Success";
+        case -1:   return "Bad value for ai_flags";
+        case -2:   return "Name or service not known";
+        case -3:   return "Temporary failure in name resolution";
+        case -4:   return "Non-recoverable failure in name resolution";
+        case -6:   return "ai_family not supported";
+        case -7:   return "ai_socktype not supported";
+        case -8:   return "Servname not supported for ai_socktype";
+        case -9:   return "Address family for hostname not supported";
+        case -10:  return "Memory allocation failure";
+        case -11:  return "System error";
+        case -12:  return "Argument buffer overflow";
+        default:   return "Unknown error";
+    }
 }
 
 extern "C" int bridgeGethostname(char *name, size_t namelen)

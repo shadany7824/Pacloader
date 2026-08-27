@@ -204,6 +204,7 @@ namespace FileSystemBridge
         MAP("opendir", bridgeOpendir);
         MAP("readdir", bridgeReaddir);
         MAP("closedir", bridgeClosedir);
+        MAP("rewinddir", bridgeRewinddir);
         MAP("clearerr", clearerr);
 
         MAP("unlink", bridgeUnlink);
@@ -551,6 +552,34 @@ extern "C"
     }
 
 
+    /* Restart from the top: DIR_Impl keeps its directory name, and a Win32
+     * find handle cannot be rewound. */
+    void bridgeRewinddir(void *dirp)
+    {
+        if (!dirp)
+            return;
+        DIR_Impl *dir = (DIR_Impl *)dirp;
+
+        char winPath[MAX_PATH];
+        ConvertPath(winPath, redirectTempPath(dir->path.c_str()), MAX_PATH);
+
+        std::string searchPath = winPath;
+        if (searchPath.empty())
+            return;
+        if (searchPath.back() == '/' || searchPath.back() == '\\')
+            searchPath += "*";
+        else
+            searchPath += "\\*";
+
+        if (dir->hFind != INVALID_HANDLE_VALUE)
+            FindClose(dir->hFind);
+
+        dir->hFind = FindFirstFileA(searchPath.c_str(), &dir->findData);
+        dir->first_read = true;
+        dir->finished = dir->hFind == INVALID_HANDLE_VALUE;
+    }
+
+
     int bridgeUnlink(const char *pathname)
     {
         pathname = redirectTempPath(pathname);
@@ -881,6 +910,20 @@ extern "C"
     int bridgeFcntl(int fd, int cmd, ...)
     {
         log_debug("fcntl(fd=%d, cmd=%d)", fd, cmd);
+
+        /* The ES1 serial ports are virtual descriptors with no host file object,
+         * and their reads return EAGAIN when the board has nothing queued. */
+        if (VirtualDeviceRegistry::find(fd))
+        {
+            constexpr int LinuxFGetFl = 3;
+            constexpr int LinuxFSetFl = 4;
+            constexpr int LinuxOReadWrite = 0x2;
+            constexpr int LinuxONonblock = 0x800;
+            if (cmd == LinuxFGetFl)
+                return LinuxOReadWrite | LinuxONonblock;
+            if (cmd == LinuxFSetFl)
+                return 0;
+        }
         return 0;
     }
 

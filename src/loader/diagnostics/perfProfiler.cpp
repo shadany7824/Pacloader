@@ -39,6 +39,17 @@ struct ThreadData
     std::array<Entry, kEntryCount> entries{};
 };
 
+constexpr size_t kGpuSampleCount = 4096;
+
+struct GpuStats
+{
+    std::atomic<uint64_t> samples{0};
+    std::atomic<uint64_t> busyNs[kGpuSampleCount]{};
+    std::atomic<int64_t> backlogNs[kGpuSampleCount]{};
+};
+
+GpuStats g_gpuStats;
+
 struct ExtraStats
 {
     std::atomic<uint64_t> cacheSkips{0};
@@ -132,7 +143,6 @@ constexpr size_t kMaxThreads = 192;
 ThreadData *g_threads[kMaxThreads]{};
 size_t g_threadCount = 0;
 DWORD g_tlsIndex = TLS_OUT_OF_INDEXES;
-std::atomic_flag g_writing = ATOMIC_FLAG_INIT;
 std::atomic<bool> g_runtimeReady{false};
 std::atomic<bool> g_flushStop{false};
 HANDLE g_flushThread = nullptr;
@@ -143,13 +153,16 @@ FrameAccumulator g_frameAccumulator;
 std::atomic<bool> g_frameBoundaryActive{false};
 std::atomic<uint64_t> g_frameBoundaryStart{0};
 std::atomic<uint64_t> g_frameSequence{0};
+std::atomic<uint64_t> g_presentSequence{0};
 std::mutex g_frameSpikeLock;
 FrameSpike g_frameSpikes[kFrameSpikeCount]{};
-size_t g_frameSpikeCount = 0;
+/* Totals, not array lengths: the arrays are rings, so these keep counting past
+ * their capacity and the writers take the last min(total, capacity) entries. */
+uint64_t g_frameSpikeCount = 0;
 uint64_t g_frameSpikeThresholdTicks = 0;
 std::mutex g_presentSpikeLock;
 PresentSpike g_presentSpikes[kPresentSpikeCount]{};
-size_t g_presentSpikeCount = 0;
+uint64_t g_presentSpikeCount = 0;
 std::atomic<uint64_t> g_lastPresentEnd{0};
 
 constexpr size_t kBufferSiteCount = 1024;
@@ -421,10 +434,58 @@ void addFrameEvent(const char *domain, const char *name, uint64_t elapsed)
         g_frameAccumulator.glxTicks.fetch_add(elapsed, std::memory_order_relaxed);
         g_frameAccumulator.glxCalls.fetch_add(1, std::memory_order_relaxed);
     }
-    else
+    /* frameTiming is the limiter waiting on purpose; counting it as "other" put
+     * ~8 ms of phantom work on every spike row. */
+    else if (!deliberateWait(domain, name))
     {
         g_frameAccumulator.otherTicks.fetch_add(elapsed, std::memory_order_relaxed);
     }
+}
+
+void writeGpuReport(const std::function<bool(const char *, size_t)> &writeText, bool &ok)
+{
+    const uint64_t samples = g_gpuStats.samples.load(std::memory_order_relaxed);
+    if (samples == 0)
+        return;
+
+    /* Static: writeReport already carries a 32 KB frame array, and this runs
+     * under the write lock. */
+    static int64_t sorted[kGpuSampleCount];
+    const size_t count =
+        static_cast<size_t>(samples > kGpuSampleCount ? kGpuSampleCount : samples);
+    char line[256];
+
+    auto report = [&](const char *label) {
+        for (size_t i = 1; i < count; ++i)
+        {
+            const int64_t value = sorted[i];
+            size_t j = i;
+            while (j > 0 && sorted[j - 1] > value)
+            {
+                sorted[j] = sorted[j - 1];
+                --j;
+            }
+            sorted[j] = value;
+        }
+        /* The GPU clock is already nanoseconds, so no QPC scaling here. */
+        const int length = std::snprintf(
+            line, sizeof(line), "extra,GpuStats,%s,%llu/%.3f/%.3f/%.3f,,,,\r\n", label,
+            static_cast<unsigned long long>(count),
+            sorted[(count - 1) * 50 / 100] / 1000.0, sorted[(count - 1) * 95 / 100] / 1000.0,
+            sorted[(count - 1) * 99 / 100] / 1000.0);
+        ok = length > 0 && static_cast<size_t>(length) < sizeof(line) &&
+             writeText(line, static_cast<size_t>(length));
+    };
+
+    for (size_t i = 0; i < count; ++i)
+        sorted[i] = static_cast<int64_t>(g_gpuStats.busyNs[i].load(std::memory_order_relaxed));
+    report("busy_p50_p95_p99_us");
+
+    if (!ok)
+        return;
+    for (size_t i = 0; i < count; ++i)
+        sorted[i] = g_gpuStats.backlogNs[i].load(std::memory_order_relaxed);
+    report("backlog_p50_p95_p99_us");
 }
 
 void writeFrameSpikeReport(const std::function<bool(const char *, size_t)> &writeText,
@@ -439,9 +500,12 @@ void writeFrameSpikeReport(const std::function<bool(const char *, size_t)> &writ
         static_cast<unsigned long long>(g_frameSpikeCount));
     ok = summaryLength > 0 && static_cast<size_t>(summaryLength) < sizeof(summary) &&
          writeText(summary, static_cast<size_t>(summaryLength));
-    for (size_t i = 0; ok && i < g_frameSpikeCount; ++i)
+    const uint64_t frameStored = g_frameSpikeCount < kFrameSpikeCount ? g_frameSpikeCount
+                                                                      : kFrameSpikeCount;
+    const uint64_t frameFirst = g_frameSpikeCount - frameStored;
+    for (uint64_t i = 0; ok && i < frameStored; ++i)
     {
-        const FrameSpike &spike = g_frameSpikes[i];
+        const FrameSpike &spike = g_frameSpikes[(frameFirst + i) % kFrameSpikeCount];
         char line[768];
         const int length = std::snprintf(
             line, sizeof(line),
@@ -478,9 +542,12 @@ void writePresentSpikeReport(const std::function<bool(const char *, size_t)> &wr
          writeText(summary, static_cast<size_t>(summaryLength));
 
     const double scale = 1000000.0 / static_cast<double>(g_frequency.QuadPart);
-    for (size_t i = 0; ok && i < g_presentSpikeCount; ++i)
+    const uint64_t presentStored =
+        g_presentSpikeCount < kPresentSpikeCount ? g_presentSpikeCount : kPresentSpikeCount;
+    const uint64_t presentFirst = g_presentSpikeCount - presentStored;
+    for (uint64_t i = 0; ok && i < presentStored; ++i)
     {
-        const PresentSpike &spike = g_presentSpikes[i];
+        const PresentSpike &spike = g_presentSpikes[(presentFirst + i) % kPresentSpikeCount];
         const uint64_t accounted = spike.eventTicks + spike.pacingTicks + spike.swapTicks;
         const uint64_t other = spike.totalTicks > accounted ? spike.totalTicks - accounted : 0;
         char line[512];
@@ -618,9 +685,9 @@ void writeReport()
 {
     if (!g_enabled)
         return;
-    if (g_writing.test_and_set(std::memory_order_acquire))
-        return;
 
+    /* Serialise on the lock alone: the atomic_flag this replaces made a second
+     * caller give up, which is how the report written at exit was dropped. */
     std::lock_guard<std::mutex> writeLock(g_writeLock);
 
     const char *path = std::getenv("LL_PERF_PROFILE_FILE");
@@ -631,13 +698,19 @@ void writeReport()
     // concurrently with the guest/GL threads, and those paths may be backed by
     // the loader's allocator. Direct Win32 I/O keeps report generation outside
     // that allocator bridge.
-    HANDLE file = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+
+    /* Build beside the target and rename on success, so a run that ends
+     * mid-write cannot leave a truncated report. */
+    char temporaryPath[1024];
+    const int temporaryLength =
+        std::snprintf(temporaryPath, sizeof(temporaryPath), "%s.tmp", path);
+    if (temporaryLength <= 0 || static_cast<size_t>(temporaryLength) >= sizeof(temporaryPath))
+        return;
+
+    HANDLE file = CreateFileA(temporaryPath, GENERIC_WRITE, FILE_SHARE_READ, nullptr,
                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE)
-    {
-        g_writing.clear(std::memory_order_release);
         return;
-    }
 
     auto writeText = [file](const char *text, size_t length) {
         while (length > 0)
@@ -766,17 +839,24 @@ void writeReport()
         }
     }
 
+    /* Interval series first: it is the only pacing measurement here, and writing
+     * it last meant any earlier failure took it along. */
+    if (ok)
+        writeIntervalReport(writeText, ok);
+    if (ok)
+        writeGpuReport(writeText, ok);
     if (ok)
         writeBufferTraceReport(writeText, ok);
     if (ok)
         writeFrameSpikeReport(writeText, ok);
     if (ok)
         writePresentSpikeReport(writeText, ok);
-    if (ok)
-        writeIntervalReport(writeText, ok);
 
     CloseHandle(file);
-    g_writing.clear(std::memory_order_release);
+    if (ok)
+        MoveFileExA(temporaryPath, path, MOVEFILE_REPLACE_EXISTING);
+    else
+        DeleteFileA(temporaryPath);
 }
 
 DWORD WINAPI flushThreadProc(void *)
@@ -978,23 +1058,39 @@ extern "C" void PerfProfiler_TextureQuery(uint32_t pname, int cacheHit)
         stat.hits.fetch_add(1, std::memory_order_relaxed);
 }
 
+extern "C" void PerfProfiler_GpuFrameSample(uint64_t busyNanoseconds,
+                                             int64_t backlogNanoseconds)
+{
+    if (!PerfProfiler_IsEnabled() || !g_runtimeReady.load(std::memory_order_acquire))
+        return;
+    /* Wrap, so the percentiles describe the whole run. */
+    const uint64_t index = g_gpuStats.samples.fetch_add(1, std::memory_order_relaxed);
+    const size_t slot = static_cast<size_t>(index % kGpuSampleCount);
+    g_gpuStats.busyNs[slot].store(busyNanoseconds, std::memory_order_relaxed);
+    g_gpuStats.backlogNs[slot].store(backlogNanoseconds, std::memory_order_relaxed);
+}
+
 extern "C" void PerfProfiler_FrameSample(uint64_t elapsedTicks)
 {
     if (!PerfProfiler_IsEnabled() || !g_runtimeReady.load(std::memory_order_acquire))
         return;
+    /* Wrap: keeping only the first samples made this describe start-up, not play. */
     const uint64_t index = g_extraStats.frameSamples.fetch_add(1, std::memory_order_relaxed);
-    if (index < kFrameSampleCount)
-        g_extraStats.frameTicks[index].store(elapsedTicks, std::memory_order_relaxed);
+    g_extraStats.frameTicks[index % kFrameSampleCount].store(elapsedTicks,
+                                                             std::memory_order_relaxed);
 }
 
 void recordFrameBoundary(uint64_t now)
 {
     const uint64_t start = g_frameBoundaryStart.load(std::memory_order_acquire);
     const uint64_t elapsed = now > start ? now - start : 0;
+    /* Count every frame: the sequence used to be a spike counter, so a spike
+     * could not be placed in the run. */
+    const uint64_t ordinal = g_frameSequence.fetch_add(1, std::memory_order_relaxed);
     if (elapsed >= g_frameSpikeThresholdTicks)
     {
         FrameSpike spike{};
-        spike.sequence = g_frameSequence.fetch_add(1, std::memory_order_relaxed);
+        spike.sequence = ordinal;
         spike.totalTicks = elapsed;
         spike.glTicks = g_frameAccumulator.glTicks.exchange(0, std::memory_order_relaxed);
         spike.pthreadTicks = g_frameAccumulator.pthreadTicks.exchange(0, std::memory_order_relaxed);
@@ -1010,8 +1106,7 @@ void recordFrameBoundary(uint64_t now)
         spike.worstName = g_frameAccumulator.worstName.exchange(nullptr, std::memory_order_relaxed);
 
         std::lock_guard<std::mutex> lock(g_frameSpikeLock);
-        if (g_frameSpikeCount < kFrameSpikeCount)
-            g_frameSpikes[g_frameSpikeCount++] = spike;
+        g_frameSpikes[g_frameSpikeCount++ % kFrameSpikeCount] = spike;
     }
     else
     {
@@ -1083,13 +1178,17 @@ extern "C" void PerfProfiler_PresentTransaction(const char *source,
     if (series)
         recordInterval(*series, interval);
 
+    /* Counted for every present, so the ordinal places a spike in the run; it
+     * used to be the spike index, which carried no timing information. */
+    const uint64_t ordinal = g_presentSequence.fetch_add(1, std::memory_order_relaxed);
+
     if (interval < g_frameSpikeThresholdTicks)
         return;
 
     PresentSpike spike{};
     if (source)
         std::strncpy(spike.source, source, sizeof(spike.source) - 1);
-    spike.sequence = static_cast<uint64_t>(g_presentSpikeCount);
+    spike.sequence = ordinal;
     spike.totalTicks = totalTicks;
     spike.eventTicks = eventTicks;
     spike.pacingTicks = pacingTicks;
@@ -1098,8 +1197,7 @@ extern "C" void PerfProfiler_PresentTransaction(const char *source,
     spike.gapTicks = interval > totalTicks ? interval - totalTicks : 0;
 
     std::lock_guard<std::mutex> lock(g_presentSpikeLock);
-    if (g_presentSpikeCount < kPresentSpikeCount)
-        g_presentSpikes[g_presentSpikeCount++] = spike;
+    g_presentSpikes[g_presentSpikeCount++ % kPresentSpikeCount] = spike;
 }
 
 extern "C" void PerfProfiler_IntervalMark(const char *name)
@@ -1222,6 +1320,7 @@ extern "C" void PerfProfiler_MarkRuntimeReady(void) {}
 extern "C" void PerfProfiler_CacheSkip(const char *) {}
 extern "C" void PerfProfiler_TextureQuery(uint32_t, int) {}
 extern "C" void PerfProfiler_FrameSample(uint64_t) {}
+extern "C" void PerfProfiler_GpuFrameSample(uint64_t, int64_t) {}
 extern "C" void PerfProfiler_FrameBoundaryEndAndStart(void) {}
 extern "C" void PerfProfiler_FrameBoundaryStart(void) {}
 extern "C" void PerfProfiler_FrameBoundaryEnd(void) {}

@@ -17,6 +17,7 @@
 #include <cmath>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <mutex>
 #include <cstdarg>
 #include <cstdio>
@@ -49,8 +50,167 @@ extern "C"
     unsigned long int __strtoul_internal(const char *nptr, char **endptr, int base, int group);
 }
 
+namespace
+{
+/* iconv over the Win32 code page converters. Only the encodings ES1 titles
+ * name are mapped, so anything else fails cleanly at iconv_open(). */
+struct IconvContext
+{
+    unsigned int from;
+    unsigned int to;
+};
+
+unsigned int codePageFor(const char *name)
+{
+    if (!name)
+        return 0;
+
+    /* Callers append transliteration suffixes such as "//TRANSLIT". */
+    std::string canonical;
+    for (const char *cursor = name; *cursor && *cursor != '/'; ++cursor)
+        if (*cursor != '-' && *cursor != '_')
+            canonical += static_cast<char>(std::toupper(static_cast<unsigned char>(*cursor)));
+
+    if (canonical == "UTF8")
+        return CP_UTF8;
+    if (canonical == "SJIS" || canonical == "SHIFTJIS" || canonical == "CP932" ||
+        canonical == "MSKANJI" || canonical == "WINDOWS31J")
+        return 932;
+    if (canonical == "EUCJP")
+        return 20932;
+    if (canonical == "ISO2022JP")
+        return 50220;
+    if (canonical == "ASCII" || canonical == "USASCII" || canonical == "ANSIX3.4" ||
+        canonical == "ANSIX34")
+        return 20127;
+    if (canonical == "LATIN1" || canonical == "ISO88591")
+        return 28591;
+    if (canonical == "UTF16LE" || canonical == "UCS2LE")
+        return 1200;
+    return 0;
+}
+} // namespace
+
 namespace LibcBridge
 {
+    void *bridgeIconvOpen(const char *tocode, const char *fromcode)
+    {
+        const unsigned int to = codePageFor(tocode);
+        const unsigned int from = codePageFor(fromcode);
+        if (to == 0 || from == 0)
+        {
+            log_warn("iconv_open(\"%s\", \"%s\"): unsupported encoding",
+                     tocode ? tocode : "", fromcode ? fromcode : "");
+            errno = EINVAL;
+            return reinterpret_cast<void *>(-1);
+        }
+
+        IconvContext *context = new IconvContext{from, to};
+        return context;
+    }
+
+    int bridgeIconvClose(void *cd)
+    {
+        if (cd && cd != reinterpret_cast<void *>(-1))
+            delete static_cast<IconvContext *>(cd);
+        return 0;
+    }
+
+    /* UTF-16 is the only pivot Win32 offers. The whole input converts at once;
+     * no ES1 title needs a shift state split across calls. */
+    size_t bridgeIconv(void *cd, char **inbuf, size_t *inbytesleft,
+                       char **outbuf, size_t *outbytesleft)
+    {
+        IconvContext *context = static_cast<IconvContext *>(cd);
+        if (!context || cd == reinterpret_cast<void *>(-1))
+        {
+            errno = EBADF;
+            return static_cast<size_t>(-1);
+        }
+
+        /* A null input buffer means "reset the shift state"; there is none. */
+        if (!inbuf || !*inbuf || !inbytesleft || *inbytesleft == 0)
+            return 0;
+        if (!outbuf || !*outbuf || !outbytesleft)
+        {
+            errno = EINVAL;
+            return static_cast<size_t>(-1);
+        }
+
+        const int inputBytes = static_cast<int>(*inbytesleft);
+        std::wstring wide;
+
+        if (context->from == 1200)
+        {
+            wide.assign(reinterpret_cast<const wchar_t *>(*inbuf),
+                        static_cast<size_t>(inputBytes) / sizeof(wchar_t));
+        }
+        else
+        {
+            const int wideLength =
+                MultiByteToWideChar(context->from, 0, *inbuf, inputBytes, nullptr, 0);
+            if (wideLength <= 0)
+            {
+                errno = EILSEQ;
+                return static_cast<size_t>(-1);
+            }
+            wide.resize(static_cast<size_t>(wideLength));
+            MultiByteToWideChar(context->from, 0, *inbuf, inputBytes, &wide[0], wideLength);
+        }
+
+        if (context->to == 1200)
+        {
+            const size_t produced = wide.size() * sizeof(wchar_t);
+            if (produced > *outbytesleft)
+            {
+                errno = E2BIG;
+                return static_cast<size_t>(-1);
+            }
+            std::memcpy(*outbuf, wide.data(), produced);
+            *outbuf += produced;
+            *outbytesleft -= produced;
+        }
+        else
+        {
+            const int needed = WideCharToMultiByte(context->to, 0, wide.data(),
+                                                   static_cast<int>(wide.size()),
+                                                   nullptr, 0, nullptr, nullptr);
+            if (needed <= 0)
+            {
+                errno = EILSEQ;
+                return static_cast<size_t>(-1);
+            }
+            if (static_cast<size_t>(needed) > *outbytesleft)
+            {
+                errno = E2BIG;
+                return static_cast<size_t>(-1);
+            }
+            WideCharToMultiByte(context->to, 0, wide.data(), static_cast<int>(wide.size()),
+                                *outbuf, needed, nullptr, nullptr);
+            *outbuf += needed;
+            *outbytesleft -= static_cast<size_t>(needed);
+        }
+
+        *inbuf += inputBytes;
+        *inbytesleft = 0;
+        return 0;
+    }
+
+    /* glibc's out-of-line strtoll/strtoull. The trailing group flag asks for
+     * locale thousands separators, which the cabinet's C locale lacks. */
+    long long bridgeStrtollInternal(const char *nptr, char **endptr, int base, int group)
+    {
+        (void)group;
+        return strtoll(nptr, endptr, base);
+    }
+
+    unsigned long long bridgeStrtoullInternal(const char *nptr, char **endptr, int base,
+                                              int group)
+    {
+        (void)group;
+        return strtoull(nptr, endptr, base);
+    }
+
     char bridgeLibcSingleThreaded = 1; // 1 = true (skip pthread locks), 0 = false
 
     FILE *native_stdin = stdin;
@@ -175,6 +335,12 @@ namespace LibcBridge
         MAP("__fixunssfdi", __fixunssfdi);
 
         // system
+        MAP("iconv_open", bridgeIconvOpen);
+        MAP("iconv_close", bridgeIconvClose);
+        MAP("iconv", bridgeIconv);
+        MAP("__strtoll_internal", bridgeStrtollInternal);
+        MAP("__strtoull_internal", bridgeStrtoullInternal);
+
         MAP("system", bridgeSystem);
 
         MAP("getpid", _getpid);

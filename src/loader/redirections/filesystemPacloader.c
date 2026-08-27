@@ -54,6 +54,10 @@ const char *redirectTempPath(const char *path)
         return path + 5;
     if (strncmp(path, "/tmp", 4) == 0)
         return path + 1;
+    /* /live/disk is the cabinet's writable storage and /live/image the boot
+     * medium; both become directories beside the game so saves survive. */
+    if (strncmp(path, "/live/", 6) == 0)
+        return path + 1;
     if (strncmp(path, "../../../freespace", 18) == 0)
         return path + 9;
 

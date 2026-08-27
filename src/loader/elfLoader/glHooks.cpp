@@ -704,6 +704,110 @@ void recycleBuffers(GLsizei n, const GLuint *buffers)
         }
     }
 }
+
+/* GPU-side frame timing, collected without ever blocking: reading a result
+ * before GL_QUERY_RESULT_AVAILABLE would sync the CPU to what it measures. */
+bool glGpuTimerEnabled()
+{
+    static const bool enabled = [] {
+        const char *setting = std::getenv("LL_GL_GPU_TIMER");
+        return setting && strcmp(setting, "1") == 0;
+    }();
+    return enabled;
+}
+
+constexpr size_t kGpuQueryRing = 8;
+
+struct GpuFrameQuery
+{
+    GLuint elapsed = 0;
+    GLuint stamp = 0;
+    GLint64 issuedGpuClock = 0;
+    bool pending = false;
+};
+
+/* Thread-local: only the drawing thread has a frame to time. */
+thread_local GpuFrameQuery t_gpuQueries[kGpuQueryRing];
+thread_local bool t_gpuQueriesReady = false;
+thread_local bool t_gpuQueryActive = false;
+thread_local size_t t_gpuActiveSlot = 0;
+
+bool gpuTimerUsable()
+{
+    return glGpuTimerEnabled() && glad_glGenQueries && glad_glBeginQuery &&
+           glad_glEndQuery && glad_glQueryCounter && glad_glGetQueryObjectiv &&
+           glad_glGetQueryObjectui64v && glad_glGetInteger64v;
+}
+
+void gpuTimerCollect()
+{
+    for (GpuFrameQuery &query : t_gpuQueries)
+    {
+        if (!query.pending)
+            continue;
+        GLint available = 0;
+        glad_glGetQueryObjectiv(query.elapsed, GL_QUERY_RESULT_AVAILABLE, &available);
+        if (!available)
+            continue;
+        glad_glGetQueryObjectiv(query.stamp, GL_QUERY_RESULT_AVAILABLE, &available);
+        if (!available)
+            continue;
+
+        GLuint64 busy = 0;
+        GLuint64 reached = 0;
+        glad_glGetQueryObjectui64v(query.elapsed, GL_QUERY_RESULT, &busy);
+        glad_glGetQueryObjectui64v(query.stamp, GL_QUERY_RESULT, &reached);
+        query.pending = false;
+        PerfProfiler_GpuFrameSample(
+            busy, static_cast<int64_t>(reached) - static_cast<int64_t>(query.issuedGpuClock));
+    }
+}
+
+/* Closes the frame that was open, if any, and hands its work to the driver. */
+void gpuTimerEndFrame()
+{
+    if (!gpuTimerUsable() || !t_gpuQueryActive)
+        return;
+    glad_glEndQuery(GL_TIME_ELAPSED);
+    t_gpuQueries[t_gpuActiveSlot].pending = true;
+    t_gpuQueryActive = false;
+}
+
+void gpuTimerBeginFrame()
+{
+    if (!gpuTimerUsable() || t_gpuQueryActive)
+        return;
+
+    if (!t_gpuQueriesReady)
+    {
+        for (GpuFrameQuery &query : t_gpuQueries)
+        {
+            glad_glGenQueries(1, &query.elapsed);
+            glad_glGenQueries(1, &query.stamp);
+        }
+        t_gpuQueriesReady = true;
+    }
+
+    gpuTimerCollect();
+
+    for (size_t slot = 0; slot < kGpuQueryRing; ++slot)
+    {
+        GpuFrameQuery &query = t_gpuQueries[slot];
+        if (query.pending || query.elapsed == 0 || query.stamp == 0)
+            continue;
+
+        /* The counter records when the GPU reaches this point; the immediate
+         * read is the GPU clock as of now. */
+        glad_glQueryCounter(query.stamp, GL_TIMESTAMP);
+        glad_glGetInteger64v(GL_TIMESTAMP, &query.issuedGpuClock);
+        glad_glBeginQuery(GL_TIME_ELAPSED, query.elapsed);
+        t_gpuQueryActive = true;
+        t_gpuActiveSlot = slot;
+        return;
+    }
+    /* Ring full: skip rather than grow, so the measurement cannot become the
+     * backlog it reports. */
+}
 }
 
 extern "C" void GLHooks_ResetStateCache()
@@ -1094,8 +1198,11 @@ extern "C" void __attribute__((cdecl)) wrap_glPolygonOffset(GLfloat factor, GLfl
 extern "C" void __attribute__((cdecl)) wrap_glFlush()
 {
     PERF_PROFILE_SCOPE("GL");
+    /* WMMT4 issues exactly one of these a frame, on the thread that draws. */
+    gpuTimerEndFrame();
     if (glad_glFlush)
         glad_glFlush();
+    gpuTimerBeginFrame();
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glFinish()
@@ -3775,8 +3882,113 @@ static void *cdeclAdapterFor(const char *procName, void *stdcallEntry)
 }
 
 // The interceptor router mapping string names to our safe __cdecl wrappers
+/* Kizuna imports these. Resolving them from SDL_GL_GetProcAddress during
+ * relocation made crash stubs, so go through glad and defer to first call. */
+#define KIZUNA_GL_WRAP(name, params, args)                                                   \
+    extern "C" void __attribute__((cdecl)) wrap_##name params                                \
+    {                                                                                        \
+        if (glad_##name)                                                                     \
+            glad_##name args;                                                                \
+    }
+
+KIZUNA_GL_WRAP(glBindFragDataLocation, (GLuint program, GLuint color, const GLchar *name),
+               (program, color, name))
+KIZUNA_GL_WRAP(glCombinerInputNV,
+               (GLenum stage, GLenum portion, GLenum variable, GLenum input, GLenum mapping,
+                GLenum componentUsage),
+               (stage, portion, variable, input, mapping, componentUsage))
+KIZUNA_GL_WRAP(glCombinerOutputNV,
+               (GLenum stage, GLenum portion, GLenum abOutput, GLenum cdOutput,
+                GLenum sumOutput, GLenum scale, GLenum bias, GLboolean abDotProduct,
+                GLboolean cdDotProduct, GLboolean muxSum),
+               (stage, portion, abOutput, cdOutput, sumOutput, scale, bias, abDotProduct,
+                cdDotProduct, muxSum))
+KIZUNA_GL_WRAP(glCombinerParameteriNV, (GLenum pname, GLint param), (pname, param))
+KIZUNA_GL_WRAP(glCompressedTexImage1DARB,
+               (GLenum target, GLint level, GLenum internalformat, GLsizei width,
+                GLint border, GLsizei imageSize, const void *data),
+               (target, level, internalformat, width, border, imageSize, data))
+KIZUNA_GL_WRAP(glCompressedTexImage3D,
+               (GLenum target, GLint level, GLenum internalformat, GLsizei width,
+                GLsizei height, GLsizei depth, GLint border, GLsizei imageSize,
+                const void *data),
+               (target, level, internalformat, width, height, depth, border, imageSize, data))
+KIZUNA_GL_WRAP(glCompressedTexSubImage3D,
+               (GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint zoffset,
+                GLsizei width, GLsizei height, GLsizei depth, GLenum format,
+                GLsizei imageSize, const void *data),
+               (target, level, xoffset, yoffset, zoffset, width, height, depth, format,
+                imageSize, data))
+KIZUNA_GL_WRAP(glFinalCombinerInputNV,
+               (GLenum variable, GLenum input, GLenum mapping, GLenum componentUsage),
+               (variable, input, mapping, componentUsage))
+KIZUNA_GL_WRAP(glFogCoordPointer, (GLenum type, GLsizei stride, const void *pointer),
+               (type, stride, pointer))
+KIZUNA_GL_WRAP(glFogCoordf, (GLfloat coord), (coord))
+KIZUNA_GL_WRAP(glFramebufferTexture1DEXT,
+               (GLenum target, GLenum attachment, GLenum textarget, GLuint texture,
+                GLint level),
+               (target, attachment, textarget, texture, level))
+KIZUNA_GL_WRAP(glGetActiveAttrib,
+               (GLuint program, GLuint index, GLsizei bufSize, GLsizei *length, GLint *size,
+                GLenum *type, GLchar *name),
+               (program, index, bufSize, length, size, type, name))
+KIZUNA_GL_WRAP(glGetProgramLocalParameterfvARB,
+               (GLenum target, GLuint index, GLfloat *params), (target, index, params))
+KIZUNA_GL_WRAP(glGetQueryObjectui64vEXT, (GLuint id, GLenum pname, GLuint64 *params),
+               (id, pname, params))
+KIZUNA_GL_WRAP(glGetVertexAttribivARB, (GLuint index, GLenum pname, GLint *params),
+               (index, pname, params))
+KIZUNA_GL_WRAP(glTexImage3D,
+               (GLenum target, GLint level, GLint internalformat, GLsizei width,
+                GLsizei height, GLsizei depth, GLint border, GLenum format, GLenum type,
+                const void *pixels),
+               (target, level, internalformat, width, height, depth, border, format, type,
+                pixels))
+KIZUNA_GL_WRAP(glTexSubImage3D,
+               (GLenum target, GLint level, GLint xoffset, GLint yoffset, GLint zoffset,
+                GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLenum type,
+                const void *pixels),
+               (target, level, xoffset, yoffset, zoffset, width, height, depth, format, type,
+                pixels))
+KIZUNA_GL_WRAP(glUniformMatrix2x3fv,
+               (GLint location, GLsizei count, GLboolean transpose, const GLfloat *value),
+               (location, count, transpose, value))
+KIZUNA_GL_WRAP(glVertexAttrib4fARB,
+               (GLuint index, GLfloat x, GLfloat y, GLfloat z, GLfloat w),
+               (index, x, y, z, w))
+KIZUNA_GL_WRAP(glVertexAttribIPointer,
+               (GLuint index, GLint size, GLenum type, GLsizei stride, const void *pointer),
+               (index, size, type, stride, pointer))
+
 void *GLHooks_GetProcAddress(const char *procName)
 {
+#define KIZUNA_GL_CASE(name)                                                                 \
+    if (strcmp(procName, #name) == 0)                                                        \
+        return (void *)&wrap_##name;
+
+    KIZUNA_GL_CASE(glBindFragDataLocation)
+    KIZUNA_GL_CASE(glCombinerInputNV)
+    KIZUNA_GL_CASE(glCombinerOutputNV)
+    KIZUNA_GL_CASE(glCombinerParameteriNV)
+    KIZUNA_GL_CASE(glCompressedTexImage1DARB)
+    KIZUNA_GL_CASE(glCompressedTexImage3D)
+    KIZUNA_GL_CASE(glCompressedTexSubImage3D)
+    KIZUNA_GL_CASE(glFinalCombinerInputNV)
+    KIZUNA_GL_CASE(glFogCoordPointer)
+    KIZUNA_GL_CASE(glFogCoordf)
+    KIZUNA_GL_CASE(glFramebufferTexture1DEXT)
+    KIZUNA_GL_CASE(glGetActiveAttrib)
+    KIZUNA_GL_CASE(glGetProgramLocalParameterfvARB)
+    KIZUNA_GL_CASE(glGetQueryObjectui64vEXT)
+    KIZUNA_GL_CASE(glGetVertexAttribivARB)
+    KIZUNA_GL_CASE(glTexImage3D)
+    KIZUNA_GL_CASE(glTexSubImage3D)
+    KIZUNA_GL_CASE(glUniformMatrix2x3fv)
+    KIZUNA_GL_CASE(glVertexAttrib4fARB)
+    KIZUNA_GL_CASE(glVertexAttribIPointer)
+#undef KIZUNA_GL_CASE
+
     if (strcmp(procName, "glOrtho") == 0)
         return (void *)&bridgeglOrtho;
     if (strcmp(procName, "glViewport") == 0)

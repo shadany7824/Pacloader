@@ -3,34 +3,67 @@
 #include <cstdlib>
 #include <cstring>
 #include <cerrno>
-#include <mutex>
 #include <unordered_set>
 #include <wchar.h>
 
 #include "../log/log.h"
+#include "../diagnostics/perfProfiler.hpp"
 #include <stdio.h>
 
 namespace
 {
-std::mutex &guestAllocationMutex()
+/* Ownership set for customFree/customRealloc, sharded like the pthread mapper:
+ * one process-wide lock here cost more than the allocation it guarded. */
+constexpr size_t kAllocationShardCount = 64;
+
+struct alignas(64) AllocationShard
 {
-    static auto *mutex = new std::mutex();
-    return *mutex;
+    SRWLOCK lock = SRWLOCK_INIT;
+    std::unordered_set<void *> pointers;
+};
+
+/* Leaked deliberately: guest threads still free memory during static destruction. */
+AllocationShard *allocationShards()
+{
+    static auto *shards = new AllocationShard[kAllocationShardCount];
+    return shards;
 }
 
-std::unordered_set<void *> &guestAllocations()
+AllocationShard &allocationShard(void *ptr)
 {
-    static auto *allocations = new std::unordered_set<void *>();
-    return *allocations;
+    /* 16-byte aligned, so the low bits carry no shard information. */
+    const uintptr_t value = reinterpret_cast<uintptr_t>(ptr);
+    return allocationShards()[(value >> 4) % kAllocationShardCount];
+}
+
+bool forgetGuestAllocation(void *ptr)
+{
+    AllocationShard &shard = allocationShard(ptr);
+    AcquireSRWLockExclusive(&shard.lock);
+    const bool owned = shard.pointers.erase(ptr) != 0;
+    ReleaseSRWLockExclusive(&shard.lock);
+    return owned;
+}
+
+void rememberGuestAllocation(void *ptr)
+{
+    AllocationShard &shard = allocationShard(ptr);
+    AcquireSRWLockExclusive(&shard.lock);
+    shard.pointers.insert(ptr);
+    ReleaseSRWLockExclusive(&shard.lock);
 }
 
 void *trackedAlignedMalloc(size_t size, size_t alignment)
 {
-    void *ptr = _aligned_malloc(size, alignment);
+    void *ptr = nullptr;
+    {
+        PerfProfilerScope scope("Alloc", "alignedMalloc");
+        ptr = _aligned_malloc(size, alignment);
+    }
     if (ptr)
     {
-        std::lock_guard<std::mutex> lock(guestAllocationMutex());
-        guestAllocations().insert(ptr);
+        PerfProfilerScope scope("Alloc", "trackInsert");
+        rememberGuestAllocation(ptr);
     }
     return ptr;
 }
@@ -265,6 +298,7 @@ size_t MemoryManager::customStrxfrm(char *dest, const char *src, size_t n)
 
 void *MemoryManager::customMalloc(size_t size)
 {
+    PERF_PROFILE_SCOPE("Alloc");
     return trackedAlignedMalloc(size, 16);
 }
 
@@ -299,22 +333,25 @@ struct mallinfo MemoryManager::customMallinfo(void)
 
 void MemoryManager::customFree(void *ptr)
 {
+    PERF_PROFILE_SCOPE("Alloc");
     if (!ptr)
         return;
 
     {
-        std::lock_guard<std::mutex> lock(guestAllocationMutex());
-        if (guestAllocations().erase(ptr) == 0)
+        PerfProfilerScope scope("Alloc", "trackErase");
+        if (!forgetGuestAllocation(ptr))
         {
             log_warn("MemoryManager: ignored free of an unowned guest pointer %p", ptr);
             return;
         }
     }
+    PerfProfilerScope scope("Alloc", "alignedFree");
     _aligned_free(ptr);
 }
 
 void *MemoryManager::customCalloc(size_t nmemb, size_t size)
 {
+    PERF_PROFILE_SCOPE("Alloc");
     if (nmemb != 0 && size > SIZE_MAX / nmemb)
     {
         return NULL;
@@ -328,6 +365,7 @@ void *MemoryManager::customCalloc(size_t nmemb, size_t size)
 
 void *MemoryManager::customRealloc(void *ptr, size_t size)
 {
+    PERF_PROFILE_SCOPE("Alloc");
     if (!ptr)
         return customMalloc(size);
     if (size == 0)
@@ -336,26 +374,31 @@ void *MemoryManager::customRealloc(void *ptr, size_t size)
         return nullptr;
     }
 
-    std::lock_guard<std::mutex> lock(guestAllocationMutex());
-    auto &allocations = guestAllocations();
-    const auto entry = allocations.find(ptr);
-    if (entry == allocations.end())
+    /* No lock across _aligned_realloc: old and new pointers can land in
+     * different shards, so no single lock covers the pair. */
+    void *replacement = nullptr;
     {
-        log_warn("MemoryManager: rejected realloc of an unowned guest pointer %p", ptr);
-        return nullptr;
+        PerfProfilerScope trackScope("Alloc", "trackRealloc");
+        if (!forgetGuestAllocation(ptr))
+        {
+            log_warn("MemoryManager: rejected realloc of an unowned guest pointer %p", ptr);
+            return nullptr;
+        }
     }
 
-    void *replacement = _aligned_realloc(ptr, size, 16);
-    if (replacement)
+    replacement = _aligned_realloc(ptr, size, 16);
+
     {
-        allocations.erase(entry);
-        allocations.insert(replacement);
+        PerfProfilerScope trackScope("Alloc", "trackRealloc");
+        /* On failure the original block is still live and still ours. */
+        rememberGuestAllocation(replacement ? replacement : ptr);
     }
     return replacement;
 }
 
 void *MemoryManager::customMemalign(size_t alignment, size_t size)
 {
+    PERF_PROFILE_SCOPE("Alloc");
     return trackedAlignedMalloc(size, alignment);
 } 
 

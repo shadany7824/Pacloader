@@ -78,6 +78,7 @@ namespace NetworkBridge
     int bridgeGethostbyaddr_r(const void *addr, int len, int type, void *ret, char *buf, size_t buflen, void **result,
                                         int *h_errnop);
     extern "C" int bridgeGethostname(char *name, size_t namelen);
+    extern "C" const char *bridgeGaiStrerror(int errorCode);
 
     // The plain forms return the record itself; see the note on their mapping.
     extern "C" void *bridgeGethostbyname(const char *name);

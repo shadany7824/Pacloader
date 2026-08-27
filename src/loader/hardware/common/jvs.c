@@ -116,6 +116,7 @@ int initJVS()
         io.capabilities.analogueInBits = 16;
         io.capabilities.rightAlignBits = 0;
         io.capabilities.analogueInChannels = getConfig()->namcoN2.jvs.analogueInputs;
+        io.capabilities.rotaryChannels = getConfig()->namcoN2.jvs.rotaryInputs;
         io.capabilities.keypad = 0;
         io.capabilities.generalPurposeInputs = getConfig()->namcoN2.jvs.generalPurposeInputs;
         io.capabilities.generalPurposeOutputs = getConfig()->namcoN2.jvs.generalPurposeOutputs;

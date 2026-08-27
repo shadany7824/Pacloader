@@ -6,14 +6,13 @@
 #include <windows.h>
 #include <libgen.h>
 
-#include "elfLoader/gccBridge.hpp"
 #include "elfLoader/ipcBridge.hpp"
+#include "elfLoader/gccBridge.hpp"
 #include "elfLoader/posixCompatBridge.hpp"
 #include "elfLoader/sdl12Bridge.hpp"
 #include "elfLoader/elfLoader.hpp"
 #include "elfLoader/filesystemBridge.hpp"
 #include "elfLoader/libcBridge.hpp"
-#include "elfLoader/gccBridge.hpp"
 #include "elfLoader/graphicsBridge.hpp"
 #include "elfLoader/pthreadBridge.hpp"
 #include "elfLoader/regexBridge.hpp"
@@ -83,9 +82,7 @@ void initBridges()
 int main(int argc, char *argv[], char *envp[])
 {
     pacFrontendInitialize();
-    /* Warnings and above by default, but a crash usually needs what is under
-     * that - where each shared object landed, where each symbol resolved - and
-     * rebuilding for it is a poor trade.  LL_LOG_LEVEL opens it up in place. */
+    /* Keep startup quiet by default; LL_LOG_LEVEL enables detailed diagnostics. */
     logSetMinLevel(LOG_WARN);
     if (const char *requested = std::getenv("LL_LOG_LEVEL"))
     {
@@ -145,15 +142,14 @@ int main(int argc, char *argv[], char *envp[])
     GetCurrentDirectoryA(MAX_PATH_LENGTH, gamePath);
     SymbolResolver::GetInstance().InitSearchPaths(libraryPath, gamePath);
 
-    // Install Exception Handler (BEFORE any C++ code runs)
+    // Install the exception handler before loading guest code.
     if (!AddVectoredExceptionHandler(1, myVectoredHandler))
         log_error("Failed to register MyVectoredHandler");
 
     log_info("Initializing bridges...\n");
     initBridges();
 
-    // CS Neo's engine is mapped as a launcher dependency. Its path-based N2
-    // overrides must therefore be registered before the ELF relocation pass.
+    // Register path-based overrides before ELF relocation.
     platformPrepareLoad(elfPath);
 
     if (!std::filesystem::exists("tmp"))

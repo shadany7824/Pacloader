@@ -1,4 +1,5 @@
 #include "es1.h"
+#include "kizuna/es1Kizuna.hpp"
 #include "es1Title.h"
 #include "es1VirtualDevices.h"
 #include "es1Network.h"
@@ -31,6 +32,7 @@ void es1MonitorCommandConsumer(const char *, const void *, size_t length, unsign
 
 extern "C" int es1PrepareLoad(const char *elfPath)
 {
+    es1KizunaPrepareLoad();
     return es1PrepareTestModeCompat(elfPath);
 }
 

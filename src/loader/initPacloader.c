@@ -104,12 +104,7 @@ void initMain(char *configPath, char *controlsPath)
     if (initSdlInput(controlsPath) != 0)
         exit(1);
 
-    /*
-     * Give the wheel back on the way out. Nothing was releasing the haptic
-     * effects, so whatever was last applied stayed loaded in the device's own
-     * firmware after the loader had gone - the wheel came up stiff and stayed
-     * that way until it was power cycled.
-     */
+    /* Release haptic effects so the wheel does not remain stiff after exit. */
     if (platformIsN2())
         atexit(sdlFfbShutdown);
 
@@ -128,8 +123,7 @@ void initMain(char *configPath, char *controlsPath)
         else if (sdlJoysticks.joysticks[i])
             joystick = sdlJoysticks.joysticks[i];
 
-        /* The counts are what a controls.ini binding indexes into, so they are
-         * worth printing next to the name. */
+        /* Show counts used by controls.ini bindings. */
         if (joystick)
             printf("  SDL CONTROLLER %d: %s (%d axes, %d buttons, %d hats)\n", i,
                    SDL_GetJoystickName(joystick), SDL_GetNumJoystickAxes(joystick),

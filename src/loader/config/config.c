@@ -46,10 +46,10 @@ static int detectGame(uint32_t elf_crc)
         config.jvsIOType = NAMCO_ES1_TYPE;
         config.region = es1CurrentTitle()->region;
         config.gameReleaseYear = (char *)es1CurrentTitle()->releaseYear;
-        config.gameNativeResolutions = (char *)"1360x768";
+        config.gameNativeResolutions = (char *)es1CurrentTitle()->nativeResolutions;
         config.gameType = DRIVING;
-        config.width = 1360;
-        config.height = 768;
+        config.width = es1CurrentTitle()->width;
+        config.height = es1CurrentTitle()->height;
         config.gameGroup = es1CurrentTitle()->group;
         log_warn("System ES1 support is experimental: cabinet I/O is emulated by Pacloader");
         return 0;
@@ -131,16 +131,14 @@ void setDefaultValues(EmulatorConfig *cfg)
     cfg->namcoES1.serialDiagnostics = 0;
     cfg->namcoES1.emulateJamma = 1;
     cfg->namcoES1.cabinetMode = NAMCO_ES1_CABINET_DRIVE;
+    strcpy(cfg->namcoES1.haspSerial, "267610069420");
     cfg->namcoES1.terminalEmulatorEnabled = 1;
     strcpy(cfg->namcoES1.dnsNbgiLoc, "");
     strcpy(cfg->namcoES1.dnsTenporouterLoc, "");
     strcpy(cfg->namcoES1.dnsBbrouterLoc, "");
     strcpy(cfg->namcoES1.dnsMuchaLocal, "");
     strcpy(cfg->namcoES1.dnsNaominetJp, "");
-    cfg->namcoES1.icCard.enabled = 1;
-    cfg->namcoES1.icCard.autoInsert = 1;
-    cfg->namcoES1.icCard.diagnostics = 0;
-    strcpy(cfg->namcoES1.icCard.cardFile, "wmmt4-card.ini");
+    strcpy(cfg->namcoES1.icCard.cardFile, "banapassport.ini");
     cfg->namcoES1.legacyCard.enabled = 0;
     cfg->namcoES1.legacyCard.autoInsert = 1;
     cfg->namcoES1.legacyCard.diagnostics = 0;
@@ -187,11 +185,15 @@ void setDefaultValues(EmulatorConfig *cfg)
     cfg->namcoN2.accelerator.maximum = 55480;
     cfg->namcoN2.brake.minimum = 29000;
     cfg->namcoN2.brake.maximum = 49480;
-    strcpy(cfg->namcoN2.jvs.name, "namco ltd.;JYU-PCB;Ver1.00;JPN,Multipurpose");
+    /* WMMT3/3DX/3DX+ identifies the actual JVS board as FCA-1.  N2 is the
+     * system assembly, not the I/O board shown by I/O PCB TEST. */
+    strcpy(cfg->namcoN2.jvs.name,
+           "namco ltd.;FCA-1;Ver1.00;JPN,Multipurpose + Rotary Encoder");
     cfg->namcoN2.jvs.players = 2;
     cfg->namcoN2.jvs.switches = 24;
     cfg->namcoN2.jvs.coins = 2;
     cfg->namcoN2.jvs.analogueInputs = 8;
+    cfg->namcoN2.jvs.rotaryInputs = 1;
     cfg->namcoN2.jvs.generalPurposeOutputs = 6;
     cfg->namcoN2.jvs.analogueOutputs = 4;
     cfg->namcoN2.jvs.generalPurposeInputs = 16;
@@ -384,6 +386,8 @@ void applyIniConfig(EmulatorConfig *config, const IniConfig *ini)
         strcpy(cabinetMode, config->namcoES1.cabinetMode == NAMCO_ES1_CABINET_TERMINAL
                                 ? "terminal"
                                 : "drive");
+        getString(ini, "NamcoES1", "HASP_SERIAL", config->namcoES1.haspSerial,
+                  sizeof(config->namcoES1.haspSerial));
         getString(ini, "NamcoES1", "CABINET_MODE", cabinetMode, sizeof(cabinetMode));
         toLowerCase(cabinetMode);
         if (strcmp(cabinetMode, "terminal") == 0)
@@ -432,12 +436,6 @@ void applyIniConfig(EmulatorConfig *config, const IniConfig *ini)
               sizeof(config->namcoES1.card.cardName));
     config->namcoES1.card.diagnostics =
         getInt(ini, "NamcoES1", "YACARDEMU_DIAGNOSTICS", config->namcoES1.card.diagnostics);
-    config->namcoES1.icCard.enabled =
-        getInt(ini, "NamcoES1", "IC_CARD_ENABLED", config->namcoES1.icCard.enabled);
-    config->namcoES1.icCard.autoInsert =
-        getInt(ini, "NamcoES1", "IC_CARD_AUTO_INSERT", config->namcoES1.icCard.autoInsert);
-    config->namcoES1.icCard.diagnostics =
-        getInt(ini, "NamcoES1", "IC_CARD_DIAGNOSTICS", config->namcoES1.icCard.diagnostics);
     getString(ini, "NamcoES1", "IC_CARD_FILE", config->namcoES1.icCard.cardFile,
               sizeof(config->namcoES1.icCard.cardFile));
     config->namcoES1.legacyCard.enabled = getInt(
@@ -502,6 +500,8 @@ void applyIniConfig(EmulatorConfig *config, const IniConfig *ini)
         getInt(ini, "NamcoN2", "JVS_COINS", config->namcoN2.jvs.coins);
     config->namcoN2.jvs.analogueInputs = getInt(
         ini, "NamcoN2", "JVS_ANALOGUE_IN", config->namcoN2.jvs.analogueInputs);
+    config->namcoN2.jvs.rotaryInputs = getInt(
+        ini, "NamcoN2", "JVS_ROTARY", config->namcoN2.jvs.rotaryInputs);
     config->namcoN2.jvs.generalPurposeOutputs = getInt(
         ini, "NamcoN2", "JVS_GPO", config->namcoN2.jvs.generalPurposeOutputs);
     config->namcoN2.jvs.analogueOutputs = getInt(
@@ -591,6 +591,7 @@ void applyIniConfig(EmulatorConfig *config, const IniConfig *ini)
 
     config->showDebugMessages = getInt(ini, "System", "DEBUG_MSGS", config->showDebugMessages);
     config->useAltJvsPassthrough = getInt(ini, "System", "USE_ALT_JVS_PASSTHROUGH", config->useAltJvsPassthrough);
+
 
 
 

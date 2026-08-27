@@ -31,12 +31,7 @@ typedef enum
     IniTargetES1
 } IniTarget;
 
-/*
- * The file is written into the game's own folder, so the board can be named by
- * finding the game's ELF beside it. Without that every board's settings were
- * written for every game, which is most of what made the result unreadable.
- *
- */
+/* Identify the board from the game ELF beside the configuration file. */
 static IniTarget detectTarget(const char *filePath, const char **gameName,
                              const char **revision)
 {
@@ -117,6 +112,9 @@ static void writeNamcoN2(FILE *file, const EmulatorConfig *defaults)
             defaults->namcoN2.accelerator.minimum, defaults->namcoN2.accelerator.maximum);
     fprintf(file, "BRAKE_RAW_MIN = %d\nBRAKE_RAW_MAX = %d\n\n",
             defaults->namcoN2.brake.minimum, defaults->namcoN2.brake.maximum);
+    fprintf(file, "# WMMT3-series FCA-1 JVS profile.\n");
+    fprintf(file, "JVS_IO_NAME = \"%s\"\n", defaults->namcoN2.jvs.name);
+    fprintf(file, "JVS_ROTARY = %d\n\n", defaults->namcoN2.jvs.rotaryInputs);
 }
 
 static void writeNamcoES1(FILE *file, const EmulatorConfig *defaults)
@@ -126,7 +124,11 @@ static void writeNamcoES1(FILE *file, const EmulatorConfig *defaults)
     fprintf(file, "DONGLE_ENABLED = %s\n", defaults->namcoES1.dongleEnabled ? "true" : "false");
     fprintf(file, "SERIAL_DIAGNOSTICS = %s\n", defaults->namcoES1.serialDiagnostics ? "true" : "false");
     fprintf(file, "EMULATE_JAMMA = %s\n", defaults->namcoES1.emulateJamma ? "true" : "false");
-    fprintf(file, "# DRIVE uses WMMT4 S/N 267610069420; TERMINAL uses 267611069420.\n");
+    fprintf(file, "# HASP dongle serial, twelve digits. The title derives its ALL.Net\n");
+    fprintf(file, "# serial from it as \"ABEN\" + the last seven digits, which is\n");
+    fprintf(file, "# what a private server matches a shop on.\n");
+    fprintf(file, "# Digit six is set from CABINET_MODE: DRIVE 0, TERMINAL 1.\n");
+    fprintf(file, "HASP_SERIAL = \"%s\"\n", defaults->namcoES1.haspSerial);
     fprintf(file, "CABINET_MODE = DRIVE\n");
     fprintf(file, "# WMMT4 DRIVE only: supplies terminal settings and clock locally.\n");
     fprintf(file, "TERMINAL_EMULATOR_ENABLED = %s\n\n",
@@ -153,11 +155,8 @@ static void writeNamcoES1(FILE *file, const EmulatorConfig *defaults)
     fprintf(file, "DNS_MUCHA_LOCAL = \"%s\"\n", defaults->namcoES1.dnsMuchaLocal);
     fprintf(file, "DNS_NAOMINET_JP = \"%s\"\n\n", defaults->namcoES1.dnsNaominetJp);
 
-    fprintf(file, "IC_CARD_ENABLED = %s\n", defaults->namcoES1.icCard.enabled ? "true" : "false");
-    fprintf(file, "IC_CARD_AUTO_INSERT = %s\n",
-            defaults->namcoES1.icCard.autoInsert ? "true" : "false");
-    fprintf(file, "IC_CARD_DIAGNOSTICS = %s\n",
-            defaults->namcoES1.icCard.diagnostics ? "true" : "false");
+    fprintf(file, "# Banapassport / Amusement IC reader and card live in their own\n");
+    fprintf(file, "# file, created on first run. Blank uses banapassport.ini.\n");
     fprintf(file, "IC_CARD_FILE = \"%s\"\n\n", defaults->namcoES1.icCard.cardFile);
 
     fprintf(file, "# WMMT3DX+ magnetic card dump used by the terminal reader.\n");

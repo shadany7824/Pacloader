@@ -10,21 +10,11 @@ typedef struct
     float springStrength;
     float damperStrength;
 
-    /*
-     * Optional shaping, both 0..1 and both off by default. The cabinet is
-     * direct drive as well, so neither corrects for it - a floor under the
-     * damper only stops the wheel going fully slack, and a deadband only stops
-     * a strong spring hunting at dead centre.
-     */
+    /* Optional shaping values in the 0..1 range. */
     float damperFloor;
     float springDeadband;
 
-    /*
-     * Where the wheel is sitting, -1 to 1. Only used when the device has no
-     * spring of its own: the centring force is worked out from it and folded
-     * into the constant force, so a wheel that supports nothing but constant
-     * force still self centres.
-     */
+    /* Current wheel position, used for constant-force centring fallback. */
     float wheelPosition;
     float constantForce;
     float vibrationStrength;
@@ -40,12 +30,9 @@ void sdlFfbInit(void);
 void sdlFfbShutdown(void);
 void sdlFfbRumble(float left, float right, int duration_ms);
 void sdlFfbApplySteering(const FfbSteeringState *state);
+void sdlFfbReapplySteering(void);
 
-/*
- * Called from the force feedback worker whenever it has been idle, so a source
- * whose state changes without anything pushing it can be re-read. Runs off the
- * game thread, so whatever it calls has to be safe there.
- */
+/* Poll a quiet source from the FFB worker thread. */
 void sdlFfbSetSteeringPoll(void (*poll)(void));
 void sdlFfbStopSteering(void);
 void sdlFfbDriveboard(const unsigned char *buffer, size_t count);

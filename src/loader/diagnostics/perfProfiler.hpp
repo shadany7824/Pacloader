@@ -18,6 +18,9 @@ void PerfProfiler_MarkRuntimeReady(void);
 void PerfProfiler_CacheSkip(const char *name);
 void PerfProfiler_TextureQuery(uint32_t pname, int cacheHit);
 void PerfProfiler_FrameSample(uint64_t elapsedTicks);
+/* One frame's GPU timing in nanoseconds: `busy` is GL_TIME_ELAPSED across the
+ * frame, `backlog` is how far behind the CPU the GPU was. */
+void PerfProfiler_GpuFrameSample(uint64_t busyNanoseconds, int64_t backlogNanoseconds);
 void PerfProfiler_FrameBoundaryEndAndStart(void);
 void PerfProfiler_FrameBoundaryStart(void);
 void PerfProfiler_FrameBoundaryEnd(void);

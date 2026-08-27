@@ -122,6 +122,7 @@ typedef enum
     GROUP_WMMT3,
     GROUP_MAXIMUM_HEAT_3D,
     GROUP_WMMT4_ES1,
+    GROUP_KIZUNA_ES1,
     GROUP_ABC,
     GROUP_HOD4,
     GROUP_HOD4_TEST,
@@ -204,6 +205,7 @@ typedef struct
     int switches;
     int coins;
     int analogueInputs;
+    int rotaryInputs;
     int generalPurposeOutputs;
     int analogueOutputs;
     int generalPurposeInputs;
@@ -225,9 +227,8 @@ typedef struct
 
 typedef struct
 {
-    int enabled;
-    int autoInsert;
-    int diagnostics;
+    /* Where the Banapassport reader keeps its own settings and card. Blank
+     * takes the default name. */
     char cardFile[MAX_PATH_LENGTH];
 } NamcoES1IcCardConfig;
 
@@ -316,6 +317,9 @@ typedef struct
     int ffbRumbleDuration;
     int ffbInvert;
     NamcoES1CabinetMode cabinetMode;
+    /* HASP dongle serial, twelve digits. The title's ALL.Net serial is "ABEN"
+     * plus the last seven, which is what a server keys the shop off. */
+    char haspSerial[16];
     /* Let a WMMT4 drive cabinet boot without a separate terminal process. */
     int terminalEmulatorEnabled;
     /* Optional WMMT4 DNS overrides. Empty strings use normal host DNS. */

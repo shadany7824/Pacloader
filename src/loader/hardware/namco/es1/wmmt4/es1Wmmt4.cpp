@@ -27,6 +27,7 @@
 #include <fstream>
 #include <vector>
 
+#include <string>
 #include <windows.h>
 
 extern int gWidth;
@@ -34,10 +35,28 @@ extern int gHeight;
 
 namespace
 {
-/* Dongle serials for the two cabinets in a WMMT4 group; they differ in the
- * fifth digit, the same way the ALL.Net serials do. */
-constexpr char DriveHaspSerial[] = "267610069420";
-constexpr char TerminalHaspSerial[] = "267611069420";
+/* The title's ALL.Net serial is "ABEN" plus the last seven digits of this, so
+ * it identifies the installation to a server and comes from the config. */
+constexpr size_t HaspSerialDigits = 12;
+constexpr size_t HaspCabinetDigitIndex = 5;
+constexpr char DefaultHaspSerial[] = "267610069420";
+
+/* The configured serial, with the cabinet digit forced to match cabinetMode. */
+std::string resolveHaspSerial(bool terminal)
+{
+    std::string serial = getConfig()->namcoES1.haspSerial;
+    const bool valid = serial.size() == HaspSerialDigits &&
+                       serial.find_first_not_of("0123456789") == std::string::npos;
+    if (!valid)
+    {
+        if (!serial.empty())
+            log_warn("System ES1 WMMT4: HASP_SERIAL '%s' is not twelve digits; using %s",
+                     serial.c_str(), DefaultHaspSerial);
+        serial = DefaultHaspSerial;
+    }
+    serial[HaspCabinetDigitIndex] = terminal ? '1' : '0';
+    return serial;
+}
 
 /* Opening bytes at each address, so a build these were not taken from is refused
  * rather than silently hooked; see Es1HookSpec. From WMN4r Rev 1.10.18. */
@@ -174,8 +193,10 @@ void initializeHaspData()
 
     const bool terminal =
         getConfig()->namcoES1.cabinetMode == NAMCO_ES1_CABINET_TERMINAL;
-    const char *serial = terminal ? TerminalHaspSerial : DriveHaspSerial;
-    std::memcpy(g_haspData.system.serial, serial, sizeof(g_haspData.system.serial));
+    const std::string serial = resolveHaspSerial(terminal);
+    std::memcpy(g_haspData.system.serial, serial.c_str(), sizeof(g_haspData.system.serial));
+    log_info("System ES1 WMMT4: dongle serial %s (ALL.Net ABEN%s)", serial.c_str(),
+             serial.c_str() + HaspSerialDigits - 7);
     uint8_t checksum = 0;
     for (int i = 0; i < 62; ++i)
         checksum = static_cast<uint8_t>(checksum + reinterpret_cast<uint8_t *>(&g_haspData.system)[i]);

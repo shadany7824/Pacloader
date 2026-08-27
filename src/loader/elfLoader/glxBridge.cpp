@@ -281,6 +281,49 @@ extern "C" int bridgeGlxWaitGL()
     return 0;
 }
 
+/* glXWaitX only orders X requests against GL ones.  There is no X server here,
+ * so there is nothing to wait for. */
+extern "C" int bridgeGlxWaitX()
+{
+    return 0;
+}
+
+/* The bridge hands out exactly one framebuffer config, so every config maps
+ * back to the same visual glXChooseVisual reports. */
+extern "C" void *bridgeGlxGetVisualFromFBConfig(void *display, void *config)
+{
+    (void)display;
+    (void)config;
+    log_debug("ES1 GLX: glXGetVisualFromFBConfig");
+    return &g_visual;
+}
+
+/* A GLXWindow is only a handle passed back to glXMakeContextCurrent, and
+ * the SDL window is the sole drawable, so reuse the X window id. */
+extern "C" unsigned long bridgeGlxCreateWindow(void *display, void *config,
+                                               unsigned long window, const int *attributes)
+{
+    (void)display;
+    (void)config;
+    (void)attributes;
+    log_debug("ES1 GLX: glXCreateWindow(0x%lx)", window);
+    return window;
+}
+
+extern "C" void bridgeGlxDestroyWindow(void *display, unsigned long window)
+{
+    (void)display;
+    (void)window;
+}
+
+/* Rendering goes straight to a WGL context, which is as direct as it gets. */
+extern "C" int bridgeGlxIsDirect(void *display, void *context)
+{
+    (void)display;
+    (void)context;
+    return 1;
+}
+
 extern "C" void bridgeGlxSwapBuffers(void *display, unsigned long drawable)
 {
     PERF_PROFILE_SCOPE("GLX");
@@ -408,6 +451,11 @@ void initBridges()
     map("glXGetProcAddress", bridgeGlxGetProcAddress);
     map("glXGetProcAddressARB", bridgeGlxGetProcAddress);
     map("glXWaitGL", bridgeGlxWaitGL);
+    map("glXWaitX", bridgeGlxWaitX);
+    map("glXGetVisualFromFBConfig", bridgeGlxGetVisualFromFBConfig);
+    map("glXCreateWindow", bridgeGlxCreateWindow);
+    map("glXDestroyWindow", bridgeGlxDestroyWindow);
+    map("glXIsDirect", bridgeGlxIsDirect);
     log_info("Initialized GLX compatibility bridges");
 }
 }

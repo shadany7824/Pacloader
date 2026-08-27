@@ -11,6 +11,7 @@
 
 #include "../es1CompatLayer.h"
 #include "../../../../config/config.h"
+#include "../../banapassport/banapassport.hpp"
 #include "../../../../elfLoader/guestTls.hpp"
 #include "../../../../log/log.h"
 
@@ -22,50 +23,14 @@ namespace
 constexpr int BanaResultOk = 1;
 constexpr int BanaResultNoCard = -1;
 constexpr int BanaStatusOk = 0;
+/* This build answers into a caller block: result at +8, card record at +16. */
 constexpr size_t ResultOffset = 8;
 constexpr size_t RecordOffset = 16;
-constexpr size_t CardRecordSize = 168;
-constexpr size_t ChipIdOffset = 0x2c;
-constexpr size_t AccessCodeOffset = 0x50;
-constexpr size_t CardStringSize = 32;
 
-std::array<uint8_t, CardRecordSize> g_cardRecord{};
-std::atomic<bool> g_cardLoaded{false};
-
-std::string readCardValue(const char *key, const char *fallback)
+/* The loader config only says where the reader's own file lives. */
+void configureReader()
 {
-    const char *file = getConfig()->namcoES1.icCard.cardFile;
-    char value[CardStringSize] = {};
-    GetPrivateProfileStringA("Card", key, fallback, value, sizeof(value), file);
-    return value;
-}
-
-void copyField(size_t offset, const std::string &text)
-{
-    std::memset(g_cardRecord.data() + offset, 0, CardStringSize);
-    const size_t length = text.size() < CardStringSize - 1 ? text.size() : CardStringSize - 1;
-    std::memcpy(g_cardRecord.data() + offset, text.c_str(), length);
-}
-
-void loadCardRecord()
-{
-    if (g_cardLoaded.exchange(true, std::memory_order_acq_rel))
-        return;
-
-    g_cardRecord.fill(0);
-    const std::string chipId = readCardValue("ChipId", "7F5C9744F111111143262C3300040610");
-    const std::string accessCode = readCardValue("AccessCode", "30764352518498791337");
-    copyField(ChipIdOffset, chipId);
-    copyField(AccessCodeOffset, accessCode);
-    if (getConfig()->namcoES1.icCard.diagnostics)
-        log_info("System ES1 WMMT5 IC card: chip=%s access=%s file=%s", chipId.c_str(),
-                 accessCode.c_str(), getConfig()->namcoES1.icCard.cardFile);
-}
-
-bool cardPresent()
-{
-    return getConfig()->namcoES1.icCard.enabled != 0 &&
-           getConfig()->namcoES1.icCard.autoInsert != 0;
+    banapassportConfigure(getConfig()->namcoES1.icCard.cardFile);
 }
 
 /* Report a command that finished cleanly. */
@@ -123,12 +88,21 @@ int wmmt5BanaReqWaitTouch(int reader, int, uint32_t, void *, uint8_t *block)
 {
     GuestTls::HostCallScope hostCall;
     /* Only the first reader exists on a drive cabinet. */
-    if (reader != 0 || !cardPresent() || !block)
+    if (reader != 0 || !block)
         return BanaResultNoCard;
 
-    loadCardRecord();
+    configureReader();
+    if (!banapassportReaderEnabled())
+        return BanaResultNoCard;
+
+    /* This entry point reports synchronously, so nothing can be left pending. */
+    if (banapassportAutoInsert())
+        banapassportPresent(nullptr, nullptr);
+    if (!banapassportCardOnReader())
+        return BanaResultNoCard;
+
     completed(block);
-    std::memcpy(block + RecordOffset, g_cardRecord.data(), g_cardRecord.size());
+    std::memcpy(block + RecordOffset, banapassportRecord(), BANAPASSPORT_RECORD_SIZE);
     return BanaResultOk;
 }
 
@@ -153,7 +127,8 @@ constexpr uint8_t SendUrlSignature[] = {0x55, 0x89, 0xe5, 0x57, 0x56, 0x83, 0xec
 
 int es1Wmmt5InstallCardHooks(void)
 {
-    if (!getConfig()->namcoES1.icCard.enabled)
+    banapassportConfigure(getConfig()->namcoES1.icCard.cardFile);
+    if (!banapassportReaderEnabled())
     {
         log_info("System ES1 WMMT5: IC card emulation disabled by configuration");
         return 0;
@@ -181,7 +156,11 @@ int es1Wmmt5InstallCardHooks(void)
         {ResetAddress, reinterpret_cast<void *>(wmmt5BanaReset), "BngRwReset", nullptr,
          Frame0x28Signature, sizeof(Frame0x28Signature)},
     };
-    return es1InstallHookTable(hooks, sizeof(hooks) / sizeof(hooks[0]), "WMMT5 card");
+    const int installed = es1InstallHookTable(hooks, sizeof(hooks) / sizeof(hooks[0]),
+                                             "WMMT5 card");
+    if (installed > 0)
+        banapassportRegisterCardControl("WMMT5 Banapassport IC card");
+    return installed;
 }
 
 #endif

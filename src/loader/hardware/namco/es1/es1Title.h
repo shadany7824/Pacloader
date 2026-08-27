@@ -122,6 +122,11 @@ typedef struct Es1Title
     const char *title;
     const char *revision;
     const char *releaseYear;
+    /* The cabinet panel the title renders for. ES1 assumed Wangan's 1360x768;
+     * Kizuna's projector has two sizes chosen by the launcher arguments. */
+    int width;
+    int height;
+    const char *nativeResolutions;
     GameRegion region;
     GameGroup group;
     int (*detect)(const char *elfPath);

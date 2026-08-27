@@ -8,6 +8,9 @@ option(PACLOADER_ENABLE_LTO
 option(PACLOADER_ENABLE_PORTABLE_TUNING
     "Enable non-native optimization tuning that preserves broad CPU compatibility"
     OFF)
+option(PACLOADER_BUILD_TESTS
+    "Build the standalone codec tests"
+    OFF)
 
 if(NOT (WIN32 OR MINGW OR CMAKE_C_COMPILER MATCHES "mingw"))
     message(FATAL_ERROR "pacloader currently targets 32-bit Windows/MinGW only")
@@ -53,10 +56,7 @@ target_compile_options(pacloader PRIVATE
     -Wimplicit-fallthrough=0
     -Wstrict-aliasing=0)
 
-# RelWithDebInfo defaults to -O2.  The loader has a large amount of small
-# bridge code spread across translation units, so -O3 plus LTO is useful here:
-# it lets GCC perform cross-TU inlining, propagation and dead-code removal.
-# Keep Debug builds untouched for source-level debugging and ABI diagnostics.
+# Use -O3 for release-like builds; Debug keeps source-level diagnostics intact.
 if(NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
     target_compile_options(pacloader PRIVATE -O3)
     target_compile_options(minhook PRIVATE -O3)
@@ -101,6 +101,11 @@ endif()
 
 target_link_directories(pacloader PRIVATE ${PROJECT_SOURCE_DIR}/libs/win32)
 
+get_filename_component(PACLOADER_TOOLCHAIN_BIN "${CMAKE_CXX_COMPILER}" DIRECTORY)
+get_filename_component(PACLOADER_TOOLCHAIN_ROOT "${PACLOADER_TOOLCHAIN_BIN}" DIRECTORY)
+find_library(PACLOADER_CRYPTO_LIBRARY NAMES crypto
+    HINTS "${PACLOADER_TOOLCHAIN_ROOT}/lib" REQUIRED)
+
 # Keep the pthread implementation internal to pacloader.  This leaves SDL3 as
 # the only non-system DLL required by the native loader itself.
 execute_process(
@@ -121,4 +126,18 @@ target_link_libraries(pacloader PRIVATE
     ws2_32
     opengl32
     psapi
-    iphlpapi)
+    iphlpapi
+    winhttp
+    ${PACLOADER_CRYPTO_LIBRARY})
+
+if(PACLOADER_BUILD_TESTS)
+    enable_testing()
+    add_executable(nbgiCodecTest
+        tools/nbgiCodecTest.cpp
+        src/loader/hardware/namco/banapassport/nbgiCodec.cpp)
+    target_include_directories(nbgiCodecTest PRIVATE ${PROJECT_SOURCE_DIR}/src)
+    target_compile_options(nbgiCodecTest PRIVATE -m32 -Wall -Wextra)
+    target_link_options(nbgiCodecTest PRIVATE -m32 -static-libgcc -static-libstdc++)
+    target_link_libraries(nbgiCodecTest PRIVATE ${PACLOADER_CRYPTO_LIBRARY})
+    add_test(NAME nbgiCodecTest COMMAND nbgiCodecTest)
+endif()

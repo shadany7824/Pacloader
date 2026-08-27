@@ -83,6 +83,7 @@ set(PACLOADER_SOURCES
     src/loader/hardware/namco/es1/es1TestModeCompat.cpp
     src/loader/hardware/namco/es1/es1Jvs.cpp
     src/loader/hardware/namco/es1/es1Kickback.cpp
+    src/loader/hardware/namco/es1/es1StrPcbStateMachine.cpp
     src/loader/hardware/namco/es1/es1Network.cpp
     src/loader/hardware/namco/es1/es1OnlineNetwork.cpp
     src/loader/hardware/namco/es1/es1VirtualDevices.cpp
@@ -90,6 +91,7 @@ set(PACLOADER_SOURCES
     src/loader/hardware/namco/es1/es1AlinCompat.cpp
     src/loader/hardware/namco/es1/es1CompatLayer.cpp
     src/loader/hardware/namco/es1/es1Titles.cpp
+    src/loader/hardware/namco/es1/kizuna/es1Kizuna.cpp
     src/loader/hardware/namco/es1/maximumHeat3d/es1MaximumHeat3D.cpp
     src/loader/hardware/namco/es1/wmmt4/es1Wmmt4.cpp
     src/loader/hardware/namco/es1/wmmt5/es1Wmmt5.cpp
@@ -100,6 +102,8 @@ set(PACLOADER_SOURCES
     src/loader/hardware/namco/es1/wmmt5/es1Wmmt5Network.cpp
     src/loader/hardware/namco/es1/wmmt5/es1Wmmt5Steering.cpp
     src/loader/hardware/namco/es1/wmmt5/es1Wmmt5Vendor.cpp
+    src/loader/hardware/namco/banapassport/banapassport.cpp
+    src/loader/hardware/namco/banapassport/nbgiCodec.cpp
     src/loader/hardware/namco/es1/wmmt4/es1Wmmt4Card.cpp
     src/loader/hardware/namco/es1/wmmt4/es1Wmmt4Ffb.cpp
     src/loader/hardware/namco/es1/wmmt4/es1Wmmt4Network.cpp

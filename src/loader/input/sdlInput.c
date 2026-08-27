@@ -225,6 +225,7 @@ extern const ControlBinding gDefaultDrivingBindings[];
 extern const ControlBinding gDefaultWmmtBindings[];
 extern const ControlBinding gDefaultWmmt4Bindings[];
 extern const ControlBinding gDefaultMaximumHeat3dBindings[];
+extern const ControlBinding gDefaultKizunaBindings[];
 extern const ControlBinding gDefaultFlyingBindings[];
 extern const ControlBinding gDefaultShootingBindings[];
 extern const ControlBinding gDefaultMahjongBindings[];
@@ -648,6 +649,18 @@ void remapPerGame()
         gJvsMap[PLAYER_2][LA_GearDown] = (JVSActionMapping){JVS_CALL_NONE, NONE};
 
         /* The card goes through the reader on ttyS1, not a panel switch. */
+        gJvsMap[PLAYER_1][LA_CardInsert] = (JVSActionMapping){JVS_CALL_NONE, NONE};
+    }
+    else if (platformCabinetPanel() == CABINET_PANEL_KIZUNA_POD)
+    {
+        /* Kizuna's POD service panel: SELECT SW and ENTER SW are the service line
+         * and the first switch bit, as on the other ES1 boards. */
+        gJvsMap[PLAYER_1][LA_Service] = (JVSActionMapping){JVS_CALL_SWITCH, BUTTON_SERVICE};
+        gJvsMap[PLAYER_1][LA_Enter] = (JVSActionMapping){JVS_CALL_SWITCH, BUTTON_1};
+        gJvsMap[PLAYER_1][LA_TestUp] = (JVSActionMapping){JVS_CALL_SWITCH, BUTTON_UP};
+        gJvsMap[PLAYER_1][LA_TestDown] = (JVSActionMapping){JVS_CALL_SWITCH, BUTTON_DOWN};
+
+        /* The Banapassport reader is on ttyS1, not a panel switch. */
         gJvsMap[PLAYER_1][LA_CardInsert] = (JVSActionMapping){JVS_CALL_NONE, NONE};
     }
     else if (platformCabinetPanel() == CABINET_PANEL_MAXIMUM_HEAT_3D)
