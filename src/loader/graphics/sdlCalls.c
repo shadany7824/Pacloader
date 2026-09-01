@@ -13,6 +13,8 @@
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_error.h>
 #include <stdbool.h>
+#include <string.h>
+#include <stdlib.h>
 #include <unistd.h>
 
 #include "blitStretching.h"
@@ -40,7 +42,6 @@ extern int gHeight;
 Display *x11Display = NULL;
 Window x11Window;
 #endif
-
 
 bool creatingWindow = false;
 SDL_Window *g_SdlWindow = NULL;
@@ -375,7 +376,6 @@ int presentSDLFrame(const SDLFramePresentOptions *options)
         PerfProfiler_End("Frame", "presentSDLFrame", profileStart, 0);
         return 0;
     }
-
 
     uint64_t segmentStart = PerfProfiler_NowTicks();
     if (options->beforeEvents)

@@ -220,6 +220,53 @@ bool glStateCacheEnabled()
     return enabled;
 }
 
+/* LL_GL_STATE_CACHE_PARTS=texparam,texenv,texunit,buf,attrib bisects a
+ * rendering fault without a rebuild; "tex" is the three texture parts. */
+enum StateCachePart
+{
+    kStateCacheTexParam = 1,
+    kStateCacheTexEnv = 2,
+    kStateCacheTexUnit = 4,
+    kStateCacheBuf = 8,
+    kStateCacheAttrib = 16,
+    kStateCacheTex = kStateCacheTexParam | kStateCacheTexEnv | kStateCacheTexUnit,
+    kStateCacheAll = kStateCacheTex | kStateCacheBuf | kStateCacheAttrib,
+};
+
+unsigned glStateCacheParts()
+{
+    static const unsigned parts = [] {
+        if (!glStateCacheEnabled())
+            return 0u;
+        const char *setting = std::getenv("LL_GL_STATE_CACHE_PARTS");
+        if (!setting || !*setting)
+            return static_cast<unsigned>(kStateCacheAll);
+
+        /* Exact tokens, not substrings: "texparam" must not also select "tex". */
+        static const struct { const char *name; unsigned bit; } known[] = {
+            {"texparam", kStateCacheTexParam}, {"texenv", kStateCacheTexEnv},
+            {"texunit", kStateCacheTexUnit},   {"tex", kStateCacheTex},
+            {"buf", kStateCacheBuf},           {"attrib", kStateCacheAttrib},
+        };
+        unsigned selected = 0;
+        for (const char *token = setting; *token;)
+        {
+            const char *end = token;
+            while (*end && *end != ',')
+                ++end;
+            const size_t length = static_cast<size_t>(end - token);
+            for (const auto &entry : known)
+                if (strlen(entry.name) == length && strncmp(entry.name, token, length) == 0)
+                    selected |= entry.bit;
+            token = *end ? end + 1 : end;
+        }
+        return selected;
+    }();
+    return parts;
+}
+
+bool glStateCachePart(unsigned part) { return (glStateCacheParts() & part) != 0; }
+
 bool glBufferPoolEnabled()
 {
     /* Reusing a deleted OpenGL name without a guest-to-host name map is not
@@ -236,9 +283,10 @@ bool glBufferPoolEnabled()
 
 bool glStreamBufferPoolEnabled()
 {
+    /* On by default; LL_GL_BUFFER_POOL=off or =unsafe selects otherwise. */
     static const bool enabled = [] {
         const char *setting = std::getenv("LL_GL_BUFFER_POOL");
-        return setting && strcmp(setting, "stream") == 0;
+        return !setting || strcmp(setting, "stream") == 0;
     }();
     return enabled;
 }
@@ -332,6 +380,31 @@ bool takeStreamRecycledBuffer(GLuint *buffer)
     return true;
 }
 
+/* The pool answers almost every gen; the rest reach the driver one name at a
+ * time, so take a batch on underflow and bank the remainder. */
+constexpr GLsizei kStreamPoolRefill = 64;
+
+template <typename Generate>
+void generatePooledBuffers(GLsizei needed, GLuint *out, Generate generate)
+{
+    if (!generate || needed <= 0)
+        return;
+    if (!glStreamBufferPoolEnabled() || needed > kStreamPoolRefill)
+    {
+        generate(needed, out);
+        return;
+    }
+
+    GLuint batch[kStreamPoolRefill * 2];
+    const GLsizei total = needed + kStreamPoolRefill;
+    generate(total, batch);
+    for (GLsizei i = 0; i < needed; ++i)
+        out[i] = batch[i];
+    /* Banked without a record: takeStreamRecycledBuffer() creates one. */
+    for (GLsizei i = needed; i < total; ++i)
+        g_streamRecycledBuffers.push_back(batch[i]);
+}
+
 bool glBufferTraceEnabled()
 {
     static const bool enabled = [] {
@@ -421,7 +494,7 @@ IntStateSlot *findTexEnvSlot(GLenum unit, GLenum target, GLenum pname, bool crea
 
 bool shouldSkipTexEnv(GLenum target, GLenum pname, GLint value)
 {
-    if (!glStateCacheEnabled())
+    if (!glStateCachePart(kStateCacheTexEnv))
         return false;
     IntStateSlot *slot = findTexEnvSlot(currentTextureUnit(), target, pname, false);
     if (!slot)
@@ -485,7 +558,7 @@ bool cacheableTextureParameter(GLenum pname)
 
 bool shouldSkipTexParameteri(GLenum target, GLenum pname, GLint value)
 {
-    if (!glStateCacheEnabled() || !cacheableTextureParameter(pname))
+    if (!glStateCachePart(kStateCacheTexParam) || !cacheableTextureParameter(pname))
         return false;
     TextureParameterSlot *slot = findTextureParameterSlot(
         currentTextureUnit(), target, pname, currentTexture(target), false);
@@ -587,7 +660,7 @@ GLuint currentBuffer(GLenum target)
 
 bool shouldSkipBindBuffer(GLenum target, GLuint buffer)
 {
-    if (!glStateCacheEnabled())
+    if (!glStateCachePart(kStateCacheBuf))
         return false;
     BufferBindingSlot *slot = findBufferBinding(target, false);
     if (!slot)
@@ -615,7 +688,7 @@ void rememberBufferBinding(GLenum target, GLuint buffer)
 
 bool shouldSkipAttribEnabled(GLuint index, bool enabled)
 {
-    if (!glStateCacheEnabled() || index >= kAttribSlots)
+    if (!glStateCachePart(kStateCacheAttrib) || index >= kAttribSlots)
         return false;
     const unsigned char desired = enabled ? 2 : 1;
     if (g_glStateCache.attribEnabled[index] == desired)
@@ -630,7 +703,7 @@ bool shouldSkipAttribEnabled(GLuint index, bool enabled)
 bool shouldSkipAttribPointer(GLuint index, GLint size, GLenum type, GLboolean normalized,
                              GLsizei stride, const GLvoid *pointer)
 {
-    if (!glStateCacheEnabled() || index >= kAttribSlots)
+    if (!glStateCachePart(kStateCacheAttrib) || index >= kAttribSlots)
         return false;
     VertexAttribPointerSlot &slot = g_glStateCache.attribPointers[index];
     const GLuint arrayBuffer = currentBuffer(GL_ARRAY_BUFFER);
@@ -1562,7 +1635,7 @@ extern "C" void __attribute__((cdecl)) wrap_glTexCoord2fv(const GLfloat *v)
 extern "C" void __attribute__((cdecl)) wrap_glActiveTexture(GLenum texture)
 {
     PERF_PROFILE_SCOPE("GL");
-    if (glStateCacheEnabled() && g_glStateCache.activeTextureValid &&
+    if (glStateCachePart(kStateCacheTexUnit) && g_glStateCache.activeTextureValid &&
         g_glStateCache.activeTexture == texture)
         return;
     g_glStateCache.activeTextureValid = true;
@@ -1588,7 +1661,7 @@ extern "C" void __attribute__((cdecl)) wrap_glMultiTexCoord2fv(GLenum target, co
 extern "C" void __attribute__((cdecl)) wrap_glActiveTextureARB(GLenum texture)
 {
     PERF_PROFILE_SCOPE("GL");
-    if (glStateCacheEnabled() && g_glStateCache.activeTextureValid &&
+    if (glStateCachePart(kStateCacheTexUnit) && g_glStateCache.activeTextureValid &&
         g_glStateCache.activeTexture == texture)
         return;
     g_glStateCache.activeTextureValid = true;
@@ -2126,8 +2199,8 @@ extern "C" void __attribute__((cdecl)) wrap_glGenBuffers(GLsizei n, GLuint *buff
         ++recycled;
     while (recycled < n && takeRecycledBuffer(&buffers[recycled]))
         ++recycled;
-    if (recycled < n && glad_glGenBuffers)
-        glad_glGenBuffers(n - recycled, buffers + recycled);
+    if (recycled < n)
+        generatePooledBuffers(n - recycled, buffers + recycled, glad_glGenBuffers);
     if (glBufferTraceEnabled())
     {
         const uintptr_t caller = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
@@ -2822,8 +2895,8 @@ extern "C" void __attribute__((cdecl)) wrap_glGenBuffersARB(GLsizei n, GLuint *b
         ++recycled;
     while (recycled < n && takeRecycledBuffer(&buffers[recycled]))
         ++recycled;
-    if (recycled < n && glad_glGenBuffersARB)
-        glad_glGenBuffersARB(n - recycled, buffers + recycled);
+    if (recycled < n)
+        generatePooledBuffers(n - recycled, buffers + recycled, glad_glGenBuffersARB);
     if (glBufferTraceEnabled())
     {
         const uintptr_t caller = reinterpret_cast<uintptr_t>(__builtin_return_address(0));
@@ -3459,9 +3532,11 @@ extern "C" const GLubyte *__attribute__((cdecl)) wrap_glGetString(GLenum name)
 extern "C" GLenum __attribute__((cdecl)) wrap_glGetError()
 {
     PERF_PROFILE_SCOPE("GL");
+    /* A GL 1.1 question no modern driver answers usefully; LL_GL_GETERROR_FAST=0
+     * puts it back on the driver. */
     static const bool fastPath = [] {
         const char *setting = std::getenv("LL_GL_GETERROR_FAST");
-        return setting && strcmp(setting, "1") == 0;
+        return !setting || strcmp(setting, "0") != 0;
     }();
     if (fastPath)
         return GL_NO_ERROR;

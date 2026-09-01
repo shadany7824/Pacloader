@@ -1200,6 +1200,17 @@ extern "C" void PerfProfiler_PresentTransaction(const char *source,
     g_presentSpikes[g_presentSpikeCount++ % kPresentSpikeCount] = spike;
 }
 
+/* A duration rather than a gap between marks, through the same wrapping series,
+ * so a cost that averages well can still be shown to be bimodal. */
+extern "C" void PerfProfiler_DurationMark(const char *name, uint64_t ticks)
+{
+    if (!PerfProfiler_IsEnabled() || !name || ticks == 0 ||
+        !g_runtimeReady.load(std::memory_order_acquire))
+        return;
+    if (IntervalSeries *series = findIntervalSeries(name))
+        recordInterval(*series, ticks);
+}
+
 extern "C" void PerfProfiler_IntervalMark(const char *name)
 {
     if (!PerfProfiler_IsEnabled() || !name ||
@@ -1328,6 +1339,7 @@ extern "C" uint64_t PerfProfiler_NowTicks(void) { return 0; }
 extern "C" void PerfProfiler_PresentTransaction(const char *, uint64_t, uint64_t,
                                                  uint64_t, uint64_t) {}
 extern "C" void PerfProfiler_IntervalMark(const char *) {}
+extern "C" void PerfProfiler_DurationMark(const char *, uint64_t) {}
 extern "C" void PerfProfiler_GLBufferEvent(const char *, uintptr_t, uintptr_t,
                                             uint32_t, uint32_t, uint64_t, uint32_t) {}
 

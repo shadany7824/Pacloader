@@ -355,6 +355,9 @@ extern "C" void bridgeGlxSwapBuffers(void *display, unsigned long drawable)
         if (afterSwap > segmentStart)
             swapTicks = afterSwap - segmentStart;
         PerfProfiler_End("Present", "SDL_GL_SwapWindow", swapStart, 0);
+        PerfProfiler_DurationMark("swap", swapTicks);
+        PerfProfiler_DurationMark("events", eventTicks);
+        PerfProfiler_DurationMark("pacing", pacingTicks);
         PerfProfiler_MarkRuntimeReady();
         const uint64_t transactionEnd = PerfProfiler_NowTicks();
         if (transactionStart && transactionEnd > transactionStart)

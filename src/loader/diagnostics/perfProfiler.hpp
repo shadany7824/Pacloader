@@ -31,6 +31,9 @@ void PerfProfiler_PresentTransaction(const char *source, uint64_t totalTicks,
 /* Records the interval between successive calls, one series per name. Used to
  * measure the pacing the display actually sees rather than the work per frame. */
 void PerfProfiler_IntervalMark(const char *name);
+/* Records a duration into the same wrapping percentile series, so a cost
+ * with a healthy average can still be shown to be bimodal. */
+void PerfProfiler_DurationMark(const char *name, uint64_t ticks);
 void PerfProfiler_GLBufferEvent(const char *operation, uintptr_t caller,
                                 uintptr_t context, uint32_t target, uint32_t usage,
                                 uint64_t size, uint32_t buffer);

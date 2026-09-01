@@ -3,7 +3,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <cerrno>
-#include <unordered_set>
 #include <wchar.h>
 
 #include "../log/log.h"
@@ -12,60 +11,65 @@
 
 namespace
 {
-/* Ownership set for customFree/customRealloc, sharded like the pthread mapper:
- * one process-wide lock here cost more than the allocation it guarded. */
-constexpr size_t kAllocationShardCount = 64;
+/* Ownership lives in a header before each block: the side table it replaces
+ * cost more than the allocation it guarded, and sharding did not help. */
+constexpr uint32_t kGuestAllocationMagic = 0x4C434150u; /* "PACL" */
 
-struct alignas(64) AllocationShard
+struct GuestAllocationHeader
 {
-    SRWLOCK lock = SRWLOCK_INIT;
-    std::unordered_set<void *> pointers;
+    uint32_t magic;
+    uint32_t offset;    /* CRT block to guest pointer, a multiple of alignment */
+    uint32_t alignment;
+    uint32_t reserved;
 };
 
-/* Leaked deliberately: guest threads still free memory during static destruction. */
-AllocationShard *allocationShards()
+/* 16 bytes keeps the common alignment of 16 at an offset of exactly one header. */
+static_assert(sizeof(GuestAllocationHeader) == 16, "header must not disturb alignment");
+
+size_t headerOffsetFor(size_t alignment)
 {
-    static auto *shards = new AllocationShard[kAllocationShardCount];
-    return shards;
+    if (alignment < sizeof(GuestAllocationHeader))
+        alignment = sizeof(GuestAllocationHeader);
+    /* A multiple of the alignment, so base + offset stays aligned. */
+    return ((sizeof(GuestAllocationHeader) + alignment - 1) / alignment) * alignment;
 }
 
-AllocationShard &allocationShard(void *ptr)
+GuestAllocationHeader *headerOf(void *guest)
 {
-    /* 16-byte aligned, so the low bits carry no shard information. */
-    const uintptr_t value = reinterpret_cast<uintptr_t>(ptr);
-    return allocationShards()[(value >> 4) % kAllocationShardCount];
+    return reinterpret_cast<GuestAllocationHeader *>(static_cast<char *>(guest) -
+                                                     sizeof(GuestAllocationHeader));
 }
 
-bool forgetGuestAllocation(void *ptr)
+/* Reading the 16 bytes before a pointer this allocator never returned is why the
+ * magic is checked: a foreign heap pointer is rejected rather than freed. */
+bool guestAllocationBase(void *guest, void **base, GuestAllocationHeader *copy)
 {
-    AllocationShard &shard = allocationShard(ptr);
-    AcquireSRWLockExclusive(&shard.lock);
-    const bool owned = shard.pointers.erase(ptr) != 0;
-    ReleaseSRWLockExclusive(&shard.lock);
-    return owned;
-}
-
-void rememberGuestAllocation(void *ptr)
-{
-    AllocationShard &shard = allocationShard(ptr);
-    AcquireSRWLockExclusive(&shard.lock);
-    shard.pointers.insert(ptr);
-    ReleaseSRWLockExclusive(&shard.lock);
+    const GuestAllocationHeader *header = headerOf(guest);
+    if (header->magic != kGuestAllocationMagic || header->offset < sizeof(*header))
+        return false;
+    *copy = *header;
+    *base = static_cast<char *>(guest) - header->offset;
+    return true;
 }
 
 void *trackedAlignedMalloc(size_t size, size_t alignment)
 {
-    void *ptr = nullptr;
-    {
-        PerfProfilerScope scope("Alloc", "alignedMalloc");
-        ptr = _aligned_malloc(size, alignment);
-    }
-    if (ptr)
-    {
-        PerfProfilerScope scope("Alloc", "trackInsert");
-        rememberGuestAllocation(ptr);
-    }
-    return ptr;
+    const size_t offset = headerOffsetFor(alignment);
+    if (size > SIZE_MAX - offset)
+        return nullptr;
+
+    PerfProfilerScope scope("Alloc", "alignedMalloc");
+    char *base = static_cast<char *>(_aligned_malloc(size + offset, alignment));
+    if (!base)
+        return nullptr;
+
+    char *guest = base + offset;
+    GuestAllocationHeader *header = headerOf(guest);
+    header->magic = kGuestAllocationMagic;
+    header->offset = static_cast<uint32_t>(offset);
+    header->alignment = static_cast<uint32_t>(alignment);
+    header->reserved = 0;
+    return guest;
 }
 }
 
@@ -337,16 +341,16 @@ void MemoryManager::customFree(void *ptr)
     if (!ptr)
         return;
 
+    void *base = nullptr;
+    GuestAllocationHeader header{};
+    if (!guestAllocationBase(ptr, &base, &header))
     {
-        PerfProfilerScope scope("Alloc", "trackErase");
-        if (!forgetGuestAllocation(ptr))
-        {
-            log_warn("MemoryManager: ignored free of an unowned guest pointer %p", ptr);
-            return;
-        }
+        log_warn("MemoryManager: ignored free of an unowned guest pointer %p", ptr);
+        return;
     }
+    headerOf(ptr)->magic = 0; /* so a double free is rejected rather than repeated */
     PerfProfilerScope scope("Alloc", "alignedFree");
-    _aligned_free(ptr);
+    _aligned_free(base);
 }
 
 void *MemoryManager::customCalloc(size_t nmemb, size_t size)
@@ -374,25 +378,24 @@ void *MemoryManager::customRealloc(void *ptr, size_t size)
         return nullptr;
     }
 
-    /* No lock across _aligned_realloc: old and new pointers can land in
-     * different shards, so no single lock covers the pair. */
-    void *replacement = nullptr;
+    void *base = nullptr;
+    GuestAllocationHeader header{};
+    if (!guestAllocationBase(ptr, &base, &header))
     {
-        PerfProfilerScope trackScope("Alloc", "trackRealloc");
-        if (!forgetGuestAllocation(ptr))
-        {
-            log_warn("MemoryManager: rejected realloc of an unowned guest pointer %p", ptr);
-            return nullptr;
-        }
+        log_warn("MemoryManager: rejected realloc of an unowned guest pointer %p", ptr);
+        return nullptr;
     }
+    if (size > SIZE_MAX - header.offset)
+        return nullptr;
 
-    replacement = _aligned_realloc(ptr, size, 16);
+    PerfProfilerScope scope("Alloc", "alignedRealloc");
+    char *moved = static_cast<char *>(
+        _aligned_realloc(base, size + header.offset, header.alignment));
+    if (!moved)
+        return nullptr; /* the original block is still live and still ours */
 
-    {
-        PerfProfilerScope trackScope("Alloc", "trackRealloc");
-        /* On failure the original block is still live and still ours. */
-        rememberGuestAllocation(replacement ? replacement : ptr);
-    }
+    char *replacement = moved + header.offset;
+    *headerOf(replacement) = header;
     return replacement;
 }
 
