@@ -2,9 +2,9 @@
   <img src="src/loader/resources/logo.png" alt="Linux Loader Logo">
 </p>
 
-# Linux Loader
+# Pacloader (5DX+)
 
-This project is an evolved version of Lindbergh Loader. The main goal is to run all the SEGA Lindbergh games in Linux and Windows plus, in the future, other Arcade systems such as Namco N2 / ES1 and Raw Thrills.
+This project is an actually forked from Pacloader. The main goal is to run all the SEGA Lindbergh games in Linux and Windows plus, in the future, other Arcade systems such as Namco N2 / ES1 and Raw Thrills.
 
 ## 📚 Documentation
 
