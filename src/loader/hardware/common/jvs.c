@@ -490,7 +490,7 @@ JVSStatus processPacket(int *packetSize)
             {
                 // setGeneralPurposeOutputByte(i, inputPacket.data[index + 2 + i]);
                 if (gpoHandler)
-                    gpoHandler(inputPacket.data[index + 2 + i]);
+                    gpoHandler((unsigned char)i, inputPacket.data[index + 2 + i]);
             }
             outputPacket.data[outputPacket.length] = REPORT_SUCCESS;
             outputPacket.length += 1;

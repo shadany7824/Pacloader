@@ -5,21 +5,30 @@
 #include <glad/gl.h>
 #include <SDL3/SDL.h>
 #include <stdbool.h>
+#include <stdlib.h>
 
 #include "blitStretching.h"
 #include "../config/config.h"
 #include "../log/log.h"
+#include "../elfLoader/glHooks.hpp"
+#include "sdlCalls.h"
 // #include "glInitFunctions.h"
 
-#define CHECK_GL(msg)                                                                                                                      \
-    do                                                                                                                                     \
-    {                                                                                                                                      \
-        GLenum err = glad_glGetError();                                                                                                    \
-        if (err != GL_NO_ERROR)                                                                                                            \
-        {                                                                                                                                  \
-            log_error("OpenGL Error in " msg ": 0x%04X", err);                                                                             \
-        }                                                                                                                                  \
-    } while (0)
+/* Every CHECK_GL is a synchronous driver round trip, and there are eight of
+ * them plus a drain loop in a function that runs on the presenting thread once
+ * a frame. Off unless LL_BLIT_DEBUG=1 asks for them. */
+static int blitDebugEnabled(void)
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char *setting = getenv("LL_BLIT_DEBUG");
+        cached = (setting && setting[0] == '1') ? 1 : 0;
+    }
+    return cached;
+}
+
+#define CHECK_GL(msg)                                                                                                                          do                                                                                                                                         {                                                                                                                                              if (blitDebugEnabled())                                                                                                                    {                                                                                                                                              GLenum err = glad_glGetError();                                                                                                            if (err != GL_NO_ERROR)                                                                                                                    {                                                                                                                                              log_error("OpenGL Error in " msg ": 0x%04X", err);                                                                                     }                                                                                                                                      }                                                                                                                                      } while (0)
 
 // #ifdef _WIN32
 // #include "../elfLoader/glhooks.hpp"
@@ -31,13 +40,18 @@ extern int gWidth;
 extern int gHeight;
 extern SDL_Window *g_SdlWindow;
 
+
 int blitWidth = 0;
 int blitHeight = 0;
 
 int gameIsOutrunChihiroMode = 0;
 
 int fboInitialized = false;
-GLuint fboId = 0;
+/* Framebuffer objects are containers, and containers are *not* shared between
+ * the contexts of a share group - only the texture they point at is. One name
+ * per thread, so the ES1 presenter and the window thread cannot take turns
+ * invalidating each other's. */
+static __thread GLuint fboId = 0;
 GLuint fboTextureId = 0;
 
 int drawableW = 1;
@@ -62,7 +76,7 @@ void blitSetWidthandHeightSize()
 
 int blitInitializeFbo()
 {
-    fboId = 0; // Will be lazily initialized in blitStretch on the correct context
+    // fboId is per-thread and lazily created in blitStretch on its own context.
 
     glad_glGenTextures(1, &fboTextureId);
     if (fboTextureId == 0)
@@ -105,29 +119,49 @@ void blitStretch()
 
     if (fboInitialized && fboId > 0 && fboTextureId > 0 && g_SdlWindow)
     {
-        while (glad_glGetError() != GL_NO_ERROR)
-            ; // clear previous errors
+        if (blitDebugEnabled())
+            while (glad_glGetError() != GL_NO_ERROR)
+                ; // clear previous errors
 
         static int firstTime = 1;
-        if (firstTime)
+        if (firstTime && !GLHooks_NativeUpscaleActive() && sdlIsWindowThread())
         {
             SDL_SetWindowSize(g_SdlWindow, gWidth, gHeight);
             firstTime = 0;
         }
-        SDL_GetWindowSizeInPixels(g_SdlWindow, &drawableW, &drawableH);
+
+        /* SDL's video functions are only safe on the window's own thread. The
+         * ES1 presenter runs this from a guest thread, where asking every frame
+         * is exactly the call that hung the game; it reads the size the window
+         * thread published instead. */
+        int haveDrawableSize;
+        if (sdlIsWindowThread())
+            haveDrawableSize = SDL_GetWindowSizeInPixels(g_SdlWindow, &drawableW, &drawableH);
+        else
+            haveDrawableSize = GLHooks_GetDrawableSize(&drawableW, &drawableH);
+        if (!haveDrawableSize || drawableW <= 0 || drawableH <= 0)
+            return;
 
         // Always copy from the default framebuffer.
         GLint sourceViewport[4] = {0, 0, blitWidth, blitHeight};
 
-        // SAVE STATE
-        GLint oldScissorTest = 0;
-        GLint oldScissorBox[4];
-        GLint oldViewport[4];
-        GLboolean oldColorMask[4];
-        GLint oldDrawFbo = 0, oldReadFbo = 0;
-        GLfloat oldClearColor[4];
-        GLint oldReadBuffer = GL_BACK, oldDrawBuffer = GL_BACK;
+        /* SAVE STATE - nine driver round trips. Under native upscale the
+         * context this runs on issues glXSwapBuffers and nothing else, so the
+         * state it holds between frames is the state we left it in: ask once
+         * per thread and reuse the answer. The window-thread path shares the
+         * guest's drawing context and has to keep asking. */
+        static __thread GLint oldScissorTest = 0;
+        static __thread GLint oldScissorBox[4];
+        static __thread GLint oldViewport[4];
+        static __thread GLboolean oldColorMask[4];
+        static __thread GLint oldDrawFbo = 0, oldReadFbo = 0;
+        static __thread GLfloat oldClearColor[4];
+        static __thread GLint oldReadBuffer = GL_BACK, oldDrawBuffer = GL_BACK;
+        static __thread int stateKnown = 0;
 
+        if (!stateKnown || !GLHooks_NativeUpscaleActive())
+        {
+        stateKnown = 1;
         glad_glGetIntegerv(GL_SCISSOR_TEST, &oldScissorTest);
         CHECK_GL("glGetIntegerv GL_SCISSOR_TEST");
         glad_glGetIntegerv(GL_SCISSOR_BOX, oldScissorBox);
@@ -146,6 +180,7 @@ void blitStretch()
         CHECK_GL("glGetIntegerv GL_DRAW_BUFFER");
         glad_glGetFloatv(GL_COLOR_CLEAR_VALUE, oldClearColor);
         CHECK_GL("glGetFloatv GL_COLOR_CLEAR_VALUE");
+        }
 
         // FORCE STATE FOR FULLSCREEN BLITS
         glad_glDisable(GL_SCISSOR_TEST);
@@ -153,7 +188,7 @@ void blitStretch()
         glad_glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
         CHECK_GL("glColorMask");
 
-        if (glad_glIsFramebuffer && !glad_glIsFramebuffer(fboId))
+        if (blitDebugEnabled() && glad_glIsFramebuffer && !glad_glIsFramebuffer(fboId))
         {
             log_error("fboId %u is NOT a valid framebuffer! Context changed?", fboId);
             // Optionally force recreation

@@ -114,6 +114,8 @@ namespace LibcBridge
     time_t bridgeMktime(struct tm *tm);
     struct tm32 *bridgeGmtime_R(const time_t *timep, struct tm32 *result);
     size_t bridgeStrftime(char *s, size_t maxsize, const char *format, const struct tm *timeptr);
+    size_t bridgeStrftime_l(char *s, size_t maxsize, const char *format,
+                            const struct tm *timeptr, void *locale);
     void bridgeFtime(struct timeb *tp);
 
     void bridgeAbort();

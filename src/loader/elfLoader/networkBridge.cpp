@@ -933,6 +933,26 @@ extern "C" int bridgeBind(SOCKET s, const struct sockaddr *name, int namelen)
         log_debug("Network bridge: bind rewritten=%d port=%u", rewritten ? 1 : 0,
                  ntohs(reinterpret_cast<const sockaddr_in *>(bindAddress)->sin_port));
     int ret = bind(s, bindAddress, configuredLength);
+    if (ret == SOCKET_ERROR && WSAGetLastError() == WSAEACCES && es1IsDetected() &&
+        bindAddress && bindAddress->sa_family == AF_INET &&
+        configuredLength >= static_cast<int>(sizeof(sockaddr_in)))
+    {
+        /* Hyper-V and WinNAT reserve blocks of ports at boot, and ES1's cabinet
+         * LAN port 50765 can land in one; binding it then fails with EACCES and
+         * the title shows E0001. Take any free port instead: the cabinet still
+         * works alone, it just cannot hear other cabinets. */
+        sockaddr_in fallback = *reinterpret_cast<const sockaddr_in *>(bindAddress);
+        const unsigned short wanted = ntohs(fallback.sin_port);
+        fallback.sin_port = 0;
+        ret = bind(s, reinterpret_cast<const sockaddr *>(&fallback), sizeof(fallback));
+        if (ret != SOCKET_ERROR)
+            log_warn("Network bridge: UDP/TCP port %u is reserved by Windows (see 'netsh interface "
+                     "ipv4 show excludedportrange'); bound a free port instead, so linked "
+                     "cabinets will not see this one",
+                     wanted);
+        else
+            WSASetLastError(WSAEACCES);
+    }
     if (ret == SOCKET_ERROR)
     {
         errno = mapWSAErrorToErrno(WSAGetLastError());

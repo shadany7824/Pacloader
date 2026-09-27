@@ -85,6 +85,55 @@ int initSDL()
     return 0;
 }
 
+/* SDL_PumpEvents - the joystick, gamepad and sensor update - costs 135.79 us
+ * average and up to 11.9 ms, measured, and it was the top named cause of present
+ * spikes because pollEvents ran it on the guest's presenting thread once a
+ * frame. Draining the queue afterwards costs 0.28 us a call, so it is the pump
+ * and not the event volume. A thread of its own pumps instead, and the frame
+ * path only takes from the queue with SDL_PeepEvents, which does not pump. The
+ * pump was never on the window-owning thread anyway, so this moves it between
+ * two non-owning threads and changes nothing about window messages.
+ * Opt-in while it earns trust: LL_SDL_PUMP_THREAD=1. */
+static SDL_Thread *g_pumpThread = NULL;
+static volatile int g_pumpQuit = 0;
+
+bool sdlPumpThreadEnabled(void)
+{
+    static int cached = -1;
+    if (cached < 0)
+    {
+        const char *setting = getenv("LL_SDL_PUMP_THREAD");
+        cached = (setting && setting[0] == '1') ? 1 : 0;
+    }
+    return cached != 0;
+}
+
+static int SDLCALL sdlPumpThreadMain(void *unused)
+{
+    (void)unused;
+    /* Faster than the frame rate so input is sampled more often than it used to
+     * be, not less - the point is to move the cost, not to spend less on it. */
+    while (!g_pumpQuit)
+    {
+        SDL_PumpEvents();
+        SDL_Delay(2);
+    }
+    return 0;
+}
+
+void startSdlPumpThread(void)
+{
+    if (!sdlPumpThreadEnabled() || g_pumpThread)
+        return;
+    g_pumpQuit = 0;
+    g_pumpThread = SDL_CreateThread(sdlPumpThreadMain, "ll-sdl-pump", NULL);
+    if (!g_pumpThread)
+        log_warn("SDL pump thread could not start (%s); pumping stays on the frame path",
+                 SDL_GetError());
+    else
+        log_warn("SDL event pump moved to its own thread");
+}
+
 /* Pump the owning window thread during long loads to avoid ghosting. */
 #define WINDOW_PUMP_INTERVAL_MS 100
 
@@ -106,16 +155,27 @@ static void disableWindowGhosting(void)
 #endif
 }
 
+/* Only this thread may call SDL's video functions; every other one reads the
+ * size this publishes instead. */
+bool sdlIsWindowThread(void)
+{
+    return g_windowThread != 0 && SDL_GetCurrentThreadID() == g_windowThread;
+}
+
 /* Publish drawable size for ES1 letterboxing without calling SDL on render threads. */
 void publishDrawableSize(void)
 {
-    if (!g_SdlWindow || !platformIsES1())
+    if (!g_SdlWindow)
         return;
 
     int drawableWidth = 0;
     int drawableHeight = 0;
     SDL_GetWindowSizeInPixels(g_SdlWindow, &drawableWidth, &drawableHeight);
-    GLHooks_SetDrawableSize(drawableWidth, drawableHeight);
+
+    /* Every title's presenter needs the size; only ES1 letterboxes onto it. */
+    GLHooks_PublishDrawableSize(drawableWidth, drawableHeight);
+    if (platformIsES1())
+        GLHooks_SetDrawableSize(drawableWidth, drawableHeight);
 }
 
 void keepWindowResponsive(void)
@@ -285,6 +345,7 @@ void startSDL()
     SDL_ShowWindow(g_SdlWindow);
     raiseSDLWindow();
     publishDrawableSize();
+    startSdlPumpThread();
     setVideoSyncWindow(SDL_GetPointerProperty(SDL_GetWindowProperties(g_SdlWindow),
                                               SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL));
     if (platformWindowIsFixedSize() && !getConfig()->fullscreen)
@@ -464,8 +525,25 @@ void pollEvents()
     /* Refresh the pump timestamp only on the owning thread. */
     if (SDL_GetCurrentThreadID() == g_windowThread)
         g_lastPumpTicks = SDL_GetTicks();
-    while (SDL_PollEvent(&event))
+    uint64_t pumpStart = PerfProfiler_Begin("SDL", "pollEvents_pump");
+    int drained = 0;
+    for (;;)
     {
+        /* The first SDL_PollEvent of a batch runs SDL_PumpEvents - the joystick,
+         * gamepad and sensor update - and the rest only take from the queue. */
+        const char *pollName = drained ? "pollEvents_drain" : "pollEvents_pumpcall";
+        uint64_t oneStart = PerfProfiler_Begin("SDL", pollName);
+        /* SDL_PeepEvents takes from the queue without pumping; the pump thread
+         * fills it. Without that thread this has to pump here as before. */
+        const bool havePolledEvent =
+            g_pumpThread
+                ? (SDL_PeepEvents(&event, 1, SDL_GETEVENT, SDL_EVENT_FIRST, SDL_EVENT_LAST) == 1)
+                : SDL_PollEvent(&event);
+        PerfProfiler_End("SDL", pollName, oneStart, 0);
+        if (!havePolledEvent)
+            break;
+        ++drained;
+        {
 #ifdef __linux__
         if (event.type == SDL_WIIMOTION_EVENT)
             processSdlEvent(&event);
@@ -557,15 +635,20 @@ void pollEvents()
             default:
                 break;
         }
+        }
     }
+    PerfProfiler_End("SDL", "pollEvents_pump", pumpStart, 0);
+
     if (sdlInputInitialized)
     {
+        uint64_t inputStart = PerfProfiler_Begin("SDL", "pollEvents_input");
         if (gGrp == GROUP_HOD4 || gGrp == GROUP_HOD4_TEST)
             updateGunShake();
         if (platformHasHPatternShifter())
             updateWmmtEs1Shifter();
         updateCombinedAxes();
         processChangedActions();
+        PerfProfiler_End("SDL", "pollEvents_input", inputStart, 0);
     }
     PerfProfiler_End("SDL", "pollEvents", profileStart, 0);
 }

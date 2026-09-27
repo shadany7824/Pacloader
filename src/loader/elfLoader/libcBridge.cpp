@@ -287,6 +287,8 @@ namespace LibcBridge
         MAP("mktime", bridgeMktime);
         MAP("gmtime_r", bridgeGmtime_R);
         MAP("strftime", bridgeStrftime);
+        MAP("strftime_l", bridgeStrftime_l);
+        MAP("__strftime_l", bridgeStrftime_l);
         MAP("ftime", bridgeFtime);
 
         // abort/exit
@@ -1725,6 +1727,15 @@ namespace LibcBridge
     {
         log_trace("Intercepted strftime");
         return strftime(s, maxsize, format, timeptr);
+    }
+
+    /* The cabinet runs the C locale, so the locale argument carries nothing
+     * the non-locale call does not already apply. */
+    size_t bridgeStrftime_l(char *s, size_t maxsize, const char *format,
+                            const struct tm *timeptr, void *locale)
+    {
+        (void)locale;
+        return bridgeStrftime(s, maxsize, format, timeptr);
     }
 
     void bridgeFtime(struct timeb *tp)

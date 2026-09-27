@@ -94,7 +94,7 @@ extern "C" const char *es1CaCertificatePath(void)
         const std::filesystem::path gameDirectory =
             std::filesystem::path(g_absoluteElfPath).parent_path();
         /* The network tree lives in whichever package shipped it. */
-        static const char *const roots[] = {"data", "data_en", "data_ng_lnx"};
+        static const char *const roots[] = {"data", "data_cn", "data_en", "data_ng_lnx"};
         for (const char *root : roots)
         {
             std::filesystem::path file =

@@ -8,6 +8,7 @@
 #include "../log/log.h"
 #include "symbolResolver.hpp"
 #include "glHooks.hpp"
+#include "../graphics/blitStretching.h"
 #include "../diagnostics/perfProfiler.hpp"
 
 #include <SDL3/SDL.h>
@@ -347,6 +348,12 @@ extern "C" void bridgeGlxSwapBuffers(void *display, unsigned long drawable)
             const uint64_t afterPacing = PerfProfiler_NowTicks();
             if (afterPacing > segmentStart)
                 pacingTicks = afterPacing - segmentStart;
+        }
+        if (GLHooks_NativeUpscaleActive())
+        {
+            const uint64_t blitStart = PerfProfiler_Begin("Present", "blitStretch");
+            blitStretch();
+            PerfProfiler_End("Present", "blitStretch", blitStart, 0);
         }
         const uint64_t swapStart = PerfProfiler_Begin("Present", "SDL_GL_SwapWindow");
         segmentStart = PerfProfiler_NowTicks();

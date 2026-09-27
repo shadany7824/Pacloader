@@ -19,6 +19,9 @@ bool runOnSDLMainThread(SDL_MainThreadCallback callback, void *userdata, bool wa
 void raiseSDLWindow(void);
 void sdlQuit();
 void pollEvents();
+/* True when LL_SDL_PUMP_THREAD=1 moves SDL_PumpEvents off the frame path. */
+bool sdlPumpThreadEnabled(void);
+void startSdlPumpThread(void);
 
 typedef void (*SDLFrameCallback)(void *userdata);
 
@@ -46,6 +49,9 @@ int presentSDLFrame(const SDLFramePresentOptions *options);
 void keepWindowResponsive(void);
 /* Re-reads the drawable size and hands it to the GL hooks. Owning thread only. */
 void publishDrawableSize(void);
+/* True on the thread that created the window - the only one that may call SDL's
+ * video functions. Anything else reads GLHooks_GetDrawableSize(). */
+bool sdlIsWindowThread(void);
 
 void showFpsInWindowTitle(const char *name);
 

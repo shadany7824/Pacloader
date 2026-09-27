@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstdio>
 
+#include "es1Wmmt5Build.hpp"
 #include "../es1CompatLayer.h"
 #include "../../../../log/log.h"
 
@@ -13,8 +14,6 @@
  * level to LOG_GAME, where the rest of the guest's chatter lives. */
 namespace
 {
-
-constexpr uintptr_t LogAddresses[] = {0x080bc980, 0x080bca60, 0x080bcb40};
 
 /* All three take (self, severity, format, ...). */
 constexpr uint8_t SmallLogSignature[] = {0x55, 0x89, 0xe5, 0x81, 0xec, 0x28, 0x08, 0x00, 0x00};
@@ -50,12 +49,16 @@ void wmmt5Log(void *self, int severity, const char *format, ...)
 
 void es1Wmmt5InstallLogHooks(void)
 {
+    const Wmmt5Build *build = es1Wmmt5Build();
+    if (!build)
+        return;
+
     const Es1HookSpec hooks[] = {
-        {LogAddresses[0], reinterpret_cast<void *>(wmmt5Log), "guestLog0", nullptr,
+        {build->log[0], reinterpret_cast<void *>(wmmt5Log), "guestLog0", nullptr,
          SmallLogSignature, sizeof(SmallLogSignature)},
-        {LogAddresses[1], reinterpret_cast<void *>(wmmt5Log), "guestLog1", nullptr,
+        {build->log[1], reinterpret_cast<void *>(wmmt5Log), "guestLog1", nullptr,
          SmallLogSignature, sizeof(SmallLogSignature)},
-        {LogAddresses[2], reinterpret_cast<void *>(wmmt5Log), "guestLog2", nullptr,
+        {build->log[2], reinterpret_cast<void *>(wmmt5Log), "guestLog2", nullptr,
          LargeLogSignature, sizeof(LargeLogSignature)},
     };
     es1InstallHookTable(hooks, sizeof(hooks) / sizeof(hooks[0]), "WMMT5 log");

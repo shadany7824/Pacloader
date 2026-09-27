@@ -33,21 +33,142 @@ static std::atomic<double> g_letterboxScaleY{1.0};
 static std::atomic<double> g_letterboxOffsetX{0.0};
 static std::atomic<double> g_letterboxOffsetY{0.0};
 static std::atomic<bool> g_letterboxActive{false};
+static std::atomic<bool> g_nativeUpscaleActive{false};
 static std::atomic<int> g_letterboxDrawableWidth{0};
 static std::atomic<int> g_letterboxDrawableHeight{0};
 static std::atomic<int> g_letterboxContentWidth{0};
 static std::atomic<int> g_letterboxContentHeight{0};
+
+/* The drawable size is published for every title, letterboxed or not: the
+ * presenter needs it each frame and may not ask SDL from a guest thread. */
+static std::atomic<int> g_drawableWidth{0};
+static std::atomic<int> g_drawableHeight{0};
+
+/* Whether the guest has GL_SCISSOR_TEST on, shadowed from the entry point it
+ * really calls (bridgeglEnable, not wrap_glEnable). Asking the driver instead
+ * cost 130 us per glClear on this ICD - the GL_TEXTURE_RESIDENT mistake again.
+ * GL's own default is disabled, which is what false means here. */
+static thread_local bool t_scissorTestEnabled = false;
+
+extern "C" void GLHooks_NotifyCapToggled(unsigned int cap, int enabled)
+{
+    if (cap == GL_SCISSOR_TEST)
+        t_scissorTestEnabled = enabled != 0;
+}
+
+/* glGenTextures answers in ~2.5 ms on average on WMMT4's upload thread, where
+ * the compressed upload beside it costs 1 us - the cost is the call, not the
+ * work, so the fix is to make fewer of them. Names come from a per-thread batch.
+ * Only *fresh* names are pooled; a deleted name goes straight back to the driver
+ * and never lands here, so this cannot resurrect a name another context in the
+ * share group still owns.
+ *
+ * OFF BY DEFAULT. With the first version on, WMMT4 exited silently after about
+ * 45 s, before a race could start (bisected 2026-09-03 against the identical
+ * build with the pool off, which ran 20,045 presents through a full race; no GL
+ * error, no E-code, exit status 0).
+ *
+ * The suspected cause was a leak: the pool was simply zeroed when the context
+ * changed, abandoning up to 255 *reserved* names each time, so the name space
+ * climbed far faster than the guest's own texture count. A guest that sizes a
+ * table by texture name would run off the end of it and die exactly like this.
+ * Unused names are now handed back with glDeleteTextures before the pool is
+ * dropped, and highWater says on the way out whether names really did climb. */
+static constexpr GLsizei kTextureNameBatch = 256;
+static thread_local GLuint t_textureNames[kTextureNameBatch];
+static thread_local GLsizei t_textureNameCount = 0;
+static std::atomic<unsigned int> g_textureNameHighWater{0};
+
+/* Reserved names are share-group state, so they have to go back to the driver
+ * rather than simply be forgotten. Deleting a name that was generated but never
+ * bound is legal and frees exactly the reservation glGenTextures made. */
+/* Both paths report here, so a pooled run and an unpooled one can be compared
+ * on the same axis: if pooling is what kills the game, the names it hands out
+ * climb away from the guest's own texture count. */
+static void noteTextureName(GLuint name)
+{
+    unsigned int seen = g_textureNameHighWater.load(std::memory_order_relaxed);
+    while (name > seen &&
+           !g_textureNameHighWater.compare_exchange_weak(seen, name,
+                                                         std::memory_order_relaxed))
+        ;
+    static std::atomic<unsigned int> handed{0};
+    const unsigned int count = handed.fetch_add(1, std::memory_order_relaxed) + 1;
+    if ((count % 512) == 0)
+        log_warn("GL texture names: %u handed out, highest %u", count,
+                 g_textureNameHighWater.load(std::memory_order_relaxed));
+}
+
+static void releaseTextureNamePool()
+{
+    if (t_textureNameCount > 0 && glad_glDeleteTextures)
+        glad_glDeleteTextures(t_textureNameCount, t_textureNames);
+    t_textureNameCount = 0;
+}
+
+static bool textureNamePoolEnabled()
+{
+    static const bool enabled = [] {
+        const char *setting = std::getenv("LL_GL_TEX_NAME_POOL");
+        return setting && setting[0] == '1';
+    }();
+    return enabled;
+}
+
+extern "C" void GLHooks_PublishDrawableSize(int drawableWidth, int drawableHeight)
+{
+    if (drawableWidth <= 0 || drawableHeight <= 0)
+        return;
+
+    g_drawableWidth.store(drawableWidth, std::memory_order_relaxed);
+    g_drawableHeight.store(drawableHeight, std::memory_order_release);
+}
+
+extern "C" int GLHooks_GetDrawableSize(int *drawableWidth, int *drawableHeight)
+{
+    const int height = g_drawableHeight.load(std::memory_order_acquire);
+    const int width = g_drawableWidth.load(std::memory_order_relaxed);
+    if (width <= 0 || height <= 0)
+        return 0;
+
+    if (drawableWidth)
+        *drawableWidth = width;
+    if (drawableHeight)
+        *drawableHeight = height;
+    return 1;
+}
 
 extern "C" void GLHooks_SetDrawableSize(int drawableWidth, int drawableHeight)
 {
     if (drawableWidth <= 0 || drawableHeight <= 0 || gWidth <= 0 || gHeight <= 0)
         return;
 
+    /* Published before any early return: the presenter needs the size even when
+     * the drawable matches the guest and nothing has to be scaled. */
+    GLHooks_PublishDrawableSize(drawableWidth, drawableHeight);
+
     if (drawableWidth == gWidth && drawableHeight == gHeight)
     {
         g_letterboxActive.store(false, std::memory_order_release);
+        g_nativeUpscaleActive.store(false, std::memory_order_release);
         return;
     }
+
+    /* Rasterising at the panel size is what costs fullscreen its frame delivery:
+     * at a 1366x768 desktop it matched windowed, at 2560x1080 it did not. Draw at
+     * the guest's own size instead and scale once, at present. */
+    const char *upscale = std::getenv("LL_NATIVE_UPSCALE");
+    if (upscale && upscale[0] == '1')
+    {
+        g_letterboxDrawableWidth.store(drawableWidth, std::memory_order_relaxed);
+        g_letterboxDrawableHeight.store(drawableHeight, std::memory_order_relaxed);
+        g_letterboxActive.store(false, std::memory_order_release);
+        g_nativeUpscaleActive.store(true, std::memory_order_release);
+        log_warn("GL native upscale: guest %dx%d drawn 1:1, scaled to %dx%d at present",
+                 gWidth, gHeight, drawableWidth, drawableHeight);
+        return;
+    }
+    g_nativeUpscaleActive.store(false, std::memory_order_release);
 
     double scaleX = static_cast<double>(drawableWidth) / gWidth;
     double scaleY = static_cast<double>(drawableHeight) / gHeight;
@@ -79,6 +200,11 @@ extern "C" void GLHooks_SetDrawableSize(int drawableWidth, int drawableHeight)
      * loader chose and settles it without a rebuild. */
     log_warn("GL letterbox: guest %dx%d on drawable %dx%d -> scale %.3f/%.3f offset %.1f/%.1f",
              gWidth, gHeight, drawableWidth, drawableHeight, scaleX, scaleY, offsetX, offsetY);
+}
+
+extern "C" int GLHooks_NativeUpscaleActive(void)
+{
+    return g_nativeUpscaleActive.load(std::memory_order_acquire) ? 1 : 0;
 }
 
 /* What the guest set, in its coordinates: it reads the viewport back, and passes
@@ -896,6 +1022,9 @@ extern "C" void GLHooks_NotifyContextCurrent(void *context)
         g_recycledBuffers.clear();
         g_streamRecycledBuffers.clear();
         g_streamBufferRecords.clear();
+        /* Reserved in the old share group, meaningless in the new one - but
+         * they must be given back, not dropped on the floor. */
+        releaseTextureNamePool();
         g_glContextTag = context;
     }
     else
@@ -1328,11 +1457,36 @@ static void clearLetterboxBars()
     glad_glPopAttrib();
 }
 
+/* Under native upscale the guest paints a gWidth x gHeight corner of a
+ * panel-sized default framebuffer, so an unscissored clear covers more than
+ * twice the pixels anything reads. Fence it to the corner the presenter blits.
+ * Returns true when the caller owes a glPopAttrib. */
+static bool boundClearToNativeCorner()
+{
+    if (t_boundDrawFramebuffer != 0 || !g_nativeUpscaleActive.load(std::memory_order_acquire))
+        return false;
+    if (!glad_glPushAttrib || !glad_glPopAttrib || !glad_glScissor || !glad_glEnable)
+        return false;
+    /* A guest scissor already bounds the clear, and there is only one box to go
+     * round - its rectangle passes through unscaled in this mode, so it is
+     * inside the corner already, and replacing it would *widen* the clear. */
+    if (t_scissorTestEnabled)
+        return false;
+
+    glad_glPushAttrib(GL_SCISSOR_BIT);
+    glad_glEnable(GL_SCISSOR_TEST);
+    glad_glScissor(0, 0, gWidth, gHeight);
+    return true;
+}
+
 extern "C" void __attribute__((cdecl)) wrap_glClear(GLbitfield mask)
 {
     PERF_PROFILE_SCOPE("GL");
+    const bool scissored = boundClearToNativeCorner();
     if (glad_glClear)
         glad_glClear(mask);
+    if (scissored)
+        glad_glPopAttrib();
     if (mask & GL_COLOR_BUFFER_BIT)
         clearLetterboxBars();
 }
@@ -1355,8 +1509,36 @@ extern "C" void __attribute__((cdecl)) wrap_glDeleteTextures(GLsizei n, const GL
 extern "C" void __attribute__((cdecl)) wrap_glGenTextures(GLsizei n, GLuint *textures)
 {
     PERF_PROFILE_SCOPE("GL");
-    if (glad_glGenTextures)
+    if (!glad_glGenTextures)
+        return;
+    if (!textureNamePoolEnabled() || n <= 0 || !textures)
+    {
         glad_glGenTextures(n, textures);
+        if (textures && n > 0)
+            noteTextureName(textures[0]);
+        return;
+    }
+
+    while (n > 0)
+    {
+        if (t_textureNameCount == 0)
+        {
+            t_textureNames[0] = 0;
+            glad_glGenTextures(kTextureNameBatch, t_textureNames);
+            /* A driver that refused the batch leaves the array as it was; fall
+             * back rather than hand out zeros, which are not texture names. */
+            if (t_textureNames[0] == 0)
+            {
+                glad_glGenTextures(n, textures);
+                return;
+            }
+            t_textureNameCount = kTextureNameBatch;
+        }
+        const GLuint name = t_textureNames[--t_textureNameCount];
+        noteTextureName(name);
+        *textures++ = name;
+        --n;
+    }
 }
 
 extern "C" void __attribute__((cdecl)) wrap_glGetLightfv(GLenum light, GLenum pname, GLfloat *params)
