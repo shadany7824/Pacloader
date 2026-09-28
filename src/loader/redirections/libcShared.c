@@ -274,7 +274,7 @@ void *sharedDlopen(const char *filename, int flags)
         es1AlinDlopen(filename, &handle))
         return handle;
 
-    bridgeLoadNeededLibrary(filename);
+    bridgeLoadNeededLibrary(filename, flags);
 
     handle = bridgeLibraryHandle(filename);
     return handle ? handle : (void *)0xDEADBEEF;

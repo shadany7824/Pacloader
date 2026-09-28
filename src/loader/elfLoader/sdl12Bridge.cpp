@@ -9,6 +9,7 @@
 
 #include <SDL3/SDL.h>
 
+#include <atomic>
 #include <cstdio>
 #include <deque>
 #include <iterator>
@@ -93,6 +94,64 @@ int sdl12KeyFromHost(SDL_Keycode key)
     return 0; // SDLK_UNKNOWN
 }
 
+/*
+ * SDL 1.2's keysym.scancode was whatever the video backend handed it, and the
+ * Namco cabinets ran it on the Linux console, where that is the kernel keycode
+ * (KEY_ESC = 1, KEY_1 = 2, KEY_Q = 16, KEY_A = 30 ...).  Games index their own
+ * key tables with it - CS Neo's name entry does - so SDL3's USB HID usage
+ * numbers have to be renumbered.  Zero is KEY_RESERVED, which such tables skip.
+ */
+uint8_t sdl12ScancodeFromHost(SDL_Scancode scancode)
+{
+    static const uint8_t letters[26] = {
+        30, 48, 46, 32, 18, 33, 34, 35, 23, 36, 37, 38, 50, // a - m
+        49, 24, 25, 16, 19, 31, 20, 22, 47, 17, 45, 21, 44, // n - z
+    };
+    // SDL_SCANCODE_1 (30) through SDL_SCANCODE_KP_EQUALS (103).
+    static const uint8_t block[74] = {
+        2, 3, 4, 5, 6, 7, 8, 9, 10, 11,             // 1 - 0
+        28, 1, 14, 15, 57,                          // return escape backspace tab space
+        12, 13, 26, 27, 43, 43, 39, 40, 41,         // - = [ ] \ nonus# ; ' `
+        51, 52, 53, 58,                             // , . / capslock
+        59, 60, 61, 62, 63, 64, 65, 66, 67, 68,     // F1 - F10
+        87, 88,                                     // F11 F12
+        99, 70, 119,                                // printscreen scrolllock pause
+        110, 102, 104, 111, 107, 109,               // insert home pageup delete end pagedown
+        106, 105, 108, 103,                         // right left down up
+        69, 98, 55, 74, 78, 96,                     // numlock kp/ kp* kp- kp+ kpenter
+        79, 80, 81, 75, 76, 77, 71, 72, 73, 82, 83, // kp1 - kp9 kp0 kp.
+        86, 127, 116, 117,                          // nonusbackslash application power kp=
+    };
+
+    if (scancode >= SDL_SCANCODE_A && scancode <= SDL_SCANCODE_Z)
+        return letters[scancode - SDL_SCANCODE_A];
+    if (scancode >= SDL_SCANCODE_1 && scancode <= SDL_SCANCODE_KP_EQUALS)
+        return block[scancode - SDL_SCANCODE_1];
+
+    switch (scancode)
+    {
+        case SDL_SCANCODE_F13: return 183;
+        case SDL_SCANCODE_F14: return 184;
+        case SDL_SCANCODE_F15: return 185;
+        case SDL_SCANCODE_INTERNATIONAL1: return 89;  // KEY_RO (JIS \ _)
+        case SDL_SCANCODE_INTERNATIONAL2: return 93;  // KEY_KATAKANAHIRAGANA
+        case SDL_SCANCODE_INTERNATIONAL3: return 124; // KEY_YEN
+        case SDL_SCANCODE_INTERNATIONAL4: return 92;  // KEY_HENKAN
+        case SDL_SCANCODE_INTERNATIONAL5: return 94;  // KEY_MUHENKAN
+        case SDL_SCANCODE_LANG1: return 122;
+        case SDL_SCANCODE_LANG2: return 123;
+        case SDL_SCANCODE_LCTRL: return 29;
+        case SDL_SCANCODE_LSHIFT: return 42;
+        case SDL_SCANCODE_LALT: return 56;
+        case SDL_SCANCODE_LGUI: return 125;
+        case SDL_SCANCODE_RCTRL: return 97;
+        case SDL_SCANCODE_RSHIFT: return 54;
+        case SDL_SCANCODE_RALT: return 100;
+        case SDL_SCANCODE_RGUI: return 126;
+        default: return 0;
+    }
+}
+
 int sdl12ModFromHost(SDL_Keymod mod)
 {
     int result = 0;
@@ -120,6 +179,28 @@ std::mutex g_eventMutex;
 
 int (*g_eventFilter)(const Sdl12Event *) = nullptr;
 bool g_unicodeEnabled = false;
+
+std::atomic_bool g_mouseCaptureRequested{false};
+bool g_mouseCaptureApplied = false;
+
+// Relative mode hides the pointer, keeps it in the window and reports motion
+// without the window edge stopping it.  SDL still tracks a clamped position,
+// which is what the guest's absolute x/y keep receiving.
+void applyMouseCapture()
+{
+    const bool requested = g_mouseCaptureRequested.load(std::memory_order_acquire);
+    if (requested == g_mouseCaptureApplied)
+        return;
+
+    SDL_Window *window = getSDLWindow();
+    if (!window)
+        return;
+    if (SDL_SetWindowRelativeMouseMode(window, requested))
+        g_mouseCaptureApplied = requested;
+    else
+        log_warn("SDL 1.2: could not %s the mouse: %s", requested ? "capture" : "release",
+                 SDL_GetError());
+}
 bool g_keyRepeatEnabled = false;
 
 // Every event type starts enabled, which is where SDL 1.2 starts too.  Only the
@@ -156,7 +237,7 @@ void queueKey(const SDL_KeyboardEvent &key, bool down)
     std::memset(&event, 0, sizeof(event));
     event.key.type = down ? sdl12KeyDown : sdl12KeyUp;
     event.key.state = down ? sdl12Pressed : sdl12Released;
-    event.key.keysym.scancode = static_cast<uint8_t>(key.scancode);
+    event.key.keysym.scancode = sdl12ScancodeFromHost(key.scancode);
     event.key.keysym.sym = sdl12KeyFromHost(key.key);
     event.key.keysym.mod = sdl12ModFromHost(key.mod);
     if (g_unicodeEnabled && down && key.key > 0 && key.key <= 0x7F)
@@ -552,6 +633,7 @@ extern "C"
     int bridgeSdl12PollEvent(Sdl12Event *event)
     {
         std::lock_guard<std::mutex> lock(g_eventMutex);
+        applyMouseCapture();
 
         SDL_Event hostEvent;
         while (g_eventQueue.empty() && SDL_PollEvent(&hostEvent))
@@ -1094,5 +1176,10 @@ namespace Sdl12Bridge
         MAP("SDL_ADM_GetDevice", bridgeSdl12ADMGetDevice);
     }
 } // namespace Sdl12Bridge
+
+void Sdl12Bridge::setMouseCaptured(bool captured)
+{
+    g_mouseCaptureRequested.store(captured, std::memory_order_release);
+}
 
 #endif

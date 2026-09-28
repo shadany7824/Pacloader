@@ -196,4 +196,12 @@ static_assert(sizeof(struct Sdl12MouseButtonEvent) == 8, "i386 SDL 1.2 SDL_Mouse
 namespace Sdl12Bridge
 {
     void initBridges();
+
+    /*
+     * An SDL 1.2 game on the cabinet ran fullscreen with nothing beside it, so
+     * mouse-look never had to keep the pointer in.  A title asks for capture
+     * while it is in play; the bridge applies it on the thread that owns the
+     * window.  Safe to call from any thread.
+     */
+    void setMouseCaptured(bool captured);
 }

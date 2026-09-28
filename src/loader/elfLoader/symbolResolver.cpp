@@ -452,6 +452,7 @@ void SymbolResolver::LoadNeededLibrary(const std::string &linuxName)
 
         ElfLoader *soLoader = new ElfLoader();
         soLoader->SetIsSharedObject(true);
+        soLoader->SetSymbolScope(m_LoadScope);
         if (soLoader->Load(fullPath))
         {
             // Both, so either name finds it next time.
@@ -524,8 +525,17 @@ void *SymbolResolver::ResolveSymbolInModule(void *handle, const std::string &sym
     return nullptr;
 }
 
-void SymbolResolver::RegisterNativeSymbol(const std::string &symbolName, void *symbolPtr)
+void SymbolResolver::RegisterNativeSymbol(const std::string &symbolName, void *symbolPtr,
+                                          const ElfLoader *owner, bool isStatic)
 {
+    const int scope = owner ? owner->GetSymbolScope() : 0;
+    if (scope != 0)
+    {
+        // First definition in load order wins, as in the scope's search list.
+        (isStatic ? m_ScopeStatics : m_ScopeSymbols)[scope].emplace(symbolName, symbolPtr);
+        return;
+    }
+
     if (m_NativeSymbols.find(symbolName) == m_NativeSymbols.end())
     {
         m_NativeSymbols[symbolName] = symbolPtr;
@@ -539,7 +549,11 @@ size_t SymbolResolver::PatchNativeJumpStubs(const std::string &prefix, void *(*r
         return 0;
 
     size_t patched = 0;
-    for (const auto &entry : m_NativeSymbols)
+    std::vector<const std::unordered_map<std::string, void *> *> tables{&m_NativeSymbols};
+    for (const auto &scope : m_ScopeSymbols)
+        tables.push_back(&scope.second);
+    for (const auto *table : tables)
+    for (const auto &entry : *table)
     {
         if (entry.first.rfind(prefix, 0) != 0 || !entry.second)
             continue;
@@ -632,7 +646,8 @@ static void *CreateUnresolvedStub(const std::string &symbolName)
 }
 
 bool loadingNeededLibrary = false;
-void *SymbolResolver::ResolveSymbol(const std::string &symbolName, std::string *outModuleName)
+void *SymbolResolver::ResolveSymbol(const std::string &symbolName, std::string *outModuleName,
+                                    const ElfLoader *requester)
 {
     log_trace("Resolving symbol: %s", symbolName.c_str());
     void *resolvedAddr = nullptr;
@@ -721,6 +736,25 @@ void *SymbolResolver::ResolveSymbol(const std::string &symbolName, std::string *
             }
         }
 
+        /* A module dlopened without RTLD_GLOBAL sees the global scope first and
+         * then its own.  Letting it fall through to other local modules is how
+         * CS Neo's cs_amd.so ended up using client_amd.so's gpGlobals and PM_*
+         * code - they share over a thousand exported names. */
+        if (!originalAddr && requester && requester->GetSymbolScope() != 0)
+        {
+            auto scopeIt = m_ScopeSymbols.find(requester->GetSymbolScope());
+            if (scopeIt != m_ScopeSymbols.end())
+            {
+                auto symbolIt = scopeIt->second.find(symbolName);
+                if (symbolIt != scopeIt->second.end())
+                {
+                    if (!resolvedAddr && outModuleName)
+                        *outModuleName = "Native Symbol (local scope)";
+                    originalAddr = symbolIt->second;
+                }
+            }
+        }
+
         if (!originalAddr)
         {
             for (void *handle : m_LoadedLibraries)
@@ -783,6 +817,28 @@ void *SymbolResolver::ResolveSymbol(const std::string &symbolName, std::string *
         return originalAddr;
     }
 
+    // The loader's own by-name lookups (hooks, dlsym(RTLD_DEFAULT)) may still
+    // want something inside a local module; relocations never fall back here.
+    if (!requester)
+    {
+        for (const auto *tables : {&m_ScopeSymbols, &m_ScopeStatics})
+        {
+            for (int scope = 1; scope <= m_NextScope; ++scope)
+            {
+                auto scopeIt = tables->find(scope);
+                if (scopeIt == tables->end())
+                    continue;
+                auto symbolIt = scopeIt->second.find(symbolName);
+                if (symbolIt != scopeIt->second.end())
+                {
+                    if (outModuleName)
+                        *outModuleName = "Native Symbol (local scope)";
+                    return symbolIt->second;
+                }
+            }
+        }
+    }
+
     log_info("Symbol not found: %s. Generating crash stub.", symbolName.c_str());
     if (outModuleName)
         *outModuleName = "UNRESOLVED_STUB";
@@ -816,10 +872,19 @@ void *bridgeResolveSymbol(const char *symbolName)
     return SymbolResolver::GetInstance().ResolveSymbol(symbolName, &moduleName);
 }
 
-void bridgeLoadNeededLibrary(const char *filename)
+void SymbolResolver::LoadDlopenedLibrary(const std::string &linuxName, bool global)
 {
+    const int outer = m_LoadScope;
+    m_LoadScope = global ? 0 : ++m_NextScope;
+    LoadNeededLibrary(linuxName);
+    m_LoadScope = outer;
+}
+
+void bridgeLoadNeededLibrary(const char *filename, int linuxFlags)
+{
+    constexpr int linuxRtldGlobal = 0x100;
     loadingNeededLibrary = true;
-    SymbolResolver::GetInstance().LoadNeededLibrary(filename);
+    SymbolResolver::GetInstance().LoadDlopenedLibrary(filename, (linuxFlags & linuxRtldGlobal) != 0);
     SymbolResolver::GetInstance().ProcessAllRelocations();
     SymbolResolver::GetInstance().PatchAllSOs();
     SymbolResolver::GetInstance().RunAllInits();

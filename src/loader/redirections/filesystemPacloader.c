@@ -194,7 +194,16 @@ FILE *sharedFopen(const char *path, const char *mode)
         mode = binaryMode;
     }
     char converted[MAX_PATH_LENGTH];
-    return fopen(nativePath(path, converted), mode);
+    FILE *file = fopen(nativePath(path, converted), mode);
+
+    // Debug aid: guest logs are opened for append and otherwise lag by a 4 KiB
+    // buffer, which hides the lines around whatever was just clicked.
+    static int unbufferedAppend = -1;
+    if (unbufferedAppend < 0)
+        unbufferedAppend = getenv("LL_UNBUFFERED_APPEND") != NULL;
+    if (file && unbufferedAppend && mode && mode[0] == 'a')
+        setvbuf(file, NULL, _IONBF, 0);
+    return file;
 }
 
 FILE *sharedFopen64(const char *path, const char *mode)
