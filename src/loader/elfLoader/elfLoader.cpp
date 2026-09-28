@@ -588,7 +588,8 @@ bool ElfLoader::ProcessRelocations()
                     if (!symbolName.empty())
                     {
                         std::string moduleName;
-                        void *resolvedFunc = SymbolResolver::GetInstance().ResolveSymbol(symbolName, &moduleName);
+                        void *resolvedFunc =
+                            SymbolResolver::GetInstance().ResolveSymbol(symbolName, &moduleName, this);
 
                         /* The CRT byte-copy primitives are selector-neutral and
                          * used constantly by guest C++, so the trampoline would
@@ -730,13 +731,13 @@ bool ElfLoader::ExportSymbols()
                 (type == STT_FUNC || type == STT_OBJECT || type == 10))
             {
                 void *symbolAddr = reinterpret_cast<void *>(value + m_LoadBias);
-                SymbolResolver::GetInstance().RegisterNativeSymbol(symbolName, symbolAddr);
+                SymbolResolver::GetInstance().RegisterNativeSymbol(symbolName, symbolAddr, this);
 
                 size_t atPos = symbolName.find('@');
                 if (atPos != std::string::npos)
                 {
                     std::string baseName = symbolName.substr(0, atPos);
-                    SymbolResolver::GetInstance().RegisterNativeSymbol(baseName, symbolAddr);
+                    SymbolResolver::GetInstance().RegisterNativeSymbol(baseName, symbolAddr, this);
                 }
             }
         }
@@ -770,7 +771,8 @@ bool ElfLoader::ExportSymbols()
                 if (value != 0 && shndx != 0 && type == STT_FUNC)
                 {
                     void *symbolAddr = reinterpret_cast<void *>(value + m_LoadBias);
-                    SymbolResolver::GetInstance().RegisterNativeSymbol(symbolName, symbolAddr);
+                    SymbolResolver::GetInstance().RegisterNativeSymbol(symbolName, symbolAddr, this,
+                                                                       /*isStatic=*/true);
                 }
             }
         }

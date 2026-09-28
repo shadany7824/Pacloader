@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <cstring>
 
+#include "es1Wmmt5Build.hpp"
 #include "../es1CompatLayer.h"
 #include "../../../../config/config.h"
 #include "../../../../log/log.h"
@@ -20,9 +21,11 @@ std::array<uint8_t, DongleSize> g_dongle{};
 bool g_initialized = false;
 constexpr uint32_t DongleHandle = 1;
 
-/* Drive and terminal cabinets carry different serials. */
-constexpr char DriveSerial[] = "267620542069";
-constexpr char TerminalSerial[] = "267621542069";
+/* 2676, the market digit, the unit digit (0 drive, 1 terminal), then the
+ * cabinet's own number. */
+constexpr char SerialTemplate[] = "2676?0542069";
+constexpr int RegionDigitIndex = 4;
+constexpr int UnitDigitIndex = 5;
 
 void initializeDongle()
 {
@@ -46,9 +49,12 @@ void initializeDongle()
         g_dongle[base + 0x0c] = 0x87;
     }
 
-    const char *serial = getConfig()->namcoES1.cabinetMode == NAMCO_ES1_CABINET_TERMINAL
-                             ? TerminalSerial
-                             : DriveSerial;
+    char serial[sizeof(SerialTemplate)];
+    std::memcpy(serial, SerialTemplate, sizeof(serial));
+    const Wmmt5Build *build = es1Wmmt5Build();
+    serial[RegionDigitIndex] = build ? build->regionDigit : '2';
+    if (getConfig()->namcoES1.cabinetMode == NAMCO_ES1_CABINET_TERMINAL)
+        serial[UnitDigitIndex] = '1';
     std::memcpy(g_dongle.data() + 0xD00, serial, 12);
 
     uint8_t checksum = 0;
@@ -97,14 +103,6 @@ int wmmt5HaspWrite(uint32_t, uint32_t, int offset, int length, const uint8_t *bu
     return 0;
 }
 
-constexpr uintptr_t LoginAddress = 0x0a982740;
-constexpr uintptr_t LogoutAddress = 0x0a9827e0;
-constexpr uintptr_t EncryptAddress = 0x0a9828cc;
-constexpr uintptr_t DecryptAddress = 0x0a9829b8;
-constexpr uintptr_t GetSizeAddress = 0x0a9836d0;
-constexpr uintptr_t ReadAddress = 0x0a983538;
-constexpr uintptr_t WriteAddress = 0x0a983604;
-
 /* Prologues guard the build, not the identity, so repeats are expected. */
 constexpr uint8_t SessionSignature[] = {0x83, 0xec, 0x14, 0x56, 0x53, 0x8b, 0x74, 0x24, 0x20};
 constexpr uint8_t CipherSignature[] = {0x83, 0xec, 0x14, 0x56, 0x53, 0x8b, 0x74, 0x24, 0x28};
@@ -120,20 +118,24 @@ void es1Wmmt5InstallDongleHooks(void)
         return;
     }
 
+    const Wmmt5Build *build = es1Wmmt5Build();
+    if (!build)
+        return;
+
     const Es1HookSpec hooks[] = {
-        {LoginAddress, reinterpret_cast<void *>(wmmt5HaspLogin), "hasp_login", nullptr,
+        {build->haspLogin, reinterpret_cast<void *>(wmmt5HaspLogin), "hasp_login", nullptr,
          SessionSignature, sizeof(SessionSignature)},
-        {LogoutAddress, reinterpret_cast<void *>(wmmt5HaspSuccess), "hasp_logout", nullptr,
+        {build->haspLogout, reinterpret_cast<void *>(wmmt5HaspSuccess), "hasp_logout", nullptr,
          SessionSignature, sizeof(SessionSignature)},
-        {EncryptAddress, reinterpret_cast<void *>(wmmt5HaspSuccess), "hasp_encrypt", nullptr,
+        {build->haspEncrypt, reinterpret_cast<void *>(wmmt5HaspSuccess), "hasp_encrypt", nullptr,
          CipherSignature, sizeof(CipherSignature)},
-        {DecryptAddress, reinterpret_cast<void *>(wmmt5HaspSuccess), "hasp_decrypt", nullptr,
+        {build->haspDecrypt, reinterpret_cast<void *>(wmmt5HaspSuccess), "hasp_decrypt", nullptr,
          CipherSignature, sizeof(CipherSignature)},
-        {GetSizeAddress, reinterpret_cast<void *>(wmmt5HaspGetSize), "hasp_get_size", nullptr,
+        {build->haspGetSize, reinterpret_cast<void *>(wmmt5HaspGetSize), "hasp_get_size", nullptr,
          StorageSignature, sizeof(StorageSignature)},
-        {ReadAddress, reinterpret_cast<void *>(wmmt5HaspRead), "hasp_read", nullptr,
+        {build->haspRead, reinterpret_cast<void *>(wmmt5HaspRead), "hasp_read", nullptr,
          StorageSignature, sizeof(StorageSignature)},
-        {WriteAddress, reinterpret_cast<void *>(wmmt5HaspWrite), "hasp_write", nullptr,
+        {build->haspWrite, reinterpret_cast<void *>(wmmt5HaspWrite), "hasp_write", nullptr,
          StorageSignature, sizeof(StorageSignature)},
     };
     es1InstallHookTable(hooks, sizeof(hooks) / sizeof(hooks[0]), "WMMT5 dongle");

@@ -4,6 +4,7 @@
 
 #include <cstdint>
 
+#include "es1Wmmt5Build.hpp"
 #include "../es1CompatLayer.h"
 #include "../../../../config/config.h"
 #include "../../../../elfLoader/guestTls.hpp"
@@ -14,29 +15,37 @@
 namespace
 {
 
-constexpr uintptr_t UpdateCheckAddress = 0x084fa120;
-constexpr uint8_t UpdateCheckSignature[] = {0x55, 0x89, 0xe5, 0x81, 0xec, 0x08,
-                                            0x05, 0x00, 0x00, 0x89, 0x5d, 0xf4};
+/* The frame size differs between builds, so only the frame setup is checked. */
+constexpr uint8_t UpdateCheckSignature[] = {0x55, 0x89, 0xe5, 0x81, 0xec};
 
-/* Offsets into the check's own state object. */
-constexpr size_t StepOffset = 568;
-constexpr size_t TerminalAnsweredOffset = 1096;
+/* The check's steps; the same numbering in every build. */
 constexpr int StepAskTerminal = 9;
 constexpr int StepWaitTerminal = 20;
 constexpr int StepAfterTerminal = 22;
 
+size_t g_stepOffset = 0;
+size_t g_terminalAnsweredOffset = 0;
+
 void (*g_originalUpdateCheck)(uint8_t *, int) = nullptr;
+
+/* The check's last step asks the terminal link whether the terminal has sent
+ * its serial; without a terminal it stops on E2407 and the boot screen stays
+ * at TERMINAL UNIT S/N CHECKING. The flag's offset differs between builds. */
+constexpr uint8_t TerminalSerialKnownSignature[] = {0x55, 0x89, 0xe5, 0x8b, 0x45, 0x08,
+                                                    0x5d, 0x8b, 0x00, 0x0f, 0xb6, 0x80};
+
+bool wmmt5TerminalSerialKnown(void *) { return true; }
 
 void wmmt5UpdateUnitCheck(uint8_t *state, int argument)
 {
     GuestTls::HostCallScope hostCall;
     if (state)
     {
-        int &step = *reinterpret_cast<int *>(state + StepOffset);
+        int &step = *reinterpret_cast<int *>(state + g_stepOffset);
         if (step == StepAskTerminal)
         {
             step = StepAfterTerminal;
-            *reinterpret_cast<int *>(state + TerminalAnsweredOffset) = 1;
+            *reinterpret_cast<int *>(state + g_terminalAnsweredOffset) = 1;
         }
         else if (step == StepWaitTerminal)
         {
@@ -56,13 +65,20 @@ void wmmt5UpdateUnitCheck(uint8_t *state, int argument)
 
 void es1Wmmt5InstallCabinetHooks(void)
 {
-    if (getConfig()->namcoES1.cabinetMode != NAMCO_ES1_CABINET_DRIVE)
+    const Wmmt5Build *build = es1Wmmt5Build();
+    if (!build || getConfig()->namcoES1.cabinetMode != NAMCO_ES1_CABINET_DRIVE)
         return;
 
+    g_stepOffset = build->unitStepOffset;
+    g_terminalAnsweredOffset = build->unitTerminalAnsweredOffset;
+
     const Es1HookSpec hooks[] = {
-        {UpdateCheckAddress, reinterpret_cast<void *>(wmmt5UpdateUnitCheck), "unitInfoCheck",
+        {build->unitCheck, reinterpret_cast<void *>(wmmt5UpdateUnitCheck), "unitInfoCheck",
          reinterpret_cast<void **>(&g_originalUpdateCheck), UpdateCheckSignature,
          sizeof(UpdateCheckSignature)},
+        {build->terminalSerialKnown, reinterpret_cast<void *>(wmmt5TerminalSerialKnown),
+         "terminalSerialKnown", nullptr, TerminalSerialKnownSignature,
+         sizeof(TerminalSerialKnownSignature)},
     };
     es1InstallHookTable(hooks, sizeof(hooks) / sizeof(hooks[0]), "WMMT5 cabinet");
 }

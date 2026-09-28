@@ -13,6 +13,7 @@
 #include "../../../../input/sdlInput.h"
 #include "../../../../log/log.h"
 #include "../../../common/jvs.h"
+#include "../es1Kickback.h"
 
 #include <algorithm>
 #include <atomic>
@@ -40,6 +41,23 @@ namespace
 constexpr size_t HaspSerialDigits = 12;
 constexpr size_t HaspCabinetDigitIndex = 5;
 constexpr char DefaultHaspSerial[] = "267610069420";
+
+/* FFBIo drives motor power through cMOTOR_BIT of the JVIO general-purpose
+ * output rather than over the serial link, so the virtual board has to notice
+ * that bit; without it State_PowerOffWait expires into E2212. */
+constexpr unsigned char JvioMotorBit = 0x80;
+int g_jvioMotorRunning = -1;
+
+void wmmt4JvioGpoWrite(unsigned char index, unsigned char data)
+{
+    if (index != 0)
+        return;
+    const int running = (data & JvioMotorBit) ? 1 : 0;
+    if (running == g_jvioMotorRunning)
+        return;
+    g_jvioMotorRunning = running;
+    es1KickbackReportMotorPower(running);
+}
 
 /* The configured serial, with the cabinet digit forced to match cabinetMode. */
 std::string resolveHaspSerial(bool terminal)
@@ -750,6 +768,7 @@ extern "C" int es1Wmmt4Detect(const char *elfPath)
 extern "C" int es1Wmmt4InstallHooks(void)
 {
     initializeHaspData();
+    setJVSGpoHandler(wmmt4JvioGpoWrite);
     const bool terminal =
         getConfig()->namcoES1.cabinetMode == NAMCO_ES1_CABINET_TERMINAL;
     log_info("System ES1 WMMT4: cabinet mode %s, virtual HASP S/N %.12s",

@@ -2,6 +2,9 @@
 #include <cstdlib>
 
 #include <filesystem>
+#include <iterator>
+#include <string>
+#include <vector>
 #include <winsock2.h>
 #include <windows.h>
 #include <libgen.h>
@@ -194,18 +197,51 @@ int main(int argc, char *argv[], char *envp[])
     }
 
     int final_argc = 0;
-    char *final_argv_arr[10];
+    char *final_argv_arr[16];
+    const int maxArguments = static_cast<int>(std::size(final_argv_arr)) - 1;
 
     final_argv_arr[final_argc++] = elfPath;
 
     if (strlen(elfArgs) > 0)
     {
         char *token = strtok(elfArgs, " ");
-        while (token != NULL && final_argc < 9)
+        while (token != NULL && final_argc < maxArguments)
         {
             final_argv_arr[final_argc++] = token;
             token = strtok(NULL, " ");
         }
+    }
+
+    // Switches the cabinet's launcher always passes, so a bare ELF name works.
+    static std::vector<std::string> requiredArguments;
+    if (const char *const *groups = platformRequiredArguments())
+    {
+        for (; *groups; ++groups)
+        {
+            std::vector<std::string> words;
+            for (const char *p = *groups; *p;)
+            {
+                const char *end = strchr(p, ' ');
+                words.emplace_back(p, end ? end - p : strlen(p));
+                p = end ? end + 1 : p + strlen(p);
+            }
+
+            bool present = false;
+            for (int i = 1; i < final_argc && !present; ++i)
+                present = words[0] == final_argv_arr[i];
+            const int pending = final_argc + static_cast<int>(requiredArguments.size());
+            if (present || pending + static_cast<int>(words.size()) > maxArguments)
+                continue;
+
+            for (const std::string &word : words)
+            {
+                requiredArguments.push_back(word);
+                log_info("Adding the launcher argument %s", word.c_str());
+            }
+        }
+        // Pointers are taken only once the vector has stopped growing.
+        for (std::string &word : requiredArguments)
+            final_argv_arr[final_argc++] = word.data();
     }
 
     if (platformWantsCabinetArgument() && final_argc == 1)

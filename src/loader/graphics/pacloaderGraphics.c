@@ -34,12 +34,16 @@ char *bridgeCgGetProgramString(char *program, int parameter)
 
 void bridgeglEnable(GLenum capability)
 {
+    /* This, not wrap_glEnable, is what the guest's glEnable resolves to, so the
+     * hooks' shadow of GL_SCISSOR_TEST has to be fed from here. */
+    GLHooks_NotifyCapToggled(capability, 1);
     if (glad_glEnable)
         glad_glEnable(capability);
 }
 
 void bridgeglDisable(GLenum capability)
 {
+    GLHooks_NotifyCapToggled(capability, 0);
     if (glad_glDisable)
         glad_glDisable(capability);
 }

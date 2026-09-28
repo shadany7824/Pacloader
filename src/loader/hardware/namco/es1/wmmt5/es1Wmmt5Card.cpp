@@ -9,6 +9,7 @@
 #include <string>
 #include <windows.h>
 
+#include "es1Wmmt5Build.hpp"
 #include "../es1CompatLayer.h"
 #include "../../../../config/config.h"
 #include "../../banapassport/banapassport.hpp"
@@ -106,17 +107,6 @@ int wmmt5BanaReqWaitTouch(int reader, int, uint32_t, void *, uint8_t *block)
     return BanaResultOk;
 }
 
-constexpr uintptr_t InitAddress = 0x0aa62c34;
-constexpr uintptr_t AttachAddress = 0x0aa62764;
-constexpr uintptr_t IsCommandExecutingAddress = 0x080ead50;
-constexpr uintptr_t ReqLedAddress = 0x0aa6200c;
-constexpr uintptr_t ReqActionAddress = 0x0aa61de6;
-constexpr uintptr_t ReqBeepAddress = 0x0aa61eec;
-constexpr uintptr_t ReqCancelAddress = 0x0aa61a1a;
-constexpr uintptr_t ReqSendUrlToAddress = 0x0aa6236e;
-constexpr uintptr_t ReqWaitTouchAddress = 0x0aa62116;
-constexpr uintptr_t ResetAddress = 0x0aa62248;
-
 /* Prologues guard the build, not the identity; repeats are expected. */
 constexpr uint8_t Frame0x28Signature[] = {0x55, 0x89, 0xe5, 0x83, 0xec, 0x28, 0x0f, 0xb6};
 constexpr uint8_t Frame0x38Signature[] = {0x55, 0x89, 0xe5, 0x83, 0xec, 0x38, 0x0f, 0xb6};
@@ -127,6 +117,10 @@ constexpr uint8_t SendUrlSignature[] = {0x55, 0x89, 0xe5, 0x57, 0x56, 0x83, 0xec
 
 int es1Wmmt5InstallCardHooks(void)
 {
+    const Wmmt5Build *build = es1Wmmt5Build();
+    if (!build)
+        return 0;
+
     banapassportConfigure(getConfig()->namcoES1.icCard.cardFile);
     if (!banapassportReaderEnabled())
     {
@@ -135,25 +129,25 @@ int es1Wmmt5InstallCardHooks(void)
     }
 
     const Es1HookSpec hooks[] = {
-        {InitAddress, reinterpret_cast<void *>(wmmt5BanaInit), "BngRwInit", nullptr,
+        {build->banaInit, reinterpret_cast<void *>(wmmt5BanaInit), "BngRwInit", nullptr,
          Frame0x28Signature, sizeof(Frame0x28Signature)},
-        {AttachAddress, reinterpret_cast<void *>(wmmt5BanaAttach), "BngRwAttach", nullptr,
+        {build->banaAttach, reinterpret_cast<void *>(wmmt5BanaAttach), "BngRwAttach", nullptr,
          Frame0x38Signature, sizeof(Frame0x38Signature)},
-        {IsCommandExecutingAddress, reinterpret_cast<void *>(wmmt5BanaIsCommandExecuting),
+        {build->banaIsCommandExecuting, reinterpret_cast<void *>(wmmt5BanaIsCommandExecuting),
          "BngRwIsCmdExec", nullptr, Frame0x18Signature, sizeof(Frame0x18Signature)},
-        {ReqLedAddress, reinterpret_cast<void *>(wmmt5BanaReqLed), "BngRwReqLed", nullptr,
+        {build->banaReqLed, reinterpret_cast<void *>(wmmt5BanaReqLed), "BngRwReqLed", nullptr,
          Frame0x28Signature, sizeof(Frame0x28Signature)},
-        {ReqActionAddress, reinterpret_cast<void *>(wmmt5BanaReqAction), "BngRwReqAction",
+        {build->banaReqAction, reinterpret_cast<void *>(wmmt5BanaReqAction), "BngRwReqAction",
          nullptr, Frame0x28Signature, sizeof(Frame0x28Signature)},
-        {ReqBeepAddress, reinterpret_cast<void *>(wmmt5BanaReqBeep), "BngRwReqBeep", nullptr,
+        {build->banaReqBeep, reinterpret_cast<void *>(wmmt5BanaReqBeep), "BngRwReqBeep", nullptr,
          Frame0x28Signature, sizeof(Frame0x28Signature)},
-        {ReqCancelAddress, reinterpret_cast<void *>(wmmt5BanaReqCancel), "BngRwReqCancel",
+        {build->banaReqCancel, reinterpret_cast<void *>(wmmt5BanaReqCancel), "BngRwReqCancel",
          nullptr, Frame0x28Signature, sizeof(Frame0x28Signature)},
-        {ReqSendUrlToAddress, reinterpret_cast<void *>(wmmt5BanaReqSendUrlTo),
+        {build->banaReqSendUrlTo, reinterpret_cast<void *>(wmmt5BanaReqSendUrlTo),
          "BngRwReqSendUrlTo", nullptr, SendUrlSignature, sizeof(SendUrlSignature)},
-        {ReqWaitTouchAddress, reinterpret_cast<void *>(wmmt5BanaReqWaitTouch),
+        {build->banaReqWaitTouch, reinterpret_cast<void *>(wmmt5BanaReqWaitTouch),
          "BngRwReqWaitTouch", nullptr, Frame0x28Signature, sizeof(Frame0x28Signature)},
-        {ResetAddress, reinterpret_cast<void *>(wmmt5BanaReset), "BngRwReset", nullptr,
+        {build->banaReset, reinterpret_cast<void *>(wmmt5BanaReset), "BngRwReset", nullptr,
          Frame0x28Signature, sizeof(Frame0x28Signature)},
     };
     const int installed = es1InstallHookTable(hooks, sizeof(hooks) / sizeof(hooks[0]),

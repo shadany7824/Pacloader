@@ -1,6 +1,10 @@
 #pragma once
 #include <stdbool.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef struct
 {
     int W;
@@ -21,3 +25,7 @@ void initBlitting();
 void blitSetWidthandHeightSize();
 int blitInitializeFbo();
 void blitStretch();
+
+#ifdef __cplusplus
+}
+#endif

@@ -6,6 +6,7 @@
 #include "../hardware/namco/n2/n2Title.h"
 #include "../hardware/namco/n2/n2.h"
 #include "../hardware/namco/n2/n2CardReader.h"
+#include "../hardware/namco/n2/csneo/n2CsNeo.h"
 #include "../hardware/namco/es1/es1VirtualDevices.h"
 #include "../hardware/namco/n2/n2VirtualDevices.h"
 #include "../log/log.h"
@@ -161,7 +162,15 @@ extern "C" int platformHandleHostKeyEvent(int key, uint32_t modifiers, int press
 
 extern "C" int platformWantsCabinetArgument(void)
 {
-    return platformIsN2() ? 1 : 0;
+    // CS Neo's .execrc starts hlds_run with its own switches, never "1".
+    return platformIsN2() && !n2TitleIs(N2_TITLE_ID_CSNEO) ? 1 : 0;
+}
+
+extern "C" const char *const *platformRequiredArguments(void)
+{
+    if (platformIsN2() && n2TitleIs(N2_TITLE_ID_CSNEO))
+        return n2CsNeoRequiredArguments();
+    return nullptr;
 }
 
 extern "C" const char *platformName(void)

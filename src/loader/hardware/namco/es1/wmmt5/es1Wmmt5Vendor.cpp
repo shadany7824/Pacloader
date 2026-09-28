@@ -8,6 +8,7 @@
 #include <mutex>
 #include <vector>
 
+#include "es1Wmmt5Build.hpp"
 #include "../es1CompatLayer.h"
 #include "../../../../config/config.h"
 #include "../../../../elfLoader/guestTls.hpp"
@@ -115,18 +116,20 @@ int wmmt5VendorReceive(int, void *data, int length)
     return size;
 }
 
-constexpr uintptr_t SendAddress = 0x080eefc0;
-constexpr uintptr_t ReceiveAddress = 0x080eef50;
 constexpr uint8_t TransferSignature[] = {0x55, 0x89, 0xe5, 0x83, 0xec, 0x08, 0x8b, 0x45, 0x08};
 
 } // namespace
 
 void es1Wmmt5InstallVendorHooks(void)
 {
+    const Wmmt5Build *build = es1Wmmt5Build();
+    if (!build)
+        return;
+
     const Es1HookSpec hooks[] = {
-        {SendAddress, reinterpret_cast<void *>(wmmt5VendorSend), "str400Send", nullptr,
+        {build->str400Send, reinterpret_cast<void *>(wmmt5VendorSend), "str400Send", nullptr,
          TransferSignature, sizeof(TransferSignature)},
-        {ReceiveAddress, reinterpret_cast<void *>(wmmt5VendorReceive), "str400Receive", nullptr,
+        {build->str400Receive, reinterpret_cast<void *>(wmmt5VendorReceive), "str400Receive", nullptr,
          TransferSignature, sizeof(TransferSignature)},
     };
     es1InstallHookTable(hooks, sizeof(hooks) / sizeof(hooks[0]), "WMMT5 card vendor");

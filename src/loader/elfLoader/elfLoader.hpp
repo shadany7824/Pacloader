@@ -29,6 +29,17 @@ class ElfLoader
         m_IsSharedObject = isSO;
     }
 
+    /* 0 is the global scope (the executable, what it needs, RTLD_GLOBAL
+     * dlopens); every RTLD_LOCAL dlopen gets its own, as in glibc. */
+    void SetSymbolScope(int scope)
+    {
+        m_SymbolScope = scope;
+    }
+    int GetSymbolScope() const
+    {
+        return m_SymbolScope;
+    }
+
     // Returns the runtime base address of the loaded ELF (0x08048000 for standard ELFs or the allocated address for PIE)
     void *GetBaseAddress() const
     {
@@ -50,6 +61,7 @@ class ElfLoader
     bool m_IsSharedObject = false;
     bool m_Relocated = false;
     bool m_Initialized = false;
+    int m_SymbolScope = 0;
     std::string m_Path;
 
     bool ParseElf(const std::string &path);

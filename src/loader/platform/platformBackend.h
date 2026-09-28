@@ -35,6 +35,9 @@ int platformHandleSystemCommand(const char *command);
 int platformHandleHostKey(int key, uint32_t modifiers);
 int platformHandleHostKeyEvent(int key, uint32_t modifiers, int pressed);
 int platformWantsCabinetArgument(void);
+/* NULL-terminated argument groups the title's launcher always passes; each is
+ * appended when its first word is missing. NULL when there are none. */
+const char *const *platformRequiredArguments(void);
 const char *platformName(void);
 void platformRegisterVirtualDevices(void);
 void platformRegisterCardControl(void);
