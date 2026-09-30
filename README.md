@@ -4,7 +4,7 @@
 
 # Pacloader (WMMT LINUX)
 
-This project is an actually forked from Pacloader. The main goal is to run all the SEGA Lindbergh games in Linux and Windows plus, in the future, other Arcade systems such as Namco N2 / ES1 and Raw Thrills.
+This project is an actually forked from another Pacloader. The main goal is to run all WMMT LINUX game for Intel and AMD GPU.
 
 ## 📚 Documentation
 
