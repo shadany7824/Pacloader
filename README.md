@@ -18,6 +18,20 @@ If you'd like to support the development work of this loader, see early developm
 
 If you need any help please ask the community in the [arcade community discord](https://arcade.community). Please only submit issues if they are bugs with the software, ask in the arcade community discord if you're not sure if it's a bug or you're not setting something up properly!
 
+## List of supported WMMT game
+Here's the list of supported game for Pacloader. I (shadany7824) is planning to make WMMT4-5DX+ run with Intel. 
+
+| Game Name | Regions | Revision | DVP       | NVidia | Intel  | AMD     |
+|---------------------------------------|---------|------------------|-----------|--------|--------|---------|
+| Wangan Midnight Maximum Tune 4 | JPN | Lindbergh Yellow | DVP-0009  | ✓      | ✓      | ✓       |
+| Wangan Midnight Maximum Tune 5  | EXP | Lindbergh Yellow | DVP-0009A | ✓      | ✓      | ✓       |
+| Wangan Midnight Maximum Tune 5DX  | EXP | Lindbergh Yellow | DVP-0009B | ✓      | ✓      | ✓       |
+| Wangan Midnight Maximum Tune 5DX+ | EXP | Lindbergh Yellow | DVP-0009B | ✓      | ✓      | ✓       |
+| Wangan Midnight Maximum Tune 5DX+ | CHN | Lindbergh Yellow | DVP-0009B | ✓      | ✓      | ✓       |
+| Wangan Midnight Maximum Tune 4 | SBLR | Lindbergh Yellow | DVP-0009B | ✓      | ✓      | ✓       |
+| Wangan Midnight Maximum Tune 4  | SBLR | Lindbergh Yellow | DVP-0009B | ✓      | ✓      | ✓       |
+
+
 ## Building & Running
 
 ### Linux
