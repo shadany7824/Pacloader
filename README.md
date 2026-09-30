@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="src/loader/resources/logo.png" alt="Linux Loader Logo">
+  <img src="src/loader/resources/pacloader-wmmt.png" alt="Pacloader WMMT Logo">
 </p>
 
-# Pacloader (5DX+)
+# Pacloader (WMMT LINUX)
 
 This project is an actually forked from Pacloader. The main goal is to run all the SEGA Lindbergh games in Linux and Windows plus, in the future, other Arcade systems such as Namco N2 / ES1 and Raw Thrills.
 
