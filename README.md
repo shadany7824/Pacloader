@@ -22,8 +22,8 @@ If you need any help please ask the community in the [arcade community discord](
 
 | Game | Revision | Status | Regions |
 |:----:|:----:|:--------:|:--------:|
-| WMMT4 | `1.05.00` | `Perfect` | `JPN` |
-| WMMT5DX+ | `2` | `Perfect` | `JPN` |
+| WMMT4 | `1.10.18` | `Running with an I/O error` | `JPN` |
+| WMMT5DX+ | `2.20.02` | `Running with a graphical bug` | `EXP` |
 
 ## Building & Running
 
