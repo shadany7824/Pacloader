@@ -14,6 +14,8 @@
 #include <SDL3/SDL.h>
 #include <windows.h>
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -417,17 +419,204 @@ extern "C" int bridgeGlxWaitVideoSyncSGI(int divisor, int remainder,
     return 0;
 }
 
+extern "C" unsigned char bridgeglTestFenceNV(unsigned int fence);
+
+/*
+ * NVIDIA-only entry points the ES1 games look up through glXGetProcAddress.
+ * Intel and AMD drivers lack them, but each maps onto core OpenGL. They are
+ * called by the guest (cdecl), and they forward to the same loader-provided
+ * entry points the guest would get for the core names, so they share its
+ * calling convention and state tracking.
+ */
+void *resolveCoreGl(const char *name)
+{
+    return GLHooks_GetProcAddress(name);
+}
+
+extern "C" void bridgeGlDepthRangedNV(double nearValue, double farValue)
+{
+    typedef void (*Fn)(double, double);
+    static Fn fn = reinterpret_cast<Fn>(resolveCoreGl("glDepthRange"));
+    if (fn)
+        fn(nearValue, farValue);
+}
+
+extern "C" void bridgeGlClearDepthdNV(double depth)
+{
+    typedef void (*Fn)(double);
+    static Fn fn = reinterpret_cast<Fn>(resolveCoreGl("glClearDepth"));
+    if (fn)
+        fn(depth);
+}
+
+extern "C" void bridgeGlRenderbufferStorageMultisampleCoverageNV(
+    unsigned int target, int coverageSamples, int colorSamples, unsigned int internalFormat,
+    int width, int height)
+{
+    (void)coverageSamples; /* coverage samples have no core equivalent */
+    typedef void (*Fn)(unsigned int, int, unsigned int, int, int);
+    static Fn fn = reinterpret_cast<Fn>(resolveCoreGl("glRenderbufferStorageMultisample"));
+    if (fn)
+        fn(target, colorSamples, internalFormat, width, height);
+}
+
+extern "C" void bridgeGlGetFenceivNV(unsigned int fence, unsigned int pname, int *params)
+{
+    if (!params)
+        return;
+    switch (pname)
+    {
+        case 0x84F3: /* GL_FENCE_STATUS_NV */
+            *params = bridgeglTestFenceNV(fence) ? 1 : 0;
+            break;
+        case 0x84F4: /* GL_FENCE_CONDITION_NV */
+            *params = 0x84F2; /* GL_ALL_COMPLETED_NV */
+            break;
+        default:
+            *params = 0;
+            break;
+    }
+}
+
+/*
+ * Diagnostic wrapper for glProgramStringARB. The game's Cg runtime feeds the
+ * driver ARB assembly programs; a rejected one only shows up as a bare
+ * GL_INVALID_OPERATION. After each call, ask the driver whether it accepted the
+ * program and, if not, log its message, the error position and the program
+ * text (also appended in full to pacloader_shader_errors.txt).
+ */
+extern "C" void bridgeGlProgramStringARBDiag(unsigned int target, unsigned int format, int length,
+                                             const void *program)
+{
+    typedef void (*ProgramStringFn)(unsigned int, unsigned int, int, const void *);
+    typedef void (*GetIntegervFn)(unsigned int, int *);
+    typedef const unsigned char *(*GetStringFn)(unsigned int);
+
+    static ProgramStringFn real =
+        reinterpret_cast<ProgramStringFn>(GLHooks_GetProcAddress("glProgramStringARB"));
+    static GetIntegervFn getIntegerv =
+        reinterpret_cast<GetIntegervFn>(GLHooks_GetProcAddress("glGetIntegerv"));
+    static GetStringFn getString =
+        reinterpret_cast<GetStringFn>(GLHooks_GetProcAddress("glGetString"));
+    static LONG reported = 0;
+
+    if (!real)
+        return;
+    real(target, format, length, program);
+    if (!getIntegerv || !getString)
+        return;
+
+    int position = -1;
+    getIntegerv(0x864B /* GL_PROGRAM_ERROR_POSITION_ARB */, &position);
+    if (position < 0)
+        return; /* accepted */
+    if (InterlockedIncrement(&reported) > 12)
+        return;
+
+    const char *message =
+        reinterpret_cast<const char *>(getString(0x8874 /* GL_PROGRAM_ERROR_STRING_ARB */));
+    const char *text = static_cast<const char *>(program);
+    const int textLength = (text && length > 0) ? length : 0;
+
+    log_error("ARB program rejected: target=0x%04X format=0x%04X length=%d errorPosition=%d",
+              target, format, length, position);
+    log_error("Driver message: %s", message ? message : "(none)");
+
+    if (textLength > 0)
+    {
+        /* Show the line holding the error position. */
+        int start = position < textLength ? position : textLength - 1;
+        int end = start;
+        while (start > 0 && text[start - 1] != '\n')
+            --start;
+        while (end < textLength && text[end] != '\n')
+            ++end;
+        log_error("Offending line: %.*s", end - start, text + start);
+        log_error("Program starts: %.*s", textLength < 160 ? textLength : 160, text);
+
+        FILE *file = std::fopen("pacloader_shader_errors.txt", "ab");
+        if (file)
+        {
+            std::fprintf(file,
+                         "==== rejected program: target=0x%04X length=%d errorPosition=%d\n"
+                         "==== driver message: %s\n",
+                         target, length, position, message ? message : "(none)");
+            std::fwrite(text, 1, static_cast<size_t>(textLength), file);
+            std::fputs("\n==== end\n\n", file);
+            std::fclose(file);
+        }
+    }
+}
+
+/* Placeholder for GL functions the driver lacks; see bridgeGlxGetProcAddress. */
+extern "C" int bridgeGlMissingFunctionStub()
+{
+    return 0;
+}
+
 extern "C" void *bridgeGlxGetProcAddress(const char *name)
 {
     if (!name)
         return nullptr;
+    /* Wrap glProgramStringARB so rejected shaders are explained in the log. */
+    if (std::strcmp(name, "glProgramStringARB") == 0 && GLHooks_GetProcAddress(name))
+        return reinterpret_cast<void *>(bridgeGlProgramStringARBDiag);
+
     if (std::strcmp(name, "glXSwapIntervalSGI") == 0)
         return reinterpret_cast<void *>(bridgeGlxSwapIntervalSGI);
     if (std::strcmp(name, "glXGetVideoSyncSGI") == 0)
         return reinterpret_cast<void *>(bridgeGlxGetVideoSyncSGI);
     if (std::strcmp(name, "glXWaitVideoSyncSGI") == 0)
         return reinterpret_cast<void *>(bridgeGlxWaitVideoSyncSGI);
-    return GLHooks_GetProcAddress(name);
+
+    void *function = GLHooks_GetProcAddress(name);
+    if (function)
+        return function;
+
+    /* Real emulations first: these map NVIDIA-only calls onto core OpenGL. */
+    if (std::strcmp(name, "glDepthRangedNV") == 0)
+        return reinterpret_cast<void *>(bridgeGlDepthRangedNV);
+    if (std::strcmp(name, "glClearDepthdNV") == 0)
+        return reinterpret_cast<void *>(bridgeGlClearDepthdNV);
+    if (std::strcmp(name, "glRenderbufferStorageMultisampleCoverageNV") == 0)
+        return reinterpret_cast<void *>(bridgeGlRenderbufferStorageMultisampleCoverageNV);
+    if (std::strcmp(name, "glGetFenceivNV") == 0)
+        return reinterpret_cast<void *>(bridgeGlGetFenceivNV);
+
+    /*
+     * The driver does not provide this function (typical on Intel/AMD for
+     * NVIDIA-only extensions). Returning NULL makes a guest that calls it
+     * without checking jump to address 0 and die, so log the name and hand
+     * back a do-nothing stub. The guest is cdecl, so the caller cleans the
+     * stack and one stub fits any argument list; it returns 0.
+     *
+     * Only functions known to be optional are stubbed by default. Set
+     * LL_STUB_MISSING_GL=1 to stub every missing "gl" function while hunting
+     * for what a title needs; stubbing a function the guest probes for can
+     * make it believe an unsupported feature exists.
+     */
+    static const char *const optionalFunctions[] = {
+        "glDepthBoundsEXT",
+        "glDepthBoundsdNV",
+    };
+
+    static int stubAll = -1;
+    if (stubAll < 0)
+    {
+        const char *setting = std::getenv("LL_STUB_MISSING_GL");
+        stubAll = (setting && setting[0] == '1') ? 1 : 0;
+    }
+
+    bool stub = stubAll == 1 && std::strncmp(name, "gl", 2) == 0;
+    for (const char *optional : optionalFunctions)
+    {
+        if (std::strcmp(name, optional) == 0)
+            stub = true;
+    }
+
+    log_warn("glXGetProcAddress: '%s' is not available on this GPU%s", name,
+             stub ? "; returning a no-op stub" : "");
+    return stub ? reinterpret_cast<void *>(bridgeGlMissingFunctionStub) : nullptr;
 }
 
 template <typename T>
