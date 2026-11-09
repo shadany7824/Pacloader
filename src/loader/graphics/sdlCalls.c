@@ -30,6 +30,7 @@ extern void bridgeX11PumpInput(void);
 #endif
 #include "../log/log.h"
 #include "sdlCalls.h"
+#include "pacloaderGraphics.h"
 #include "../elfLoader/glHooks.hpp"
 #include "../diagnostics/perfProfiler.hpp"
 
@@ -67,6 +68,16 @@ void GLAPIENTRY openglDebugCallback(GLenum source, GLenum type, GLuint id, GLenu
     if (severity == GL_DEBUG_SEVERITY_HIGH)
     {
         printf("This is a high severity error!\n");
+    }
+
+    /* The driver keeps a detailed reason and position for rejected ARB programs. */
+    if (message && strstr(message, "ProgramStringARB") != NULL)
+    {
+        GLint errorPosition = -1;
+        glad_glGetIntegerv(0x864B /* GL_PROGRAM_ERROR_POSITION_ARB */, &errorPosition);
+        const char *errorText = (const char *)glad_glGetString(0x8874 /* GL_PROGRAM_ERROR_STRING_ARB */);
+        printf("ARB program error position=%d reason: %s\n", (int)errorPosition,
+               errorText ? errorText : "(none)");
     }
 }
 
@@ -305,6 +316,8 @@ void startSDL()
         log_error("Failed to initialize GLAD.\n");
         exit(EXIT_FAILURE);
     }
+
+    pacInstallShaderDiagnostics();
 
     if (getConfig()->showDebugMessages)
     {
