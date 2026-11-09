@@ -305,6 +305,50 @@ LONG CALLBACK emulateGuestGsInstruction(EXCEPTION_POINTERS *exception)
         !state.instructionScratch)
         return EXCEPTION_CONTINUE_SEARCH;
 
+    /*
+     * A guest call or jump through a NULL/invalid function pointer arrives here
+     * with an unreadable EIP. Decoding the instruction at EIP would fault inside
+     * hde32_disasm and hide the real problem, so report the caller and let the
+     * fault continue unhandled. The first stack value is the return address
+     * when the guest got here with a call.
+     */
+    {
+        MEMORY_BASIC_INFORMATION eipInfo{};
+        const bool eipReadable =
+            VirtualQuery(reinterpret_cast<const void *>(context->Eip), &eipInfo,
+                         sizeof(eipInfo)) &&
+            eipInfo.State == MEM_COMMIT &&
+            (eipInfo.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0;
+        if (!eipReadable)
+        {
+            if (!g_reportedUnhandledAccessViolation.exchange(true))
+            {
+                char text[512]{};
+                int n = _snprintf(text, sizeof(text) - 1,
+                                  "Guest jumped to invalid EIP=%08lx. Stack at fault:",
+                                  static_cast<unsigned long>(context->Eip));
+                const DWORD *sp = reinterpret_cast<const DWORD *>(context->Esp);
+                if (n > 0 && !IsBadReadPtr(sp, 8 * sizeof(DWORD)))
+                {
+                    for (int i = 0; i < 8 && n < static_cast<int>(sizeof(text)) - 12; ++i)
+                        n += _snprintf(text + n, sizeof(text) - n - 1, " %08lx",
+                                       static_cast<unsigned long>(sp[i]));
+                }
+                if (n > 0)
+                    n += _snprintf(text + n, sizeof(text) - n - 1,
+                                   "\r\n(first value is the return address if this was a call;"
+                                   " guest offset = value - 08040000)\r\n");
+                if (n > 0)
+                {
+                    DWORD written = 0;
+                    WriteFile(GetStdHandle(STD_ERROR_HANDLE), text, static_cast<DWORD>(n),
+                              &written, nullptr);
+                }
+            }
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+    }
+
     const auto *source = reinterpret_cast<const uint8_t *>(context->Eip);
     hde32s instruction{};
     const unsigned int length = hde32_disasm(source, &instruction);
