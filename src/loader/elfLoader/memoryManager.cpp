@@ -4,6 +4,7 @@
 #include <cstring>
 #include <cerrno>
 #include <wchar.h>
+#include <psapi.h>
 
 #include "../log/log.h"
 #include "../diagnostics/perfProfiler.hpp"
@@ -52,6 +53,105 @@ bool guestAllocationBase(void *guest, void **base, GuestAllocationHeader *copy)
     return true;
 }
 
+/*
+ * A failed large allocation used to return NULL without a word, and the guest
+ * then wrote through it. Say why: how much address space and commit charge are
+ * left, the largest free holes, and the biggest things occupying the rest.
+ */
+void reportLargeAllocationFailure(size_t size, size_t alignment)
+{
+    static volatile LONG reported = 0;
+    if (InterlockedIncrement(&reported) > 6)
+        return;
+
+    log_error("MemoryManager: allocation of %zu MB (alignment %zu) FAILED", size / (1024 * 1024),
+              alignment);
+
+    MEMORYSTATUSEX status{};
+    status.dwLength = sizeof(status);
+    if (GlobalMemoryStatusEx(&status))
+    {
+        log_error("  free physical %llu MB, free commit %llu MB, free address space %llu MB",
+                  static_cast<unsigned long long>(status.ullAvailPhys / (1024 * 1024)),
+                  static_cast<unsigned long long>(status.ullAvailPageFile / (1024 * 1024)),
+                  static_cast<unsigned long long>(status.ullAvailVirtual / (1024 * 1024)));
+    }
+
+    struct Region
+    {
+        uintptr_t base;
+        size_t size;
+        DWORD type;
+        char name[96];
+    };
+    Region largestFree[3] = {};
+    Region largestUsed[6] = {};
+
+    SYSTEM_INFO info;
+    GetSystemInfo(&info);
+    uintptr_t address = reinterpret_cast<uintptr_t>(info.lpMinimumApplicationAddress);
+    const uintptr_t limit = reinterpret_cast<uintptr_t>(info.lpMaximumApplicationAddress);
+    size_t totalFree = 0;
+
+    while (address < limit)
+    {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (!VirtualQuery(reinterpret_cast<void *>(address), &mbi, sizeof(mbi)))
+            break;
+
+        Region candidate{};
+        candidate.base = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
+        candidate.size = mbi.RegionSize;
+        candidate.type = mbi.Type;
+
+        Region *list = largestUsed;
+        size_t count = 6;
+        if (mbi.State == MEM_FREE)
+        {
+            list = largestFree;
+            count = 3;
+            totalFree += mbi.RegionSize;
+        }
+
+        size_t slot = count;
+        for (size_t i = 0; i < count; ++i)
+        {
+            if (candidate.size > list[i].size)
+            {
+                slot = i;
+                break;
+            }
+        }
+        if (slot < count)
+        {
+            if (mbi.State != MEM_FREE && (mbi.Type == MEM_IMAGE || mbi.Type == MEM_MAPPED))
+                GetMappedFileNameA(GetCurrentProcess(), mbi.BaseAddress, candidate.name,
+                                   sizeof(candidate.name));
+            for (size_t i = count - 1; i > slot; --i)
+                list[i] = list[i - 1];
+            list[slot] = candidate;
+        }
+
+        address = candidate.base + mbi.RegionSize;
+        if (address <= candidate.base)
+            break;
+    }
+
+    log_error("  total free address space (all holes): %zu MB", totalFree / (1024 * 1024));
+    for (const Region &r : largestFree)
+    {
+        if (r.size)
+            log_error("  free hole: %p, %zu MB", reinterpret_cast<void *>(r.base),
+                      r.size / (1024 * 1024));
+    }
+    for (const Region &r : largestUsed)
+    {
+        if (r.size)
+            log_error("  in use: %p, %zu MB, type 0x%lx %s", reinterpret_cast<void *>(r.base),
+                      r.size / (1024 * 1024), r.type, r.name);
+    }
+}
+
 void *trackedAlignedMalloc(size_t size, size_t alignment)
 {
     const size_t offset = headerOffsetFor(alignment);
@@ -61,7 +161,14 @@ void *trackedAlignedMalloc(size_t size, size_t alignment)
     PerfProfilerScope scope("Alloc", "alignedMalloc");
     char *base = static_cast<char *>(_aligned_malloc(size + offset, alignment));
     if (!base)
+    {
+        if (size >= 16u * 1024 * 1024)
+            reportLargeAllocationFailure(size, alignment);
         return nullptr;
+    }
+    if (size >= 128u * 1024 * 1024)
+        log_warn("MemoryManager: large allocation of %zu MB succeeded at %p", size / (1024 * 1024),
+                 static_cast<void *>(base));
 
     char *guest = base + offset;
     GuestAllocationHeader *header = headerOf(guest);
