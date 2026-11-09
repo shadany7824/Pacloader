@@ -7,6 +7,7 @@
 
 #include "libcShared.h"
 #include "../config/config.h"
+#include "../log/log.h"
 #include "loader/elfLoader/symbolResolver.hpp"
 #include "../hardware/namco/es1/es1AlinCompat.h"
 
@@ -22,6 +23,23 @@ extern uint32_t gId;
 extern int gGrp;
 extern char envpath[100];
 
+/*
+ * dlerror() state. The guest commonly calls dlerror() right after a failed
+ * dlsym()/dlopen() and prints the result. Returning NULL there hands a NULL
+ * string to the loader's printf/puts path and crashes it, so record a real
+ * message for each failure and return it once, as POSIX does.
+ */
+#ifdef _WIN32
+static __thread char g_dlErrorText[256];
+static __thread int g_dlErrorPending = 0;
+
+static void setDlError(const char *prefix, const char *name)
+{
+    snprintf(g_dlErrorText, sizeof(g_dlErrorText), "%s: %s", prefix, name ? name : "(null)");
+    g_dlErrorPending = 1;
+}
+#endif
+
 /**
  * Hook for the only function provided by kswapapi.so
  * @param p No idea this gets discarded
@@ -34,6 +52,9 @@ int sharedKswap_collect(void *p)
 int sharedSystem(const char *command)
 {
     int (*_system)(const char *command) = REAL_FUNC(system);
+
+    if (command == NULL)
+        return -1;
 
     if (strcmp(command, "lsmod | grep basebd > /dev/null") == 0)
         return 0;
@@ -81,6 +102,9 @@ char *sharedStrncpy(char *dest, const char *src, size_t n)
 {
     char *(*_strncpy)(char *dest, const char *src, size_t n) = REAL_FUNC(strncpy);
 
+    if (dest == NULL || src == NULL)
+        return dest;
+
     switch (gId)
     {
         case HARLEY_DAVIDSON_SBRG:
@@ -107,6 +131,9 @@ int sharedSetenv(const char *name, const char *value, int overwrite)
     int (*_setenv)(const char *name, const char *value, int overwrite) = dlsym(RTLD_NEXT, "setenv");
 #endif
 
+    if (name == NULL || value == NULL)
+        return -1;
+
     if (strcmp(name, "DISPLAY") == 0)
     {
         return 0;
@@ -122,6 +149,9 @@ int sharedSetenv(const char *name, const char *value, int overwrite)
 char *sharedGetenv(const char *name)
 {
     char *(*_getenv)(const char *name) = REAL_FUNC(getenv);
+
+    if (name == NULL)
+        return NULL;
 
     if (strcmp(name, "TEA_DIR") == 0)
     {
@@ -171,6 +201,9 @@ int sharedUnsetenv(const char *name)
     int (*_unsetenv)(const char *name) = dlsym(RTLD_NEXT, "unsetenv");
 #endif
 
+    if (name == NULL)
+        return -1;
+
     if (strcmp(name, "DISPLAY") == 0)
     {
         return 0;
@@ -187,6 +220,8 @@ char *shared__strdup(const char *string)
 {
 #ifdef __linux__
     char *(*___strdup)(const char *string) = dlsym(RTLD_NEXT, "__strdup");
+    if (string == NULL)
+        return NULL;
     if (strcmp(string, "plughw:0, 0") == 0)
     {
         return ___strdup("default");
@@ -294,11 +329,24 @@ void *sharedDlsym(void *handle, const char *symbol)
     if (es1Function)
         return es1Function;
 
+    if (symbol == NULL)
+    {
+        setDlError("undefined symbol", NULL);
+        return NULL;
+    }
+
     void *func = bridgeResolveSymbolInModule(handle, symbol);
     if (func)
         return func;
 
-    return bridgeResolveSymbolOptional(symbol);
+    func = bridgeResolveSymbolOptional(symbol);
+    if (func == NULL)
+    {
+        /* Shows which symbols this GPU/driver cannot provide (e.g. NV-only GL). */
+        log_warn("dlsym: unresolved symbol '%s'", symbol);
+        setDlError("undefined symbol", symbol);
+    }
+    return func;
 #else
     return dlsym(handle, symbol);
 #endif
@@ -320,6 +368,11 @@ int sharedDlclose(void *handle)
 char *sharedDlerror()
 {
 #ifdef _WIN32
+    if (g_dlErrorPending)
+    {
+        g_dlErrorPending = 0;
+        return g_dlErrorText;
+    }
     return NULL;
 #else
     return dlerror();
