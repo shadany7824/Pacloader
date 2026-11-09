@@ -18,6 +18,13 @@ If you'd like to support the development work of this loader, see early developm
 
 If you need any help please ask the community in the [arcade community discord](https://arcade.community). Please only submit issues if they are bugs with the software, ask in the arcade community discord if you're not sure if it's a bug or you're not setting something up properly!
 
+## Compatibility Progress
+
+| Game | Revision | Status | Regions |
+|:----:|:----:|:--------:|:--------:|
+| WMMT4 | `1.05.00` | `Perfect` | `JPN` |
+| WMMT5DX+ | `2` | `Perfect` | `JPN` |
+
 ## Building & Running
 
 ### Linux
